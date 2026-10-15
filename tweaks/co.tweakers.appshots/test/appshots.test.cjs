@@ -1,45 +1,36 @@
 "use strict";
-
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const tweak = require("../index.js");
 
-test("safeFilePart strips path separators and control characters", () => {
-  assert.equal(tweak._test.safeFilePart("My App:/Window\nName"), "My-App-Window-Name");
+test("AppShots registers only native settings and tears down its page", () => {
+  let registration;
+  let disposed = 0;
+  const instance = Object.create(tweak);
+  instance.start({ process: "main", codex: new Proxy({}, { get() { throw new Error("No competing capture or shortcut"); } }) });
+  instance.start({ process: "renderer", settings: { registerPage(page) { registration = page; return { unregister() { disposed++; } }; } } });
+  assert.equal(registration.title, "AppShots");
+  instance.stop();
+  instance.stop();
+  assert.equal(disposed, 1);
 });
 
-test("filesForCapture creates a png and context text file", () => {
-  const files = tweak._test.filesForCapture(sampleCapture(), { includeText: true });
-  assert.equal(files.length, 2);
-  assert.match(files[0].name, /^AppShot-Safari-/);
-  assert.equal(files[0].mimeType, "image/png");
-  assert.equal(files[1].name, "AppShot-Safari-Context.txt");
-  assert.equal(files[1].mimeType, "text/plain");
-  assert.match(Buffer.from(files[1].dataBase64, "base64").toString("utf8"), /Hello from AX/);
+test("native state read does not enable capture or create files", async () => {
+  const calls = [];
+  const nodes = [];
+  const previous = global.document;
+  global.document = { createElement(tag) { const node = { tag, children: [], append(...items) { this.children.push(...items); }, addEventListener() {}, textContent: "" }; nodes.push(node); return node; } };
+  const instance = Object.create(tweak);
+  let page;
+  try {
+    instance.start({ process: "renderer", nativeCapture: {
+      appshots: { async getState() { calls.push("appshots"); return { supported: true, hotkey: "DoubleCommand" }; }, async setHotkey() { calls.push("mutation"); } },
+      computerHistory: { async getState() { calls.push("history"); return { state: "running" }; } },
+    }, settings: { registerPage(value) { page = value; return { unregister() {} }; } } });
+    page.render({ replaceChildren() {}, append() {} });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, ["appshots", "history"]);
+    assert.ok(nodes.some(node => node.textContent === "Native AppShots shortcut: both Command keys."));
+    assert.ok(nodes.some(node => node.textContent === "Native Computer History: running."));
+  } finally { instance.stop(); global.document = previous; }
 });
-
-test("filesForCapture degrades to image-only without text", () => {
-  const capture = sampleCapture();
-  capture.accessibility.text = null;
-  const files = tweak._test.filesForCapture(capture, { includeText: true });
-  assert.equal(files.length, 1);
-});
-
-test("contextFileText includes source metadata", () => {
-  const text = tweak._test.contextFileText(sampleCapture());
-  assert.match(text, /App: Safari/);
-  assert.match(text, /Bundle ID: com.apple.Safari/);
-  assert.match(text, /Window: Example/);
-  assert.match(text, /Accessibility: captured/);
-});
-
-function sampleCapture() {
-  return {
-    captureId: "capture-1",
-    capturedAt: "2026-07-13T12:00:00.000Z",
-    app: { name: "Safari", bundleIdentifier: "com.apple.Safari", pid: 123 },
-    window: { id: 42, title: "Example", bounds: { x: 0, y: 0, width: 800, height: 600 } },
-    image: { mimeType: "image/png", dataBase64: "aW1hZ2U=", width: 800, height: 600, byteLength: 5 },
-    accessibility: { status: "captured", text: "Hello from AX", characterCount: 13 },
-  };
-}

@@ -36,10 +36,14 @@ import {
   type FrontendControlEvidence,
   type LockedDependencyEvidence,
   type CodexRustLifecycleTestEvidence,
+  type CodexExecutedRustLifecycleTestEvidence,
   type RestartWindow,
   type WatcherPromotionEvidence,
   type CodexSourceEvidence,
+  type CodexBackendClosureEvidence,
+  type CodexGeneratedRuntimeEvidence,
 } from "../codex-derived-receipt.js";
+import { readRuntimeFingerprintEvidence, RUNTIME_FINGERPRINT_FILE } from "../runtime-fingerprint.js";
 import {
   CODEX_GITHUB_API_VERSION,
   CODEX_RELEASE_REPOSITORY,
@@ -77,11 +81,12 @@ import {
   type PrepareManagedMcpLifecycleInput,
 } from "../managed-mcp-lifecycle.js";
 import { userPaths } from "../paths.js";
-import { locateCodex, locateCodexAtExactPath } from "../platform.js";
+import { locateCodex, locateCodexAtExactPath, resolveBundledCodexBackend } from "../platform.js";
 import { readPlist } from "../plist.js";
 import { assertInternalStoragePath as assertInternalFilesystemPath } from "../internal-storage.js";
-import { signCodexApp, signatureInfo, verifySignature } from "../codesign.js";
-import { buildPatchedCandidateOnly } from "./install.js";
+import { assertCodeModeHostSigningPosture, findExistingPreparedSigningIdentity, signDeveloperIdBackend,
+  signDeveloperIdCodeModeHost, signCodexApp, signatureInfo, verifySignature, type PreparedSigningIdentity } from "../codesign.js";
+import { buildPatchedCandidateOnly, packagedRuntimeAssetsRoot, bundledDerivedCodeModeHostPath, validateBundledDerivedCodeModeHost, type BundledDerivedCodeModeHostArtifact } from "./install.js";
 import {
   assertManagedMcpCanaryEvidence,
   runManagedMcpCanary,
@@ -103,6 +108,9 @@ import {
   rollbackCodexSourceCutover,
   type CodexSourceCutoverReceipt,
 } from "../codex-source-cutover.js";
+
+import { readQualifiedRustTests, qualifiedRustShape, parseExactRustProof, verifyV8BuildInputs,
+  type RustReuseInput, type VerifiedV8Input, type RustSourceIdentity } from "../qualified-rust-evidence.js";
 
 const GITHUB_API_ORIGIN = "https://api.github.com";
 const CODEX_GIT_URL = "https://github.com/openai/codex.git";
@@ -128,6 +136,51 @@ export const CODEX_SOURCE_BUILD_COMMAND = [
   "codex-cli",
   "--bin",
   "codex",
+  "--package",
+  "codex-code-mode-host",
+  "--bin",
+  "codex-code-mode-host",
+] as const;
+
+export const CODEX_SOURCE_REQUIRED_RUST_TESTS = [
+  "connection_manager::tests::shutdown_dormant_connection_does_not_publish_startup",
+  "connection_manager::tests::pre_cancelled_startup_does_not_enter_transport",
+  "connection_manager::tests::shutdown_continues_after_caller_is_aborted",
+  "connection_manager::tests::capture_binding_exposes_cached_tools_before_startup",
+  "connection_manager::tests::cancelling_startup_does_not_disable_a_ready_client",
+  "connection_manager::tests::shutdown_cancels_pending_tool_listing",
+  "oauth::tests::tweakers_oauth_preserves_modes_and_native_credentials",
+  "oauth::tests::tweakers_oauth_auto_fallback_stays_in_overlay",
+  "loader::unit_tests::tweakers_layers_preserve_origins_and_leave_account_config_unused",
+  "instructions::tests::shared_instructions_keep_both_original_sources_and_overlay_precedence",
+  "config::edit::tests::tweakers_shared_edits_write_overlay_and_reject_linked_config",
+  "request_processors::plugins::shared_installed_response_does_not_invent_provider_identity_without_account_metadata",
+  "manager::tests::shared_inventory_overrides_account_cloud_membership_and_reloads_native_snapshot",
+  "manager::tests::native_inventory_bootstrap_reads_raw_cloud_without_shared_snapshot_or_package_writes",
+  "manager::tests::shared_plugin_state_batch_preserves_policy_and_native_summary_semantics",
+  "manager::tests::shared_plugin_reads_observe_in_place_edits_and_other_account_mutations",
+  "manager::tests::shared_plugin_uninstall_rejects_config_symlink_before_package_mutation",
+  "marketplace_add::tests::add_marketplace_sync_admits_shared_bundled_source_and_records_it_in_overlay",
+  "marketplace_policy::tests::shared_bundled_marketplace_add_accepts_account_base_and_overlay_but_not_lookalikes",
+  "marketplace_policy::tests::shared_marketplace_admission_uses_base_and_overlay_without_trusting_other_roots",
+  "manager::remote_mutations::tests::shared_remote_uninstall_masks_local_package_without_provider_mutation",
+  "store::tests::shared_plugin_overlay_reads_base_and_keeps_mutations_shared_but_metadata_private",
+  "store::tests::shared_plugin_background_refresh_does_not_materialize_inherited_package_or_tombstone",
+  "store::tests::shared_plugin_writes_reject_overlay_symlink_to_base",
+  "store::tests::shared_native_inventory_rejects_missing_invalid_and_oversized_snapshots",
+  "schema_fixtures_tests::typescript_schema_fixtures_match_generated",
+  "schema_fixtures_tests::json_schema_fixtures_match_generated",
+  "schema_fixtures_tests::stable_precomputed_exports_match_schema_fixtures",
+  "schema_fixtures_tests::experimental_precomputed_exports_match_generated",
+  "oauth::tests::tweakers_oauth_rejects_linked_fallback_leaf",
+  "oauth::tests::tweakers_oauth_rejects_linked_secrets_parent",
+  "oauth::tests::tweakers_oauth_rejects_linked_secrets_leaf",
+  "oauth::tests::tweakers_oauth_rejects_linked_lock_parent",
+  "oauth::tests::tweakers_oauth_rejects_linked_lock_leaf",
+  "oauth::tests::tweakers_oauth_retained_directory_does_not_follow_replacement",
+  "oauth::tests::tweakers_oauth_bootstrap_does_not_create_through_replaced_overlay",
+  "oauth::tests::tweakers_oauth_manager_rejects_replaced_root_without_native_keyring_access",
+  "local::tests::private_mcp_keyring_account_remains_pinned_after_root_replacement",
 ] as const;
 
 export const CODEX_SOURCE_RUST_TEST_COMMAND = [
@@ -136,7 +189,26 @@ export const CODEX_SOURCE_RUST_TEST_COMMAND = [
   "--locked",
   "--package",
   "codex-mcp",
+  "--package",
+  "codex-rmcp-client",
+  "--package",
+  "codex-config",
+  "--package",
+  "codex-home",
+  "--package",
+  "codex-core",
+  "--package",
+  "codex-core-plugins",
+  "--package",
+  "codex-app-server",
+  "--package",
+  "codex-app-server-protocol",
+  "--package",
+  "codex-secrets",
   "--lib",
+  "--",
+  "--exact",
+  ...CODEX_SOURCE_REQUIRED_RUST_TESTS,
 ] as const;
 
 export function codexSourceCargoEnvironment(
@@ -150,7 +222,24 @@ export function codexSourceCargoEnvironment(
 
 export type CodexSourceAction = "build" | "canary-pass" | "freeze" | "cutover" | "rollback" | "detect" | "resolve" | "status";
 
+/** Internal release compilation budget; it does not alter any test timeout. */
+export function codexSourceReleaseBuildTimeoutMs(value?: number): number {
+  const minimum = 60 * 60 * 1_000;
+  if (value === undefined) return minimum;
+  if (!Number.isInteger(value) || value < minimum || value > 3 * minimum) {
+    throw new Error("releaseBuildTimeoutMs must be an integer between 60 minutes and 3 hours");
+  }
+  return value;
+}
+
 export interface CodexSourceOptions {
+  /** Internal owner-selected release budget; no CLI flag. */
+  releaseBuildTimeoutMs?: number;
+  /** Internal owner-reviewed reuse; no arbitrary source or test-log roots. */
+  reuseRustTests?: RustReuseInput;
+  verifiedV8Inputs?: VerifiedV8Input;
+  buildOnly?: boolean;
+  "build-only"?: boolean;
   app?: string;
   channel?: string;
   json?: boolean;
@@ -159,6 +248,8 @@ export interface CodexSourceOptions {
   "frontend-source-app"?: string;
   patchSeries?: string | readonly string[];
   "patch-series"?: string | readonly string[];
+  backendSigningIdentity?: string;
+  "backend-signing-identity"?: string;
   chromePluginRoot?: string;
   "chrome-plugin-root"?: string;
   playwrightPluginRoot?: string;
@@ -247,6 +338,13 @@ export interface CodexSourceBuildEvidence {
     sha256: string;
   };
   rustLifecycleTests?: CodexRustLifecycleTestEvidence;
+  /** Source verification outputs; present before any desktop slot is reserved. */
+  compiledBackend?: {
+    binaryPath: string;
+    codeModeHostPath: string;
+  };
+  backendClosure?: CodexBackendClosureEvidence;
+  generatedRuntime?: CodexGeneratedRuntimeEvidence;
 }
 
 export interface CodexPreparedSourceCandidate {
@@ -347,11 +445,16 @@ export interface CodexSourceInstalledPluginEvidence {
 }
 
 export interface ProductionCodexSourceBuildAdapterInput {
+  releaseBuildTimeoutMs?: number;
+  reuseRustTests?: RustReuseInput;
+  verifiedV8Inputs?: VerifiedV8Input;
   transactionRoot: string;
   transactionId: string;
   frontendSourceApp: string;
   finalUserRoot: string;
   patchSeries: readonly string[];
+  buildOnly?: boolean;
+  backendSigningIdentity?: string;
   dependencies: readonly LockedDependencyEvidence[];
   managedMcp?: ManagedMcpPreparedRuntimeEvidence;
 }
@@ -362,11 +465,14 @@ export interface ValidatedBundledDerivedArtifact {
   fingerprint: string;
   receiptPath: string;
   transactionId: string;
+  codeModeHost?: BundledDerivedCodeModeHostArtifact;
 }
 
 export type ProductionCodexSourceBuildAdapter =
   Pick<CodexSourcePreparationDependencies, "checkoutSource" | "verifySourceCommit" | "buildSource"> & {
     paths: CodexSourceTransactionPaths;
+    /** Called only after source verification and desktop-capacity admission. */
+    stageDesktopCandidate?(evidence: CodexSourceBuildEvidence): Promise<CodexSourceBuildEvidence>;
   };
 
 export interface CodexSourceBuildCommandResult {
@@ -376,10 +482,13 @@ export interface CodexSourceBuildCommandResult {
   transactionId: string;
   channel: CodexSourceChannel;
   paths: CodexSourceTransactionPaths;
-  managedMcp: ManagedMcpStageEvidence;
+  managedMcp?: ManagedMcpStageEvidence;
   managedMcpRuntime?: ManagedMcpPreparedRuntimeEvidence;
   receipt: CodexDerivedReceipt | null;
   liveMutation: false;
+  /** No desktop candidate was created; source outputs remain in this transaction. */
+  buildOnly?: true;
+  evidence?: CodexSourceBuildEvidence;
 }
 
 export interface CodexSourceCanaryPassResult {
@@ -564,9 +673,14 @@ export async function buildCodexSourceCandidate(
   options: CodexSourceOptions,
   deps: CodexSourceCommandDependencies,
 ): Promise<CodexSourceBuildCommandResult> {
+  const releaseBuildTimeoutMs = codexSourceReleaseBuildTimeoutMs(options.releaseBuildTimeoutMs);
   const production = deps.production ?? defaultProductionDependencies();
+  const buildOnly = options.buildOnly === true || options["build-only"] === true;
   const channel = parseChannel(options.channel);
   const transactionId = requireTransactionId(optionValue(options, "transactionId", "transaction-id") ?? production.transactionId());
+  if (options.reuseRustTests && (!buildOnly || options.reuseRustTests.transactionId === transactionId || !options.verifiedV8Inputs)) {
+    throw new Error("Qualified reuse requires a distinct build-only successor and verified official V8 inputs");
+  }
   const transactionRoot = requireInternalAbsolutePath(deps.root(), "Codex source transaction root", false);
   const paths = codexSourceTransactionPaths(transactionRoot, transactionId);
   const frontendSourceApp = requireInternalAbsolutePath(
@@ -577,16 +691,6 @@ export async function buildCodexSourceCandidate(
   const selectedApp = requireInternalAbsolutePath(options.app ?? STOCK_CHATGPT_APP, "selected installed app", false);
   const patchSeries = parsePatchSeries(optionValue(options, "patchSeries", "patch-series")).map((path) =>
     requireInternalAbsoluteFile(path, "Codex source patch")
-  );
-  const chromePluginRoot = requireInternalAbsolutePath(
-    optionValue(options, "chromePluginRoot", "chrome-plugin-root"),
-    "Chrome plugin root",
-    true,
-  );
-  const playwrightPluginRoot = requireInternalAbsolutePath(
-    optionValue(options, "playwrightPluginRoot", "playwright-plugin-root"),
-    "Playwright plugin root",
-    true,
   );
   const bundledVersion = channel === "bundled"
     ? deps.probeBundledVersion(options.app ?? STOCK_CHATGPT_APP)
@@ -600,13 +704,13 @@ export async function buildCodexSourceCandidate(
 
   // Package staging precedes source preparation so the candidate state (and a
   // future post-canary receipt) commits to the exact reviewed MCP artifacts.
-  const managedMcp = production.stageManagedMcpPackages({
-    chromePluginRoot,
-    playwrightPluginRoot,
+  const managedMcp = buildOnly ? undefined : production.stageManagedMcpPackages({
+    chromePluginRoot: requireInternalAbsolutePath(optionValue(options, "chromePluginRoot", "chrome-plugin-root"), "Chrome plugin root", true),
+    playwrightPluginRoot: requireInternalAbsolutePath(optionValue(options, "playwrightPluginRoot", "playwright-plugin-root"), "Playwright plugin root", true),
     managedMcpRoot: join(paths.root, "prepared", "managed-package-staging"),
     now: deps.now,
   });
-  const managedMcpRuntime = production.prepareManagedMcpLifecycle
+  const managedMcpRuntime = !buildOnly && production.prepareManagedMcpLifecycle
     ? production.prepareManagedMcpLifecycle({
         manifestFile: requireInternalAbsoluteFile(
           optionValue(options, "fleetManifest", "fleet-manifest"),
@@ -617,13 +721,18 @@ export async function buildCodexSourceCandidate(
       })
     : undefined;
   if (managedMcpRuntime) assertManagedMcpPreparedRuntimeEvidence(managedMcpRuntime);
-  const dependencies = lockedDependenciesFromManagedMcp(managedMcp);
+  const dependencies = managedMcp ? lockedDependenciesFromManagedMcp(managedMcp) : [];
   const adapter = production.createBuildAdapter({
+    releaseBuildTimeoutMs,
     transactionRoot,
     transactionId,
+    reuseRustTests: options.reuseRustTests,
+    verifiedV8Inputs: options.verifiedV8Inputs,
     frontendSourceApp,
     finalUserRoot: transactionRoot,
     patchSeries,
+    buildOnly,
+    backendSigningIdentity: optionValue(options, "backendSigningIdentity", "backend-signing-identity"),
     dependencies,
     ...(managedMcpRuntime ? { managedMcp: managedMcpRuntime } : {}),
   });
@@ -670,12 +779,26 @@ export async function buildCodexSourceCandidate(
       liveMutation: false,
     };
   }
+  // The adapter's source proof completes before staging can reserve a desktop
+  // slot. Persist it first so a capacity failure does not lose the build.
+  atomicJsonWrite(paths.candidateStateFile, prepared.candidate);
+  if (buildOnly) {
+    return {
+      schemaVersion: 1, kind: "codex-source-build", status: "prepared",
+      transactionId, channel, paths, managedMcp,
+      ...(managedMcpRuntime ? { managedMcpRuntime } : {}),
+      receipt: null, liveMutation: false, buildOnly: true, evidence: prepared.candidate.evidence,
+    };
+  }
+  const stagedEvidence = adapter.stageDesktopCandidate
+    ? await adapter.stageDesktopCandidate(prepared.candidate.evidence)
+    : prepared.candidate.evidence;
   const trustedRunnerSourcePath = trustedManagedMcpCanaryRunnerSourcePath();
   const trustedAdapterSourcePath = trustedManagedMcpAppServerAdapterSourcePath();
   const boundCandidate: CodexPreparedSourceCandidate = {
     ...prepared.candidate,
     evidence: {
-      ...prepared.candidate.evidence,
+      ...stagedEvidence,
       trustedCanaryRunner: {
         sourcePath: trustedRunnerSourcePath,
         sha256: sha256TrustedManagedMcpCanaryRunnerSource(trustedRunnerSourcePath),
@@ -1075,6 +1198,8 @@ export async function freezeCodexSourceCandidate(
     frontendControl: evidence.frontendControl,
     controlBinary: evidence.controlBinary,
     candidateBinary: evidence.candidateBinary,
+    ...(evidence.backendClosure ? { backendClosure: evidence.backendClosure } : {}),
+    ...(evidence.generatedRuntime ? { generatedRuntime: evidence.generatedRuntime } : {}),
     ...(evidence.managedMcp ? { managedMcp: evidence.managedMcp } : {}),
     ...(evidence.trustedCanaryRunner ? { trustedCanaryRunner: evidence.trustedCanaryRunner } : {}),
     ...(evidence.trustedCanaryAdapter ? { trustedCanaryAdapter: evidence.trustedCanaryAdapter } : {}),
@@ -1270,13 +1395,27 @@ export function assertFrontendControlParity(input: FrontendControlParityInput): 
       throw new Error(`Pristine frontend source is stale: ${key} differs from the selected installed control`);
     }
   }
-  const selectedBackend = exactExistingFile(join(selected.resourcesDir, "codex"), "selected installed backend");
-  const pristineBackend = exactExistingFile(join(pristine.resourcesDir, "codex"), "pristine frontend backend");
+  const selectedBackend = exactExistingFile(resolveBundledCodexBackend(selectedPath), "selected installed backend");
+  const pristineBackend = exactExistingFile(resolveBundledCodexBackend(pristinePath), "pristine frontend backend");
   const selectedVersion = probeCodexBinaryVersion(selectedBackend);
   const pristineVersion = probeCodexBinaryVersion(pristineBackend);
   if (selectedVersion !== pristineVersion || sha256File(selectedBackend) !== sha256File(pristineBackend)) {
     throw new Error("Pristine frontend embedded backend does not match the selected installed backend control");
   }
+}
+
+/** Keep the backend signer unchanged while binding the helper to its exact reviewed posture. */
+export function signCodexSourceBackendPair(
+  backend: string, helper: string, identity: PreparedSigningIdentity,
+  deps: { signBackend: typeof signDeveloperIdBackend; signHelper: typeof signDeveloperIdCodeModeHost;
+    assertHelperPosture: typeof assertCodeModeHostSigningPosture } = {
+    signBackend: signDeveloperIdBackend, signHelper: signDeveloperIdCodeModeHost,
+    assertHelperPosture: assertCodeModeHostSigningPosture,
+  },
+): void {
+  deps.signBackend(backend, identity);
+  deps.signHelper(helper, identity);
+  deps.assertHelperPosture(helper);
 }
 
 /**
@@ -1288,11 +1427,15 @@ export function assertFrontendControlParity(input: FrontendControlParityInput): 
 export function createProductionCodexSourceBuildAdapter(
   input: ProductionCodexSourceBuildAdapterInput,
 ): ProductionCodexSourceBuildAdapter {
+  const releaseBuildTimeoutMs = codexSourceReleaseBuildTimeoutMs(input.releaseBuildTimeoutMs);
   const paths = codexSourceTransactionPaths(input.transactionRoot, input.transactionId);
   if (input.patchSeries.length === 0) throw new Error("Codex source build requires a reviewed patch series artifact");
   const patchFiles = input.patchSeries.map((file) => exactExistingFile(file, "patch series"));
   const frontendSourceApp = exactExistingPath(input.frontendSourceApp, "frontend source app");
   const finalUserRoot = exactExistingOrFuturePath(input.finalUserRoot, "final user root");
+  const backendIdentity = input.backendSigningIdentity
+    ? findExistingPreparedSigningIdentity({ identityName: input.backendSigningIdentity, signingPosture: "strict" })
+    : undefined;
   return {
     paths,
     checkoutSource: ({ sourceRoot, tag, peeledCommit }) => checkoutOfficialCodexSource({
@@ -1329,42 +1472,58 @@ export function createProductionCodexSourceBuildAdapter(
       const lockfile = exactExistingFile(join(cargoRoot, "Cargo.lock"), "Cargo.lock");
       const rustc = execFileSync("rustc", ["-vV"], { encoding: "utf8", timeout: 10_000 });
       const cargo = execFileSync("cargo", ["-V"], { encoding: "utf8", timeout: 10_000 });
-      const rustLifecycleTests = runRustLifecycleReceiptTests({
-        cargoRoot,
-        evidenceRoot: join(paths.root, "prepared", "rust-lifecycle-tests"),
-        sourceCommit: peeledCommit,
-        patchedTreeSha256: treeDigest.value,
-        cargoLockSha256: sha256File(lockfile),
+      const rustSource = inspectRustSourceIdentity(sourceRoot, patchFiles);
+      const testRoot = join(paths.root, "prepared", "rust-lifecycle-tests");
+      const v8BuildInputs = input.verifiedV8Inputs ? verifyV8BuildInputs(input.verifiedV8Inputs, sourceRoot, peeledCommit) : undefined;
+      if (input.reuseRustTests && (!input.buildOnly || input.reuseRustTests.transactionId === input.transactionId || !v8BuildInputs)) {
+        throw new Error("Qualified reuse requires a distinct build-only successor and official V8 pair");
+      }
+      const rustLifecycleTests = input.reuseRustTests
+        ? reuseQualifiedRustTests({ userRoot: input.transactionRoot, reuse: input.reuseRustTests, source: rustSource,
+          rustc, testRoot, patchFiles, sourceRoot })
+        : runRustLifecycleReceiptTests({ cargoRoot, evidenceRoot: testRoot, sourceCommit: peeledCommit,
+          patchedTreeSha256: treeDigest.value, cargoLockSha256: sha256File(lockfile) });
+      // Persist actual successful execution before release work can fail. A qualified
+      // predecessor remains a distinct origin, never a fabricated execution checkpoint.
+      atomicJsonWrite(join(paths.root, "prepared", "rust-tests-checkpoint.json"), {
+        schemaVersion: 1, kind: "codex-source-pre-release-checkpoint", transactionId: input.transactionId,
+        source: rustSource, releaseToolchain: { rustc, cargo }, tests: rustLifecycleTests,
+        ...(v8BuildInputs ? { v8BuildInputs } : {}),
       });
+      const buildEnv = codexSourceCargoEnvironment();
+      if (buildEnv.V8_FROM_SOURCE || buildEnv.RUSTY_V8_MIRROR) throw new Error("Source receipt does not permit V8 source or mirror fallback");
+      if (!v8BuildInputs && (buildEnv.RUSTY_V8_ARCHIVE || buildEnv.RUSTY_V8_SRC_BINDING_PATH)) throw new Error("V8 overrides require verified input authority");
+      if (v8BuildInputs) {
+        for (const [key, value] of Object.entries({ RUSTY_V8_ARCHIVE: v8BuildInputs.archive.path, RUSTY_V8_SRC_BINDING_PATH: v8BuildInputs.binding.path })) {
+          if (buildEnv[key] && buildEnv[key] !== value) throw new Error("Inherited V8 override differs from verified input");
+          buildEnv[key] = value;
+        }
+      }
       execFileSync(CODEX_SOURCE_BUILD_COMMAND[0], [...CODEX_SOURCE_BUILD_COMMAND.slice(1)], {
         cwd: cargoRoot,
-        env: codexSourceCargoEnvironment(),
+        env: buildEnv,
         stdio: "inherit",
-        timeout: 60 * 60 * 1_000,
+        timeout: releaseBuildTimeoutMs,
       });
       const builtBinary = exactExistingFile(join(cargoRoot, "target", "release", "codex"), "built Codex binary");
+      const builtCodeModeHost = exactExistingFile(join(cargoRoot, "target", "release", "codex-code-mode-host"), "built Codex code-mode helper");
       const builtVersion = probeCodexBinaryVersion(builtBinary);
       if (builtVersion !== version) throw new Error(`Built Codex version ${builtVersion} does not match ${version}`);
-
-      await buildPatchedCandidateOnly({
-        sourceApp: frontendSourceApp,
-        destinationApp: paths.candidateApp,
-        destinationRuntime: join(paths.root, "candidate", "runtime"),
-        finalUserRoot,
-      });
-      const candidate = locateCodex(paths.candidateApp);
-      const candidateBinary = join(candidate.resourcesDir, "codex");
-      copyFileSync(builtBinary, candidateBinary);
-      chmodSync(candidateBinary, 0o755);
-      const signing = signCodexApp(paths.candidateApp, { useLocalIdentity: true });
-      const verified = verifySignature(paths.candidateApp);
-      if (!signing || !verified.ok) throw new Error(`Derived desktop candidate signature failed: ${verified.output}`);
-      if (probeCodexBinaryVersion(candidateBinary) !== version) {
-        throw new Error("Staged desktop backend version does not match the built candidate");
+      if (backendIdentity) {
+        signCodexSourceBackendPair(builtBinary, builtCodeModeHost, backendIdentity);
       }
 
+      const helperSignature = signatureFromPath(builtCodeModeHost);
+      const compiledSigned = helperSignature && verifySignature(builtCodeModeHost).ok && verifySignature(builtBinary).ok;
+      if (input.buildOnly && !compiledSigned) {
+        throw new Error("Compile-only evidence requires valid backend/helper signatures; select the existing backend signing identity");
+      }
+      if (input.buildOnly) assertCodeModeHostSigningPosture(builtCodeModeHost);
+      const generatedRuntimeRoot = packagedRuntimeAssetsRoot();
+      const generatedRuntime = readRuntimeFingerprintEvidence(generatedRuntimeRoot);
+      if (!generatedRuntime) throw new Error("Packaged generated runtime lacks verified fingerprint evidence");
       const control = locateCodex(frontendSourceApp);
-      const controlBinary = exactExistingFile(join(control.resourcesDir, "codex"), "desktop bundled Codex binary");
+      const controlBinary = exactExistingFile(resolveBundledCodexBackend(frontendSourceApp), "desktop bundled Codex binary");
       const controlVersion = probeCodexBinaryVersion(controlBinary);
       if (channel === "bundled" && controlVersion !== version) {
         throw new Error(`Desktop bundled control is ${controlVersion}; expected ${version}`);
@@ -1372,13 +1531,6 @@ export function createProductionCodexSourceBuildAdapter(
       const plist = control.metaPath ? readPlist(control.metaPath) : {};
       const frontendVersion = requiredPlistString(plist, "CFBundleShortVersionString");
       const frontendBuild = requiredPlistString(plist, "CFBundleVersion");
-      const candidateSignature = signatureInfo(paths.candidateApp);
-      if (!candidateSignature.ok) throw new Error("Derived desktop candidate signing identity is unreadable");
-      const signature = {
-        identity: signing.identity,
-        teamIdentifier: candidateSignature.teamIdentifier,
-        designatedRequirement: null,
-      };
       const platform = "darwin";
       const architecture = "arm64";
       return {
@@ -1388,11 +1540,19 @@ export function createProductionCodexSourceBuildAdapter(
           archiveDigest: null,
           treeDigest,
           patchSeriesDigest,
+          patchSeriesFiles: patchFiles.map(path => ({ path, sha256: sha256File(path) })),
           reviewedDiffDigest,
           buildCommand: CODEX_SOURCE_BUILD_COMMAND,
+          ...(v8BuildInputs ? { v8BuildInputs } : {}),
           toolchainDigests: [digestText("rustc -vV", rustc), digestText("cargo -V", cargo)],
           lockfileDigests: [digestFile("Cargo.lock", lockfile)],
         },
+        compiledBackend: { binaryPath: builtBinary, codeModeHostPath: builtCodeModeHost },
+        // Pinned code-mode-host embeds ICU_DATA and settled.js; no external resources.
+        ...(compiledSigned ? { backendClosure: { codeModeHost: { path: builtCodeModeHost, sha256: sha256File(builtCodeModeHost),
+          architecture: "arm64" as const, signature: helperSignature! }, resources: [] } } : {}),
+        generatedRuntime: { sourceRoot: generatedRuntimeRoot, ...generatedRuntime,
+          documentSha256: sha256File(join(generatedRuntimeRoot, RUNTIME_FINGERPRINT_FILE)) },
         dependencies: input.dependencies,
         frontendControl: {
           source: "currently installed desktop frontend at test time",
@@ -1419,27 +1579,112 @@ export function createProductionCodexSourceBuildAdapter(
           platform,
           architecture,
           version,
-          digests: [digestFile("derived candidate binary", candidateBinary)],
-          signature,
+          digests: [digestFile("derived candidate binary", builtBinary), digestFile("derived candidate code-mode helper", builtCodeModeHost)],
+          signature: signatureFromPath(builtBinary),
         },
         rustLifecycleTests: {
           ...rustLifecycleTests,
-          candidateBinarySha256: sha256File(candidateBinary),
+          candidateBinarySha256: sha256File(builtBinary),
         },
         ...(input.managedMcp ? { managedMcp: input.managedMcp } : {}),
+      };
+    },
+    stageDesktopCandidate: async (evidence) => {
+      const outputs = evidence.compiledBackend;
+      if (!outputs) throw new Error("Source verification lacks compiled backend/helper output paths");
+      const builtBinary = exactExistingFile(outputs.binaryPath, "source-verified backend");
+      const builtCodeModeHost = exactExistingFile(outputs.codeModeHostPath, "source-verified code-mode helper");
+      const version = evidence.candidateBinary.version;
+      for (const [file, scope] of [[builtBinary, "derived candidate binary"], [builtCodeModeHost, "derived candidate code-mode helper"]] as const) {
+        if (evidence.candidateBinary.digests.find(item => item.algorithm === "sha256" && item.scope === scope)?.value !== sha256File(file)) {
+          throw new Error("Source-verified backend/helper changed before desktop staging");
+        }
+      }
+      assertCodeModeHostSigningPosture(builtCodeModeHost);
+      await buildPatchedCandidateOnly({
+        sourceApp: frontendSourceApp,
+        destinationApp: paths.candidateApp,
+        destinationRuntime: join(paths.root, "candidate", "runtime"),
+        finalUserRoot,
+      });
+      const candidate = locateCodex(paths.candidateApp);
+      const candidateBinary = join(candidate.resourcesDir, "codex");
+      copyFileSync(builtBinary, candidateBinary);
+      chmodSync(candidateBinary, 0o755);
+      const candidateCodeModeHost = bundledDerivedCodeModeHostPath(paths.candidateApp);
+      copyFileSync(builtCodeModeHost, candidateCodeModeHost);
+      chmodSync(candidateCodeModeHost, 0o755);
+      const signing = signCodexApp(paths.candidateApp, { useLocalIdentity: true,
+        ...(backendIdentity ? { retainedSignedBackend: {
+          sourcePath: builtBinary, sha256: sha256File(builtBinary), certificateSha1: backendIdentity.hash,
+        }, retainedSignedCodeModeHost: {
+          sourcePath: builtCodeModeHost, sha256: sha256File(builtCodeModeHost), certificateSha1: backendIdentity.hash,
+        } } : {}),
+      });
+      const verified = verifySignature(paths.candidateApp);
+      if (!signing || !verified.ok) throw new Error(`Derived desktop candidate signature failed: ${verified.output}`);
+      if (probeCodexBinaryVersion(candidateBinary) !== version) {
+        throw new Error("Staged desktop backend version does not match the built candidate");
+      }
+
+      const helperSignature = signatureFromPath(candidateCodeModeHost);
+      if (!helperSignature || !verifySignature(candidateCodeModeHost).ok) throw new Error("Staged code-mode helper signature is invalid");
+      assertCodeModeHostSigningPosture(candidateCodeModeHost);
+      const runtimeRoot = join(paths.root, "candidate", "runtime");
+      const runtime = readRuntimeFingerprintEvidence(runtimeRoot);
+      if (!runtime) throw new Error("Staged generated runtime lacks verified fingerprint evidence");
+
+      return {
+        ...evidence,
+        // The reviewed 0.162 code-mode runtime embeds its ICU data through
+        // deno_core_icudata::ICU_DATA; it has no external runtime resources.
+        backendClosure: { codeModeHost: {
+          path: candidateCodeModeHost, sha256: sha256File(candidateCodeModeHost), architecture: "arm64", signature: helperSignature,
+        }, resources: [] },
+        generatedRuntime: { sourceRoot: runtimeRoot, ...runtime,
+          documentSha256: sha256File(join(runtimeRoot, RUNTIME_FINGERPRINT_FILE)),
+        },
+        candidateBinary: { ...evidence.candidateBinary,
+          digests: [digestFile("derived candidate binary", candidateBinary), digestFile("derived candidate code-mode helper", candidateCodeModeHost)],
+          signature: signatureFromPath(candidateBinary),
+        },
+        ...(evidence.rustLifecycleTests ? { rustLifecycleTests: {
+          ...evidence.rustLifecycleTests, candidateBinarySha256: sha256File(candidateBinary),
+        } } : {}),
       };
     },
   };
 }
 
-const RUST_LIFECYCLE_REQUIRED_TESTS = [
-  /connection_manager::tests::deferred_shutdown_does_not_ignite_never_started_servers$/,
-  /connection_manager::tests::cancelled_startup_never_reaches_the_transport$/,
-  /connection_manager::tests::shutdown_continues_after_caller_is_aborted$/,
-  /connection_manager::tests::capture_binding_exposes_cached_tools_before_startup$/,
-  /connection_manager::tests::cancelling_startup_does_not_disable_a_ready_client$/,
-  /connection_manager::tests::shutdown_cancels_pending_tool_listing$/,
-] as const;
+const RUST_LIFECYCLE_REQUIRED_TESTS = CODEX_SOURCE_REQUIRED_RUST_TESTS.map(name =>
+  new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`));
+
+/** Shared source projection used at import and accepted-build reinspection. */
+export function inspectRustSourceIdentity(sourceRoot: string, patchFiles: readonly string[], git: typeof runGit = runGit): RustSourceIdentity {
+  return { commit: git(["rev-parse", "HEAD"], sourceRoot).trim(),
+    tag: `rust-v${readFileSync(join(sourceRoot, "codex-rs", "Cargo.toml"), "utf8").match(/^version = "([^"]+)"/m)?.[1] ?? ""}`,
+    treeSha256: digestTrackedSource(sourceRoot, git).value,
+    reviewedDiffSha256: digestText("reviewed applied diff", git(["diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-color", git(["rev-parse", "HEAD"], sourceRoot).trim(), "--"], sourceRoot)).value,
+    cargoLockSha256: sha256File(join(sourceRoot, "codex-rs", "Cargo.lock")), patchSeriesSha256: digestFiles("patch series", patchFiles).value,
+    patches: patchFiles.map(path => ({ path, sha256: sha256File(path) })) };
+}
+function reuseQualifiedRustTests(input: { userRoot: string; reuse: RustReuseInput; source: RustSourceIdentity;
+  rustc: string; testRoot: string; patchFiles: readonly string[]; sourceRoot: string }) {
+  const original = readQualifiedRustTests({ ...input, command: CODEX_SOURCE_RUST_TEST_COMMAND,
+    requiredTests: CODEX_SOURCE_REQUIRED_RUST_TESTS, successorSourceRoot: input.sourceRoot, currentEnvironment: codexSourceCargoEnvironment(),
+    inspectPriorSource: root => inspectRustSourceIdentity(root, input.patchFiles) });
+  mkdirSync(input.testRoot, { recursive: true, mode: 0o700 });
+  const stdoutFile = join(input.testRoot, "cargo-test.stdout.log"), stderrFile = join(input.testRoot, "cargo-test.stderr.log");
+  atomicTextWrite(stdoutFile, original.stdout); atomicTextWrite(stderrFile, original.stderr);
+  if (sha256File(stdoutFile) !== original.qualification.logs.stdout.sha256 || sha256File(stderrFile) !== original.qualification.logs.stderr.sha256) throw new Error("Copied Rust evidence differs");
+  return { schemaVersion: 2 as const, kind: "codex-rust-lifecycle-tests" as const,
+    sourceCommit: input.source.commit, patchedTreeSha256: input.source.treeSha256, cargoLockSha256: input.source.cargoLockSha256,
+    command: CODEX_SOURCE_RUST_TEST_COMMAND, exitCode: 0 as const, passedTests: original.passedTests,
+    stdoutFile, stdoutSha256: sha256File(stdoutFile), stderrFile, stderrSha256: sha256File(stderrFile),
+    origin: { kind: "lead-qualified-prior-transaction" as const, userRoot: input.userRoot, transactionId: input.reuse.transactionId,
+      qualification: original.reference, timing: original.qualification.timing, priorToolchain: original.qualification.priorToolchain,
+      observations: original.qualification.observations } };
+}
 
 function runRustLifecycleReceiptTests(input: {
   cargoRoot: string;
@@ -1447,7 +1692,7 @@ function runRustLifecycleReceiptTests(input: {
   sourceCommit: string;
   patchedTreeSha256: string;
   cargoLockSha256: string;
-}): Omit<CodexRustLifecycleTestEvidence, "candidateBinarySha256"> {
+}): Omit<CodexExecutedRustLifecycleTestEvidence, "candidateBinarySha256"> {
   const args = CODEX_SOURCE_RUST_TEST_COMMAND.slice(1);
   const startedAt = new Date().toISOString();
   const result = spawnSync("cargo", [...args], {
@@ -1458,25 +1703,23 @@ function runRustLifecycleReceiptTests(input: {
     maxBuffer: 32 * 1024 * 1024,
   });
   const completedAt = new Date().toISOString();
-  if (result.error) throw new Error(`Rust lifecycle receipt tests could not run: ${result.error.message}`);
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
-  if (result.status !== 0) {
-    throw new Error(`Rust lifecycle receipt tests failed with exit ${String(result.status)}: ${stderr.slice(-4_000)}`);
-  }
-  const passedTests = [...`${stdout}\n${stderr}`.matchAll(/^test\s+([^\s]+)\s+\.\.\.\s+ok\s*$/gm)]
-    .map((match) => match[1]!)
-    .sort();
-  for (const required of RUST_LIFECYCLE_REQUIRED_TESTS) {
-    if (!passedTests.some((name) => required.test(name))) {
-      throw new Error(`Rust lifecycle receipt tests did not report required proof ${required.source}`);
-    }
-  }
   mkdirSync(input.evidenceRoot, { recursive: true });
   const stdoutFile = join(input.evidenceRoot, "cargo-test.stdout.log");
   const stderrFile = join(input.evidenceRoot, "cargo-test.stderr.log");
   atomicTextWrite(stdoutFile, Buffer.from(stdout));
   atomicTextWrite(stderrFile, Buffer.from(stderr));
+  if (result.error) throw new Error(`Rust lifecycle receipt tests could not run: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`Rust lifecycle receipt tests failed with exit ${String(result.status)}: ${stderr.slice(-4_000)}`);
+  }
+  const passedTests = parseExactRustProof(stdout, stderr, CODEX_SOURCE_REQUIRED_RUST_TESTS);
+  for (const required of RUST_LIFECYCLE_REQUIRED_TESTS) {
+    if (!passedTests.some((name) => required.test(name))) {
+      throw new Error(`Rust lifecycle receipt tests did not report required proof ${required.source}`);
+    }
+  }
   return {
     schemaVersion: 1,
     kind: "codex-rust-lifecycle-tests",
@@ -1501,7 +1744,7 @@ function assertRustLifecycleTestEvidence(
   candidateBinarySha256: string,
 ): asserts evidence is CodexRustLifecycleTestEvidence {
   if (!evidence
-    || evidence.schemaVersion !== 1
+    || (evidence.schemaVersion !== 1 && !qualifiedRustShape(evidence))
     || evidence.kind !== "codex-rust-lifecycle-tests"
     || evidence.sourceCommit !== candidate.evidence.source.checkoutCommit
     || evidence.patchedTreeSha256 !== candidate.evidence.source.treeDigest.value
@@ -1509,9 +1752,8 @@ function assertRustLifecycleTestEvidence(
     || JSON.stringify(evidence.command) !== JSON.stringify(CODEX_SOURCE_RUST_TEST_COMMAND)
     || evidence.exitCode !== 0
     || evidence.candidateBinarySha256 !== candidateBinarySha256
-    || !validTimestamp(evidence.startedAt)
-    || !validTimestamp(evidence.completedAt)
-    || Date.parse(evidence.startedAt) > Date.parse(evidence.completedAt)
+    || (evidence.schemaVersion === 1 && (!validTimestamp(evidence.startedAt)
+      || !validTimestamp(evidence.completedAt) || Date.parse(evidence.startedAt) > Date.parse(evidence.completedAt)))
     || !Array.isArray(evidence.passedTests)) {
     throw new Error("Prepared candidate lacks exact green Rust lifecycle receipt evidence");
   }
@@ -1593,7 +1835,15 @@ export function readValidatedBundledDerivedArtifact(
   }
   const signature = verifySignature(candidateApp);
   if (!signature.ok) throw new Error(`Bundled-derived candidate signature is invalid: ${signature.output}`);
-  return { binaryPath, version, fingerprint, receiptPath: exactReceipt, transactionId: receipt.transactionId };
+  const helperDigest = receipt.candidateBinary.digests.find(digest => digest.algorithm === "sha256" && digest.scope === "derived candidate code-mode helper")?.value;
+  const artifact: ValidatedBundledDerivedArtifact = { binaryPath, version, fingerprint, receiptPath: exactReceipt, transactionId: receipt.transactionId,
+    ...(helperDigest ? { codeModeHost: {
+      binaryPath: exactExistingFile(bundledDerivedCodeModeHostPath(candidateApp), "bundled-derived code-mode helper"),
+      fingerprint: helperDigest.toLowerCase(), receiptPath: exactReceipt, receiptSha256: sha256File(exactReceipt),
+      resources: receipt.backendClosure?.resources ?? [],
+    } } : {}) };
+  validateBundledDerivedCodeModeHost(artifact);
+  return artifact;
 }
 
 function defaultCommandDependencies(): CodexSourceCommandDependencies {
@@ -1817,7 +2067,9 @@ export function probeInstalledBundledCodexVersion(app?: string): string {
   const install = process.platform === "darwin"
     ? locateCodexAtExactPath(app ?? "/Applications/ChatGPT.app")
     : locateCodex(app);
-  const binary = join(install.resourcesDir, "codex");
+  const binary = install.platform === "darwin"
+    ? resolveBundledCodexBackend(install.appRoot)
+    : join(install.resourcesDir, "codex");
   const output = execFileSync(binary, ["--version"], {
     encoding: "utf8",
     timeout: 5_000,
@@ -1961,7 +2213,7 @@ function filesystemAvailableBytes(path: string): bigint {
   return stats.bsize * stats.bavail;
 }
 
-function readPreparedSourceCandidate(file: string, transactionId: string): CodexPreparedSourceCandidate {
+export function readPreparedSourceCandidate(file: string, transactionId: string): CodexPreparedSourceCandidate {
   const exact = requireInternalAbsoluteFile(file, "prepared Codex source candidate state");
   let value: unknown;
   try {
@@ -2599,11 +2851,11 @@ function digestFiles(scope: string, files: readonly string[]): { algorithm: "sha
   return { algorithm: "sha256", value: hash.digest("hex"), scope };
 }
 
-function digestTrackedSource(sourceRoot: string): { algorithm: "sha256"; value: string; scope: string } {
+function digestTrackedSource(sourceRoot: string, git: typeof runGit = runGit): { algorithm: "sha256"; value: string; scope: string } {
   // `git apply` leaves newly added patch files untracked in the disposable
   // checkout. Include them so the receipt commits to the complete patched
   // tree, not only files that existed in the upstream tag.
-  const files = runGit(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], sourceRoot)
+  const files = git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], sourceRoot)
     .split("\0")
     .filter(Boolean)
     .sort();

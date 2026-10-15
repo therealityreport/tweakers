@@ -1,12 +1,18 @@
 {
   "id": "co.tweakers.shadcn-codex-ui",
   "name": "Shadcn Codex UI",
-  "version": "0.2.3",
+  "version": "0.2.7",
   "githubRepo": "therealityreport/tweakers",
   "description": "Render bounded, extensible Rich Blocks v1 in an owned, native-safe message section.",
   "author": "hulibrands",
-  "tags": ["ui", "messages", "rich-blocks"],
+  "tags": [
+    "ui",
+    "messages",
+    "rich-blocks"
+  ],
   "scope": "renderer",
-  "permissions": ["settings"],
+  "permissions": [
+    "settings"
+  ],
   "minRuntime": ">=1.0.0"
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,7 +28,7 @@ function installExecSpy(): { calls: RecordedExecCall[]; restore: () => void } {
     ((command: string, args: readonly string[], options: unknown) => {
       calls.push({ command, args, options });
       return "button returned:Dismiss\n";
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
   );
   return { calls, restore };
 }
@@ -261,7 +261,7 @@ test("native-update handoff clicks the updater menu on the exact committed proce
     exec: ((command: string, args: readonly string[], options: unknown) => {
       calls.push({ command, args, options });
       return "";
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
   });
 
   assert.deepEqual(requested, { ok: true });
@@ -281,7 +281,7 @@ test("native-update handoff refuses a process that is not the exact committed ap
     exec: (() => {
       executed = true;
       return "";
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 1,
@@ -300,7 +300,7 @@ test("native-update handoff gives up immediately when the exact PID is gone (Spa
       observations += 1;
       return null;
     },
-    exec: (() => "") as typeof execFileSync,
+    exec: (() => "") as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 60_000,
@@ -325,7 +325,7 @@ test("native-update handoff includes localized labels and a structural app-menu 
     exec: ((command: string, args: readonly string[], options: unknown) => {
       calls.push({ command, args, options });
       return "";
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
   });
 
   assert.deepEqual(result, { ok: true });
@@ -350,7 +350,7 @@ test("native-update handoff reports Automation denial with exact System Settings
     exec: (() => {
       execCalls += 1;
       throw denied;
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
   });
@@ -380,7 +380,7 @@ test("native-update handoff surfaces denied assistive access instead of reportin
       execCalls += 1;
       script = String(args[1]);
       throw assistiveDenied;
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 60_000,
@@ -414,7 +414,7 @@ test("native-update handoff records why the menu snapshot was unavailable", { sk
     exec: ((command: string, args: readonly string[]) => {
       if (String(args[1]).includes("click updateItem")) throw missing;
       throw snapshotDenied;
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 1,
@@ -437,7 +437,7 @@ test("native-update handoff reports a missing updater menu instead of swallowing
   const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
     observe: () => ({ pid: 91, visibleWindow: true }),
     readLocaleMessages: () => null,
-    exec: (() => { throw missing; }) as typeof execFileSync,
+    exec: (() => { throw missing; }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 1,
@@ -456,7 +456,7 @@ test("native-update handoff attempt script compiles as valid AppleScript", { ski
     exec: ((command: string, args: readonly string[]) => {
       if (String(args[1]).includes("click updateItem")) script = String(args[1]);
       throw Object.assign(new Error("capture only"), { stderr: "capture only", status: 1 });
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 1,
@@ -490,7 +490,7 @@ test("native-update handoff ignores menu markers echoed back in the command line
         stderr: "1149:1151: script error: Expected “contained by”, “equal” or expression but found parameter name. (-2741)",
         status: 1,
       });
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 1,
@@ -517,7 +517,7 @@ test("native-update handoff retries until the menu appears after app launch", { 
       execCalls += 1;
       if (execCalls < 3) throw missing;
       return "";
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 60_000,
@@ -546,7 +546,7 @@ test("native-update handoff stops retrying at the deadline and records the obser
         throw missing;
       }
       return "|About ChatGPT| |Settings…|Log Out";
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     // deadline = first nowMs (1000) + 5000; each nowMs call advances 1s, so
@@ -577,7 +577,7 @@ test("native-update handoff re-observes a hidden window on each retry", { skip: 
     exec: (() => {
       executed += 1;
       return "";
-    }) as typeof execFileSync,
+    }) as unknown as typeof execFileSync,
     nowMs: clock.nowMs,
     sleep: clock.sleep,
     deadlineMs: 60_000,
@@ -637,6 +637,22 @@ test(
     }
   },
 );
+
+test("independent startup capture opens only the exact app into fresh private streams", { skip: process.platform !== "darwin" }, () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "startup-streams-"))), streams = { stdout: join(root, "stdout.log"), stderr: join(root, "stderr.log") };
+  const { calls, restore } = installExecSpy();
+  try {
+    for (const file of Object.values(streams)) writeFileSync(file, "", { mode: 0o600 });
+    withEnv({ TWEAKER_WATCHER: undefined, XPC_SERVICE_NAME: undefined, TWEAKER_REOPEN_BACKGROUND: undefined }, () => openAndActivateCodex("/Applications/Tweakers.app", streams));
+    assert.equal(calls.at(-1)?.command, "/usr/bin/open");
+    assert.deepEqual(calls.at(-1)?.args, ["-a", "/Applications/Tweakers.app", "--stdout", streams.stdout, "--stderr", streams.stderr]);
+    const count = calls.length;
+    assert.throws(() => openAndActivateCodex("/Applications/ChatGPT.app", streams), /exact independent Tweakers/);
+    chmodSync(streams.stderr, 0o644); assert.throws(() => openAndActivateCodex("/Applications/Tweakers.app", streams), /fresh private/);
+    chmodSync(streams.stderr, 0o600); writeFileSync(streams.stderr, "old capture"); assert.throws(() => openAndActivateCodex("/Applications/Tweakers.app", streams), /fresh private/);
+    assert.equal(calls.length, count);
+  } finally { restore(); rmSync(root, { recursive: true, force: true }); }
+});
 
 test(
   "reopen uses exactly one launch strategy",

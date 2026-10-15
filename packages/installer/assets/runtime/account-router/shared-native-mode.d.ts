@@ -3,7 +3,9 @@ import { type NativeHistoryDirectoryIdentityV1, type NativeHistorySourceBindingV
 import { type OpaqueAccountId } from "./types";
 export declare const SHARED_NATIVE_MODE_FILE_V1 = "shared-native-mode.v1.json";
 export declare const SHARED_NATIVE_MODE_TRANSITION_FILE_V1 = "shared-native-mode-transition.v1.json";
+export declare const OFFICIAL_SHARED_PLUGIN_PREPARATION_TIMEOUT_MS_V1 = 600000;
 type Sha256 = `sha256:${string}`;
+export type SharedNativeResolverProtocolV1 = "shared-native-overlay-v1" | "official-bundled-v1";
 type Root = {
     path: string;
     identity: NativeHistoryDirectoryIdentityV1;
@@ -15,7 +17,7 @@ export interface SharedNativeModeV1 {
     sourceAccountId: OpaqueAccountId;
     nativeBase: Root;
     overlay: Root;
-    resolverProtocol: "shared-native-overlay-v1";
+    resolverProtocol: SharedNativeResolverProtocolV1;
     resolverBinarySha256: string;
     retiredCopyState: {
         priorSharedFingerprint: Sha256;
@@ -47,8 +49,8 @@ export type SharedNativeModeReadResultV1 = {
     document: SharedNativeModeV1;
     fingerprint: Sha256;
     environment: {
-        TWEAKERS_NATIVE_BASE_ROOT: string;
-        TWEAKERS_OVERLAY_ROOT: string;
+        TWEAKERS_NATIVE_BASE_ROOT?: string;
+        TWEAKERS_OVERLAY_ROOT?: string;
     };
 };
 export type SharedNativeModePublishResultV1 = Blocked | {
@@ -68,7 +70,14 @@ interface WriteInput extends SharedNativeModeContextV1 {
     /** Existing-test interruption seam, never supplied by production callers. */
     faultAt?: "after_intent" | "after_abort" | "after_publication";
 }
-export declare function readSharedNativeModeV1(context: SharedNativeModeContextV1): SharedNativeModeReadResultV1;
+/** A signed latency hint only. Full mode/root authority is still checked by the
+ * broker; this never authorizes a process, file mutation or account operation. */
+export declare function sharedNativePluginPreparationTimeoutV1(stateRoot: string, secret: Buffer, fallbackMs: number): number;
+export interface OwnedPluginPreparationV1 {
+    account: OpaqueAccountId;
+    permitsPendingIntent: () => boolean;
+}
+export declare function readSharedNativeModeV1(context: SharedNativeModeContextV1, preparation?: OwnedPluginPreparationV1): SharedNativeModeReadResultV1;
 export declare function prepareSharedNativeModeV1(input: PrepareSharedNativeModeInputV1): {
     state: "prepared";
     plan: SharedNativeModePlanV1;
@@ -98,10 +107,11 @@ export interface SharedNativeResolverTransitionV1 {
     document: SharedNativeModeV1;
     signature: string;
 }
-/** Prepare a signed resolver-only CAS without changing the installed registration. */
+/** Prepare a signed resolver/protocol CAS without changing the installed registration. */
 export declare function prepareSharedNativeResolverTransitionV1(input: SharedNativeModeContextV1 & {
     expectedRegistrationFingerprint: Sha256;
     resolverBinarySha256: string;
+    resolverProtocol?: SharedNativeResolverProtocolV1;
     repairBinding: SharedNativeResolverRepairBindingV1;
 }): {
     state: "prepared";
@@ -124,7 +134,17 @@ export declare function executeSharedNativeResolverTransitionV1(input: SharedNat
     priorResolverBinarySha256: string;
     resolverBinarySha256: string;
 } | Blocked;
-/** Installer port: load only the exact signed native binding and wipe the key after each phase. */
+export declare function readSharedNativeModeAtRootV1(input: {
+    stateRoot: string;
+}): SharedNativeModeReadResultV1;
+export declare function prepareSharedNativeResolverTransitionAtRootV1(input: {
+    stateRoot: string;
+    expectedRegistrationFingerprint: string;
+    resolverBinarySha256: string;
+    resolverProtocol?: SharedNativeResolverProtocolV1;
+    repairBinding: SharedNativeResolverRepairBindingV1;
+}): ReturnType<typeof prepareSharedNativeResolverTransitionV1>;
+/** Installer execution port: load only the exact signed native binding and wipe the key after each phase. */
 export declare function executeSharedNativeResolverTransitionAtRootV1(input: {
     stateRoot: string;
     plan: unknown;

@@ -1,3 +1,4 @@
+import { OBSERVED_RUST_OVERRIDES, UNOBSERVED_ORIGINAL_RUST_KEYS } from "../src/qualified-rust-evidence.ts";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -338,3 +339,20 @@ function canaryReference() {
     completedAt: t3,
   };
 }
+
+test("derived parser distinguishes qualified bounded Rust evidence from exact executed timestamps", () => {
+  const value = validReceipt();
+  const h = "1".repeat(64);
+  const qualified = { schemaVersion: 2 as const, kind: "codex-rust-lifecycle-tests" as const, sourceCommit: commitA,
+    patchedTreeSha256: h, cargoLockSha256: h, command: ["cargo", "test"], exitCode: 0 as const, passedTests: ["exact::proof"],
+    stdoutFile: "/private/source/log.stdout", stdoutSha256: h, stderrFile: "/private/source/log.stderr", stderrSha256: h,
+    candidateBinarySha256: h, origin: { kind: "lead-qualified-prior-transaction" as const, userRoot: "/private/source", transactionId: "prior",
+      qualification: { path: "/private/source/codex-source/qualifications/prior.json", sha256: h },
+      timing: { kind: "bounded-execution-window" as const, notBefore: t1, notAfter: t2 }, observations: { kind: "partially-observed-original-environment" as const, observedOverrides: OBSERVED_RUST_OVERRIDES,
+        unobservedOriginalKeys: UNOBSERVED_ORIGINAL_RUST_KEYS, testLibFingerprints: Array.from({ length: 9 }, (_, i) => ({ package: `shape-${i}`, testExecutable: `shape-${i}`, fingerprint: { path: `/private/shape-${i}.json`, sha256: "1".repeat(64) } })) }, priorToolchain: { rustc: "reconstructed exact rustc", rustcInfo: { path: "/private/source/rustc_info.json", sha256: h }, cargo: null } } };
+  value.rustLifecycleTests = qualified;
+  assert.equal(isCodexDerivedReceipt(value), true);
+  assert.equal(isCodexDerivedReceipt({ ...value, rustLifecycleTests: { ...qualified, startedAt: t1 } }), false);
+  assert.equal(isCodexDerivedReceipt({ ...value, rustLifecycleTests: { ...qualified, origin: { ...qualified.origin,
+    priorToolchain: { ...qualified.origin.priorToolchain, cargo: "invented Cargo-V" } } } }), false);
+});

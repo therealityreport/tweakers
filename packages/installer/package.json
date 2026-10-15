@@ -1,6 +1,6 @@
 {
   "name": "@therealityreport/tweakers-installer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Installer CLI for tweaker tweak system",
   "type": "module",
   "repository": {
@@ -26,7 +26,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run build-manager -- --bootstrap && npm run copy-assets && npm run build-manager && npm run copy-assets -- --only manager-launcher",
+    "build": "node ../../scripts/local-work.mjs workspace-build installer",
     "build-manager": "node ./scripts/build-manager.mjs",
     "copy-assets": "node ./scripts/copy-assets.mjs",
     "dev": "tsx src/cli.ts"
@@ -53,6 +53,7 @@
   },
   "license": "MIT",
   "engines": {
-    "node": ">=20"
-  }
+    "node": "^22.13.0 || >=24.0.0"
+  },
+  "tweakersBuildCommand": "tsc -p tsconfig.json && node ../../scripts/prune-shipped-tests.mjs dist && npm run build-manager -- --bootstrap && npm run copy-assets && npm run build-manager && npm run copy-assets -- --only manager-launcher"
 }

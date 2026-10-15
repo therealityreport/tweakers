@@ -1,8 +1,17 @@
-import { createHash } from "node:crypto";
+import { assertHistoricalManagerAdmission } from "./manager-historical-continuations.js";
+import { readManagerAcceptedBackendRecoveryEvidence, settleManagerAcceptedBackendRecovery, settleVerifiedManagerRecoveryOperations } from "./manager-recovery-evidence.js";
+import { acquireProcessLock } from "./process-lock.js";
+import { operationErrorMessage } from "./operation-error.js";
+import { readLiveAccountRouterBrokerStatus } from "./account-router-status.js";
+import { defaultTweakersAccountsBrokerRoot } from "./macos-variant.js";
+import { canonicalTweakersManagerRoot } from "./manager-descriptor.js";
+import { withLocalOperation } from "./local-operation.js";
+import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { constants, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import { writeDoctorPrivateJson } from "./doctor-store.js";
 import {
   observeCodexMainProcess,
   openAndActivateCodex,
@@ -36,13 +45,13 @@ import {
   readEnvironmentProfileRegistry,
   readEnvironmentSelection,
 } from "./environment-profile.js";
-import { ManagerOperationStore, managerOperationStorePaths, type ManagerOperationStorePaths } from "./manager-operation-store.js";
+import { ManagerOperationStore, managerOperationStorePaths, isManagerOperationId, type ManagerOperationStorePaths } from "./manager-operation-store.js";
 import { createTweakersManagerStatusSnapshot, managerStatusPaths, type CreateTweakersManagerStatusSnapshotInput, type ManagerStatusDependencies } from "./manager-status.js";
 import { resolveSealedTweakersManagerUserRoot } from "./manager-descriptor.js";
 import {
   acquireRegisteredOfficialSourceLease,
   readRegisteredOfficialSourceStatusProjection,
-  registerStableOfficialSource,
+  registerOfficialSourceEvidence,
 } from "./official-source-registration.js";
 import {
   resolveSealedManagerManagedRuntimeAssets,
@@ -58,6 +67,7 @@ import { getOpenReport, listProcesses, type ProcessInfo } from "./commands/debug
 import { locateCodexAtExactPath } from "./platform.js";
 import { userPaths } from "./paths.js";
 import type { DeferredTweakersVariantRefresh } from "./commands/create-variant.js";
+import { ForwardBackendTransitionRecoveryRequired } from "./shared-native-backend-transition.js";
 
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const MAX_PREPARE_TTL_MS = 10 * 60 * 1000;
@@ -126,6 +136,7 @@ export interface InjectedRefreshExecutionResult {
 /** Test-only dependencies for the fixed independent-app lifecycle helper.
  * They are deliberately absent from the sealed adapter factory. */
 export interface SealedIndependentRefreshLifecycleForTest {
+  reserveCutover?(): Promise<{ release(): Promise<void> }>;
   observe(app: string): CodexMainProcessObservation | null;
   quit(app: string, expectedPid: number): void;
   relatedPids(app: string): number[];
@@ -137,8 +148,11 @@ export interface SealedIndependentRefreshLifecycleForTest {
     execution: IndependentRefreshExecutionInput,
     sourceAuthorityRoot: string,
     beforePromotion: () => Promise<void>,
+    beforeRollback: () => void,
   ): Promise<DeferredTweakersVariantRefresh>;
   readRuntimeReady(userRoot: string): unknown | null;
+  /** Main-owned signed preparation latency only; never a request/approval override. */
+  runtimeReadyTimeoutMs?(accountsBrokerRoot: string): number;
   now(): number;
   sleep(milliseconds: number): Promise<void>;
   sealedAccountsRuntimeRoot(managerRoot: string): string | Promise<string>;
@@ -272,7 +286,7 @@ export class TweakersManagerActionAdapter {
     return withLifecycleLock(lifecycleLockFile(userRoot), `manager prepare ${input.actionId}`, async () => {
       const now = this.now();
       const executable = requireResolvedExecutable(input.executable);
-      const snapshot = this.snapshot(userRoot, executable, undefined, input.actionId);
+      let snapshot = this.snapshot(userRoot, executable, undefined, input.actionId);
       if (input.stateToken !== snapshot.stateToken) {
         throw staleState("The manager state changed before this action was prepared", snapshot.stateToken);
       }
@@ -290,6 +304,10 @@ export class TweakersManagerActionAdapter {
       if (!availability?.available) {
         throw new ManagerActionAdapterError("unsupported_action", availability?.reason ?? `Action ${input.actionId} is unavailable`, snapshot.stateToken);
       }
+      assertHistoricalManagerAdmission(userRoot);
+      if (settleVerifiedManagerRecoveryOperations(userRoot, this.store(userRoot), now).length) {
+        snapshot = this.snapshot(userRoot, executable, undefined, input.actionId);
+      }
       const target = this.receiptTarget(snapshot, input.actionId);
       if (target === null) {
         throw new ManagerActionAdapterError("unsupported_action", `Action ${input.actionId} has no exact durable receipt target`, snapshot.stateToken);
@@ -304,7 +322,7 @@ export class TweakersManagerActionAdapter {
         preparedRequestId: input.requestId,
         actionId: input.actionId,
         moduleIdentity: executable,
-        boundStateToken: input.stateToken,
+        boundStateToken: snapshot.stateToken,
         parameters: {},
         parametersSha256: digestCanonical({}),
         impact: spec.impact,
@@ -343,6 +361,10 @@ export class TweakersManagerActionAdapter {
   }
 
   async execute(input: ExecuteManagerActionInput): Promise<ExecuteManagerActionResult> {
+    return withLocalOperation(`manager:${input.operationId}`, () => this.executeOwned(input));
+  }
+
+  private async executeOwned(input: ExecuteManagerActionInput): Promise<ExecuteManagerActionResult> {
     const userRoot = this.userRoot();
     const executable = requireResolvedExecutable(input.executable);
     const consumed = await withLifecycleLock(lifecycleLockFile(userRoot), "manager execute consume", async () => {
@@ -375,6 +397,8 @@ export class TweakersManagerActionAdapter {
         store.replace(stale);
         throw staleState("The bound receipt is no longer actionable", projection.stateToken);
       }
+
+      assertHistoricalManagerAdmission(userRoot);
 
       // Consumption is persisted and fsynced before any legacy coordinator is
       // invoked. A process crash below can never reopen this approval.
@@ -750,7 +774,7 @@ export function createSealedTweakersManagerActionAdapter(
       return { completed: true };
     },
     async executeOfficialSourceRegister(input: OfficialSourceRegistrationExecutionInput) {
-      return registerStableOfficialSource({
+      return registerOfficialSourceEvidence({
         root: managerOperationStorePaths(userRoot()).userRoot,
         operationId: input.operationId,
         expectedSourceDigest: input.sourceDigest,
@@ -964,8 +988,88 @@ function committedInjectedRefreshResult(
   };
 }
 
+/** A legacy broker cannot prove comprehensive idleness. Require natural closure
+ * and hold its existing admission endpoint across the final cutover instead. */
+export async function reserveClosedIndependentTweakersCutover(): Promise<{ release(): Promise<void> }> {
+  const assertClosed = (): void => {
+    if (observeCodexMainProcess(INDEPENDENT_TWEAKERS_APP) !== null
+      || getOpenReport(locateCodexAtExactPath(INDEPENDENT_TWEAKERS_APP)).relatedPids.length > 0) {
+      throw new ManagerActionAdapterError("operation_conflict", "Finish active work and quit Tweakers before updating. No desktop or helper was interrupted.");
+    }
+  };
+  assertClosed();
+  const root = defaultTweakersAccountsBrokerRoot();
+  const observed = await readLiveAccountRouterBrokerStatus(root);
+  if (observed.state !== "not_running") throw new ManagerActionAdapterError("operation_conflict",
+    "Tweakers broker must finish active work and stop before updating; active or unavailable activity evidence cannot prove idle.");
+  const assets = resolveSealedManagerManagedRuntimeAssets();
+  if (!assets) throw new Error("Cutover requires the sealed Manager runtime");
+  verifySealedManagerManagedRuntimeAssets(assets);
+  const broker = createRequire(import.meta.url)(join(assets.root, "packages", "installer", "assets", "runtime", "account-router", "broker-socket.js")) as {
+    readAccountsBrokerSecret(root: string): Buffer | null;
+    reserveAccountsBrokerSocket(options: {root: string; secret: Buffer}): Promise<{close(): Promise<void>}>;
+  };
+  const secret = broker.readAccountsBrokerSecret(root);
+  if (!secret) throw new Error("Cutover broker capability is unavailable");
+  let desktop: ReturnType<typeof acquireProcessLock> | undefined;
+  let admission: {close(): Promise<void>} | undefined;
+  try {
+    desktop = acquireProcessLock(join(canonicalTweakersManagerRoot(), "desktop-instance.lock"));
+    admission = await broker.reserveAccountsBrokerSocket({root, secret});
+    assertClosed();
+    let released = false;
+    return {async release() {
+      if (released) return;
+      released = true;
+      try { await admission!.close(); }
+      finally { desktop!.release(); secret.fill(0); }
+    }};
+  } catch (error) {
+    try { await admission?.close(); } finally {desktop?.release(); secret.fill(0);}
+    throw error;
+  }
+}
+
+/** Every guarded reopen retains its native entry error even if the app exits
+ * before Tweakers' runtime logger can report it. These streams are diagnostics,
+ * never readiness or acceptance. The exact promoted path is checked by caller. */
+export function prepareIndependentStartupCapture(managerRoot: string): { stdout: string; stderr: string } {
+  if (managerRoot !== resolve(managerRoot) || realpathSync(managerRoot) !== managerRoot) throw new Error("Startup diagnostic root is not canonical");
+  const request = join(managerRoot, "doctor", "startup-diagnostics", "request.json"), status = lstatSync(request);
+  if (!status.isFile() || status.isSymbolicLink() || status.uid !== process.getuid?.() || (status.mode & 0o777) !== 0o600 || status.nlink !== 1 || status.size > 1024 || realpathSync(request) !== request) throw new Error("Startup capture request is not private");
+  const requested = JSON.parse(readFileSync(request, "utf8"));
+  if (!requested || Object.keys(requested).sort().join(",") !== "kind,requestId,target,version" || requested.version !== 1
+    || requested.kind !== "tweakers-native-startup-capture-request" || !isManagerOperationId(requested.requestId) || requested.target !== INDEPENDENT_TWEAKERS_APP) throw new Error("Startup capture request changed");
+  const directory = join(managerRoot, "doctor", "startup-diagnostics", randomUUID());
+  for (let cursor = managerRoot;;) {
+    const stat = lstatSync(cursor);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0 || realpathSync(cursor) !== cursor) throw new Error("Startup diagnostic ancestry is unsafe");
+    if (cursor === directory) break;
+    const next = directory.slice(cursor.length + 1).split("/")[0]!;
+    cursor = join(cursor, next);
+    if (!existsSync(cursor)) mkdirSync(cursor, { mode: 0o700 });
+  }
+  const streams = { stdout: join(directory, "stdout.log"), stderr: join(directory, "stderr.log") };
+  for (const file of Object.values(streams)) closeSync(openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_WRONLY, 0o600));
+  const expectation = join(managerRoot, "variants", "tweakers", "runtime-ready-expectation.json");
+  let operationId: string | null = null, promotionId: string | null = null;
+  if (existsSync(expectation)) {
+    const value = JSON.parse(readFileSync(expectation, "utf8"));
+    if (isManagerOperationId(value.operationId)) operationId = value.operationId;
+    if (isManagerOperationId(value.promotionId)) promotionId = value.promotionId;
+  }
+  writeDoctorPrivateJson(join(directory, "capture.json"), { version: 1, kind: "tweakers-native-startup-diagnostics", operationId, promotionId, target: INDEPENDENT_TWEAKERS_APP, createdAt: new Date().toISOString(), ...streams });
+  const current = lstatSync(request);
+  if (current.dev !== status.dev || current.ino !== status.ino || current.mtimeMs !== status.mtimeMs || current.size !== status.size) throw new Error("Startup capture request changed during preparation");
+  // A private request changes only diagnostic routing. It grants no app launch,
+  // journal, backend, readiness or acceptance authority and is used once.
+  renameSync(request, join(directory, "request-consumed.json"));
+  return streams;
+}
+
 function createSealedIndependentRefreshLifecycle(): SealedIndependentRefreshLifecycleForTest {
   return {
+    reserveCutover: reserveClosedIndependentTweakersCutover,
     observe: observeCodexMainProcess,
     quit: quitCodexMainProcess,
     relatedPids(app: string): number[] {
@@ -975,12 +1079,17 @@ function createSealedIndependentRefreshLifecycle(): SealedIndependentRefreshLife
     signal(pid: number, signal: NodeJS.Signals): void {
       process.kill(pid, signal);
     },
-    reopen: openAndActivateCodex,
+    reopen(app: string): void {
+      if (app !== INDEPENDENT_TWEAKERS_APP) throw new Error("Independent reopen target changed");
+      const root = canonicalTweakersManagerRoot(), request = join(root, "doctor", "startup-diagnostics", "request.json");
+      openAndActivateCodex(app, existsSync(request) ? prepareIndependentStartupCapture(root) : undefined);
+    },
     async refresh(
       input: IndependentRefreshInput,
       execution: IndependentRefreshExecutionInput,
       sourceAuthorityRoot: string,
       beforePromotion: () => Promise<void>,
+      beforeRollback: () => void,
     ): Promise<DeferredTweakersVariantRefresh> {
       const { prepareDeferredTweakersVariantRefresh } = await import("./commands/create-variant.js");
       return prepareDeferredTweakersVariantRefresh({
@@ -1006,6 +1115,7 @@ function createSealedIndependentRefreshLifecycle(): SealedIndependentRefreshLife
           }
           await beforePromotion();
         },
+        beforeRollback,
       });
     },
     readRuntimeReady(userRoot: string): unknown | null {
@@ -1020,6 +1130,24 @@ function createSealedIndependentRefreshLifecycle(): SealedIndependentRefreshLife
         throw new Error("Independent Tweakers runtime-ready receipt is not owned by the current user.");
       }
       return JSON.parse(readFileSync(path, "utf8")) as unknown;
+    },
+    runtimeReadyTimeoutMs(accountsBrokerRoot: string): number {
+      if (accountsBrokerRoot !== defaultTweakersAccountsBrokerRoot()) throw new Error("Independent startup broker root changed");
+      const assets = resolveSealedManagerRuntimeAssets();
+      if (assets === null) throw new Error("Sealed startup preparation runtime is unavailable");
+      verifySealedManagerRuntimeAssets(assets);
+      const load = createRequire(import.meta.url);
+      const sockets = load(join(assets.root, "account-router", "broker-socket.js")) as {
+        readAccountsBrokerSecret(root: string): Buffer | null;
+      };
+      const mode = load(join(assets.root, "account-router", "shared-native-mode.js")) as {
+        sharedNativePluginPreparationTimeoutV1(root: string, secret: Buffer, fallbackMs: number): number;
+      };
+      const secret = sockets.readAccountsBrokerSecret(accountsBrokerRoot);
+      if (!secret) return INDEPENDENT_RUNTIME_READY_TIMEOUT_MS;
+      try {
+        return INDEPENDENT_RUNTIME_READY_TIMEOUT_MS + mode.sharedNativePluginPreparationTimeoutV1(accountsBrokerRoot, secret, 0);
+      } finally { secret.fill(0); }
     },
     now: () => Date.now(),
     sleep: (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -1069,17 +1197,26 @@ function createSealedIndependentRefreshExecutor(
         "Independent Tweakers refresh requires a source-bound validated Accounts recovery receipt in the sealed runtime. Rebuild candidate compatibility evidence.",
       );
     }
+    let cutoverLease: {release(): Promise<void>} | null = null;
+    const releaseCutover = async (): Promise<void> => {
+      const releasing = cutoverLease; cutoverLease = null;
+      await releasing?.release();
+    };
     const beforePromotion = async (): Promise<void> => {
       // This hook runs after sealed candidate staging and immediately before
       // the exact process gate and atomic promotion. It is the narrowest
       // independent-refresh cutover boundary the manager can observe.
       await timing?.start("quiesce-promote");
+      cutoverLease = await lifecycle.reserveCutover?.() ?? null;
       const observed = lifecycle.observe(INDEPENDENT_TWEAKERS_APP);
+      if (cutoverLease && (observed !== null || lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length > 0)) {
+        throw new ManagerActionAdapterError("operation_conflict", "Tweakers appeared during closed-app cutover; no process was interrupted.");
+      }
       // Record the pre-cutover identity before any lifecycle action. If
       // quiescence fails after the main process exits, the failure path still
       // knows which previously running app must be restored.
       cutover.quiesced = observed;
-      await quiesceIndependentTweakers(lifecycle, observed);
+      if (!cutoverLease) await quiesceIndependentTweakers(lifecycle, observed);
       cutover.quiescenceProven = true;
       try {
         lifecycle.prepareAccountContinuity(join(
@@ -1099,6 +1236,15 @@ function createSealedIndependentRefreshExecutor(
       // ordinary prelaunch does; a later idle launch retries the migration.
     };
     let deferred: DeferredTweakersVariantRefresh | null = null;
+    const beforeRollback = (): void => {
+      if (lifecycle.reserveCutover && cutoverLease === null) {
+        throw new Error("Independent Tweakers rollback requires held closed desktop and broker admission.");
+      }
+      if (lifecycle.observe(INDEPENDENT_TWEAKERS_APP) !== null
+        || lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length > 0) {
+        throw new Error("Independent Tweakers rollback cannot compensate while the desktop or its helpers are running.");
+      }
+    };
     try {
       // create-variant deliberately owns source validation, clone, signing,
       // verification under one sealed
@@ -1109,7 +1255,7 @@ function createSealedIndependentRefreshExecutor(
         "The sealed candidate builder exposes this only inside patch stage.",
       );
       await timing?.start("patch-stage");
-      deferred = await lifecycle.refresh(refreshInput, execution, managerUserRoot, beforePromotion);
+      deferred = await lifecycle.refresh(refreshInput, execution, managerUserRoot, beforePromotion, beforeRollback);
       if (!lifecycle.verifyAccountsTransferRecovery(join(refreshInput.userRoot, "runtime"))) {
         throw new ManagerActionAdapterError(
           "internal_error",
@@ -1119,21 +1265,39 @@ function createSealedIndependentRefreshExecutor(
       await timing?.complete("patch-stage");
       await timing?.complete("quiesce-promote");
       await timing?.start("runtime-ready-wait");
+      await releaseCutover();
       await reopenAndProveIndependentTweakers(lifecycle, cutover.quiesced, deferred);
       await timing?.complete("runtime-ready-wait");
       deferred.commit();
     } catch (error) {
+      if (deferred?.recoveryMode === "forward-only" || error instanceof ForwardBackendTransitionRecoveryRequired) {
+        // The registered resolver has crossed its CAS boundary. Retain the
+        // exact app/runtime journal and leave live processes untouched; only
+        // the bound forward-recovery path can complete this generation.
+        deferred?.retain();
+        throw error;
+      }
       const rollbackErrors: unknown[] = [];
       if (deferred !== null) {
         try {
           // A broken newly-reopened process must not keep the target path busy
           // while its uncommitted generation is restored.
-          await quiesceIndependentTweakers(lifecycle, lifecycle.observe(INDEPENDENT_TWEAKERS_APP));
+          const current = lifecycle.observe(INDEPENDENT_TWEAKERS_APP);
+          if (lifecycle.reserveCutover && (current !== null || lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length > 0)) {
+            throw new Error("Tweakers is running after failed acceptance; transaction and fallback retained without interrupting possibly active work.");
+          }
+          if (lifecycle.reserveCutover) {
+            // A failed launch may leave its broker alive after the main exits.
+            // Reacquire both admission boundaries before any compensation.
+            cutoverLease ??= await lifecycle.reserveCutover();
+            beforeRollback();
+          } else await quiesceIndependentTweakers(lifecycle, current);
         } catch (rollbackError) {
+          deferred.retain();
           rollbackErrors.push(rollbackError);
         }
         if (rollbackErrors.length === 0) {
-          try { deferred.rollback(); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+          try { deferred.rollback(); } catch (rollbackError) { deferred.retain(); rollbackErrors.push(rollbackError); }
         }
       }
       // refreshTweakersVariant rethrows the original ordinary failure after a
@@ -1171,8 +1335,197 @@ function createSealedIndependentRefreshExecutor(
         );
       }
       throw error;
+    } finally {
+      await releaseCutover();
     }
   };
+}
+
+interface IndependentBackendRecoveryPort {
+  readEvidence: typeof readManagerAcceptedBackendRecoveryEvidence;
+  resume(input: { userRoot: string; target: string; promotionId: string; operationId: string; expectedJournalSha256: string },
+    managerRoot: string, assertClosedAdmission: () => void): Promise<DeferredTweakersVariantRefresh>;
+  settle(managerRoot: string, operationId: string): boolean;
+}
+
+/** Continue the original consumed operation; callers supply no roots or new authority. */
+export async function resumeSealedIndependentBackendTransition(operationId: string): Promise<void> {
+  const root = resolveSealedTweakersManagerUserRoot();
+  const lifecycle = createSealedIndependentRefreshLifecycle();
+  const executor = createSealedIndependentBackendRecoveryExecutor(() => root, lifecycle, {
+    readEvidence: readManagerAcceptedBackendRecoveryEvidence,
+    async resume(input, managerRoot, beforeRollback) {
+      const { resumeDeferredAcceptedBackendTransition } = await import("./commands/create-variant.js");
+      return resumeDeferredAcceptedBackendTransition(input, { managerRoot: () => managerRoot, beforeRollback });
+    },
+    settle: settleManagerAcceptedBackendRecovery,
+  });
+  await withLocalOperation(`manager-forward-recovery:${operationId}`, () => withLifecycleLock(lifecycleLockFile(root),
+    `accepted backend recovery ${operationId}`, () => executor(operationId)));
+}
+
+/** One fixed child repairs the original operation; no new action/CAS/root is supplied. */
+export async function resumeSealedAcceptedRuntimeRepair(operationId:string):Promise<void> {
+  const root=resolveSealedTweakersManagerUserRoot(),lifecycle=createSealedIndependentRefreshLifecycle();
+  const repair=await import("./accepted-runtime-repair.js");
+  await withLocalOperation(`manager-runtime-repair:${operationId}`,()=>withLifecycleLock(lifecycleLockFile(root),`accepted runtime repair ${operationId}`,async()=>{
+    await createSealedAcceptedRuntimeRepairExecutor(lifecycle,repair)(operationId);
+  }));
+}
+
+type AcceptedRuntimeRepairExecutionPort=Pick<typeof import("./accepted-runtime-repair.js"),"readAcceptedRuntimeRepairRecord"|"readAuthenticatedAcceptedRuntimeRepair"|
+  "settleAcceptedRuntimeRepair"|"finishAcceptedRuntimeRepairFromRetainedAcceptance"|"resumeAcceptedRuntimeRepair">;
+function createSealedAcceptedRuntimeRepairExecutor(lifecycle:SealedIndependentRefreshLifecycleForTest,repair:AcceptedRuntimeRepairExecutionPort):(operationId:string)=>Promise<void> {
+  return async(operationId)=>{
+    if(!isManagerOperationId(operationId)||!lifecycle.reserveCutover)throw new Error("Runtime repair requires exact operation and closed admission");
+    let admission:{release():Promise<void>}|null=null,deferred:DeferredTweakersVariantRefresh|null=null;
+    const assertClosed=()=>{
+      if(!admission||lifecycle.observe(INDEPENDENT_TWEAKERS_APP)!==null||lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length!==0)
+        throw new Error("Accepted runtime repair lost held closed desktop and broker admission");
+    };
+    const release=async()=>{const held=admission;admission=null;await held?.release();};
+    const assertAcceptedProcess=(pid:number,token:string)=>{
+      const observed=lifecycle.observe(INDEPENDENT_TWEAKERS_APP);
+      if(!observed||observed.pid!==pid||observed.startedAtRaw!==token)throw new Error("Accepted runtime repair canary process identity changed");
+    };
+    try {
+      admission=await lifecycle.reserveCutover();assertClosed();
+      const record=repair.readAcceptedRuntimeRepairRecord(operationId);
+      if(record?.publication.phase==="committed") {
+        repair.readAuthenticatedAcceptedRuntimeRepair(operationId);
+        if(!repair.settleAcceptedRuntimeRepair(operationId))throw new Error("Committed runtime repair lacks authenticated original settlement");
+        return;
+      }
+      if(record&&(["acceptance:verified","active:archive-planned","active:archived","active:promote-planned","active:promoted"].includes(record.publication.phase)
+        ||record.publication.phase==="challenge:published"&&existsSync(join(record.root,"acceptance.json")))) {
+        repair.finishAcceptedRuntimeRepairFromRetainedAcceptance(operationId,assertClosed);
+        if(!repair.settleAcceptedRuntimeRepair(operationId))throw new Error("Retained genuine canary did not settle the original repair");
+        return;
+      }
+      deferred=repair.resumeAcceptedRuntimeRepair(operationId,{assertClosedAdmission:assertClosed,assertAcceptedProcess});
+      if(deferred.recoveryMode!=="forward-only"||deferred.runtimeReadyExpectation.operationId!==operationId)throw new Error("Runtime repair returned foreign authority");
+      await release();
+      await reopenAndProveIndependentTweakers(lifecycle,null,deferred);
+      deferred.commit();deferred=null;
+      if(!repair.settleAcceptedRuntimeRepair(operationId))throw new Error("Runtime repair acceptance did not settle its original operation");
+    }catch(error){deferred?.retain();throw error;}finally{await release();}
+  };
+}
+
+/** Explicit fixture ports; the sealed production entry always uses real APIs. */
+export function createSealedAcceptedRuntimeRepairExecutorForTest(lifecycle:SealedIndependentRefreshLifecycleForTest,repair:AcceptedRuntimeRepairExecutionPort):(operationId:string)=>Promise<void> {
+  return createSealedAcceptedRuntimeRepairExecutor(lifecycle,repair);
+}
+
+type AcceptedRuntimeRepairApprovalPort=Pick<typeof import("./accepted-runtime-repair.js"),"acceptedRuntimeRepairApprovalRequiresClosedAdmission"|"approveAcceptedRuntimeRepair">;
+function createSealedAcceptedRuntimeRepairApprovalExecutor(lifecycle:SealedIndependentRefreshLifecycleForTest,repair:AcceptedRuntimeRepairApprovalPort) {
+  return async(jobId:string,reportFingerprint:string)=>{
+    if(!repair.acceptedRuntimeRepairApprovalRequiresClosedAdmission(jobId,reportFingerprint))return repair.approveAcceptedRuntimeRepair(jobId,reportFingerprint);
+    if(!lifecycle.reserveCutover)throw new Error("Successor approval requires closed desktop and broker admission");
+    let admission:Awaited<ReturnType<NonNullable<SealedIndependentRefreshLifecycleForTest["reserveCutover"]>>>|null=null;
+    const assertClosed=()=>{
+      if(!admission||lifecycle.observe(INDEPENDENT_TWEAKERS_APP)!==null||lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length!==0)
+        throw new Error("Successor approval lost held closed admission");
+    };
+    try{admission=await lifecycle.reserveCutover();assertClosed();return repair.approveAcceptedRuntimeRepair(jobId,reportFingerprint,assertClosed);}
+    finally{const lease=admission;admission=null;await lease?.release();}
+  };
+}
+/** Explicit fixture ports; production calls the same executor with real APIs. */
+export function createSealedAcceptedRuntimeRepairApprovalExecutorForTest(lifecycle:SealedIndependentRefreshLifecycleForTest,repair:AcceptedRuntimeRepairApprovalPort) {
+  return createSealedAcceptedRuntimeRepairApprovalExecutor(lifecycle,repair);
+}
+
+export async function runSealedAcceptedRuntimeRepairDoctorAction(value:unknown):Promise<unknown> {
+  const repair=await import("./accepted-runtime-repair.js"),request=repair.parseAcceptedRuntimeRepairAction(value);
+  if(request.action==="recover") {
+    await resumeSealedAcceptedRuntimeRepair(request.operationId);
+    return{operationId:request.operationId,outcome:"verified-installation-accepted"};
+  }
+  const root=resolveSealedTweakersManagerUserRoot();
+  return withLocalOperation(`manager-runtime-repair-doctor:${request.action}`,()=>withLifecycleLock(lifecycleLockFile(root),`runtime repair Doctor ${request.action}`,async()=>{
+    if(request.action==="prepare-native-replacement") {
+      const lifecycle=createSealedIndependentRefreshLifecycle();
+      return createSealedNativeReplacementExecutor(lifecycle,repair)(request.operationId);
+    }
+    if(request.action==="scan-successor") {
+      const lifecycle=createSealedIndependentRefreshLifecycle();
+      if(!lifecycle.reserveCutover)throw new Error("Successor review requires closed desktop and broker admission");
+      const admission=await lifecycle.reserveCutover();
+      const assertClosed=()=>{if(lifecycle.observe(INDEPENDENT_TWEAKERS_APP)!==null||lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length!==0)
+        throw new Error("Successor review lost held closed admission");};
+      try{assertClosed();return{report:await repair.scanAcceptedRuntimeRepairSuccessor(request.operationId,assertClosed)};}
+      finally{await admission.release();}
+    }
+    if(request.action==="scan")return{report:await repair.scanAcceptedRuntimeRepair(request.operationId)};
+    return{approval:await createSealedAcceptedRuntimeRepairApprovalExecutor(createSealedIndependentRefreshLifecycle(),repair)(request.jobId,request.reportFingerprint)};
+  }));
+}
+
+function createSealedNativeReplacementExecutor(lifecycle:SealedIndependentRefreshLifecycleForTest,
+  repair:Pick<typeof import("./accepted-runtime-repair.js"),"prepareAcceptedRuntimeNativeReplacement">) {
+  return async(operationId:string)=>{
+    if(!lifecycle.reserveCutover)throw new Error("Native replacement requires closed desktop and broker admission");
+    let admission:Awaited<ReturnType<NonNullable<SealedIndependentRefreshLifecycleForTest["reserveCutover"]>>>|null=null;
+    const assertClosed=()=>{
+      if(!admission||lifecycle.observe(INDEPENDENT_TWEAKERS_APP)!==null||lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length!==0)
+        throw new Error("Native replacement lost held closed admission");
+    };
+    try{admission=await lifecycle.reserveCutover();assertClosed();return await repair.prepareAcceptedRuntimeNativeReplacement(operationId,assertClosed);}
+    finally{const lease=admission;admission=null;await lease?.release();}
+  };
+}
+export function createSealedNativeReplacementExecutorForTest(lifecycle:SealedIndependentRefreshLifecycleForTest,
+  repair:Pick<typeof import("./accepted-runtime-repair.js"),"prepareAcceptedRuntimeNativeReplacement">) {
+  return createSealedNativeReplacementExecutor(lifecycle,repair);
+}
+
+function createSealedIndependentBackendRecoveryExecutor(userRoot: () => string, lifecycle: SealedIndependentRefreshLifecycleForTest,
+  port: IndependentBackendRecoveryPort): (operationId: string) => Promise<void> {
+  return async operationId => {
+    const managerRoot = userRoot();
+    const evidence = port.readEvidence(managerRoot, operationId);
+    if (evidence.committed) {
+      if (!port.settle(managerRoot, operationId)) throw new Error("Committed backend recovery lacks its exact installed acceptance");
+      return;
+    }
+    if (!lifecycle.reserveCutover) throw new Error("Backend recovery requires closed desktop and broker admission");
+    let admission: {release(): Promise<void>} | null = null;
+    let deferred: DeferredTweakersVariantRefresh | null = null;
+    const assertClosedAdmission = () => {
+      if (!admission || lifecycle.observe(INDEPENDENT_TWEAKERS_APP) !== null || lifecycle.relatedPids(INDEPENDENT_TWEAKERS_APP).length > 0) {
+        throw new Error("Backend recovery lost closed desktop and broker admission");
+      }
+    };
+    const release = async () => { const lease = admission; admission = null; await lease?.release(); };
+    try {
+      admission = await lifecycle.reserveCutover();
+      assertClosedAdmission();
+      // Re-read under admission. A changed operation or journal is never
+      // substituted for the original recovery request.
+      const held = port.readEvidence(managerRoot, operationId);
+      if (canonicalManagerJson(held) !== canonicalManagerJson(evidence)) throw new Error("Backend recovery evidence changed before replay");
+      const { binding } = evidence;
+      deferred = await port.resume({ userRoot: binding.userRoot, target: binding.target, promotionId: binding.promotionId,
+        operationId, expectedJournalSha256: evidence.journalSha256 }, managerRoot, assertClosedAdmission);
+      if (deferred.recoveryMode !== "forward-only" || deferred.target !== binding.target || deferred.userRoot !== binding.userRoot
+        || deferred.runtimeReadyExpectation.operationId !== operationId) throw new Error("Backend recovery returned a different authority");
+      if (!lifecycle.verifyAccountsTransferRecovery(join(binding.userRoot, "runtime"))) throw new Error("Backend recovery Accounts binding is not verified");
+      await release();
+      await reopenAndProveIndependentTweakers(lifecycle, null, deferred);
+      deferred.commit();
+      deferred = null;
+      if (!port.settle(managerRoot, operationId)) throw new Error("Backend recovery commit lacks exact installation evidence");
+    } catch (error) {
+      deferred?.retain();
+      throw error;
+    } finally { await release(); }
+  };
+}
+
+export function createSealedIndependentBackendRecoveryExecutorForTest(userRoot: () => string,
+  lifecycle: SealedIndependentRefreshLifecycleForTest, port: IndependentBackendRecoveryPort): (operationId: string) => Promise<void> {
+  return createSealedIndependentBackendRecoveryExecutor(userRoot, lifecycle, port);
 }
 
 async function quiesceIndependentTweakers(
@@ -1245,6 +1598,12 @@ async function reopenAndProveIndependentTweakers(
   previous: CodexMainProcessObservation | null,
   deferred: DeferredTweakersVariantRefresh,
 ): Promise<void> {
+  const runtimeReadyTimeoutMs = lifecycle.runtimeReadyTimeoutMs?.(deferred.runtimeReadyExpectation.accountsBrokerRoot)
+    ?? INDEPENDENT_RUNTIME_READY_TIMEOUT_MS;
+  if (!Number.isSafeInteger(runtimeReadyTimeoutMs) || runtimeReadyTimeoutMs < INDEPENDENT_RUNTIME_READY_TIMEOUT_MS
+    || runtimeReadyTimeoutMs > INDEPENDENT_RUNTIME_READY_TIMEOUT_MS + 600_000) {
+    throw new ManagerActionAdapterError("operation_conflict", "Independent runtime preparation deadline is invalid");
+  }
   lifecycle.reopen(INDEPENDENT_TWEAKERS_APP);
   const processDeadline = lifecycle.now() + INDEPENDENT_REOPEN_PROCESS_TIMEOUT_MS;
   let runtimeReadyDeadline: number | null = null;
@@ -1261,7 +1620,7 @@ async function reopenAndProveIndependentTweakers(
       // PID/start token instead. The receipt is the stronger renderer proof:
       // it can be published only after the owned preload initialized every
       // enabled renderer tweak and observed the Settings surface mounted.
-      runtimeReadyDeadline ??= lifecycle.now() + INDEPENDENT_RUNTIME_READY_TIMEOUT_MS;
+      runtimeReadyDeadline ??= lifecycle.now() + runtimeReadyTimeoutMs;
       const receipt = lifecycle.readRuntimeReady(deferred.userRoot);
       if (receipt !== null) {
         deferred.verifyRuntimeReady(receipt, observed.pid, processStartToken);
@@ -1799,7 +2158,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return operationErrorMessage(error);
 }
 
 // Keep these imports used in the public type surface when the runtime is

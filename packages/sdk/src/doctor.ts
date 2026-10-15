@@ -32,6 +32,13 @@ export interface DoctorFindingV1 {
   evidence: string[];
 }
 export interface DoctorReportV1 {
+  /** Last upstream probe, independent of installation acceptance. */
+  upstreamCurrency?: {
+    version: 1; jobId: string; checkedAt: string;
+    state: "current" | "update-available" | "unavailable";
+    installedVersion: string | null; installedBuild: string | null;
+    latestVersion: string | null; latestBuild: string | null;
+  };
   schemaVersion: 1;
   /** Additive capabilities; legacy reports never imply these guarantees. */
   workflowVersion?: 2;

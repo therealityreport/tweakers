@@ -12,7 +12,7 @@
       "manifest": {
         "id": "co.tweakers.account-switcher",
         "name": "Accounts",
-        "version": "0.10.6",
+        "version": "0.10.16",
         "githubRepo": "therealityreport/tweakers",
         "description": "Manage saved Codex accounts, pooled usage, quota-aware routing, safe failover, and paired devices.",
         "author": "hulibrands",
@@ -22,6 +22,7 @@
           "security"
         ],
         "scope": "both",
+        "minRuntime": ">=1.0.0",
         "permissions": [
           "ipc",
           "filesystem",
@@ -41,9 +42,9 @@
       "manifest": {
         "id": "co.tweakers.appshots",
         "name": "AppShots",
-        "version": "0.1.1",
+        "version": "0.2.0",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Capture the frontmost window and attach a PNG plus Accessibility context to the active composer.",
+        "description": "Use authentic native Codex AppShots and view native Computer History status.",
         "author": {
           "name": "Tweakers"
         },
@@ -53,15 +54,11 @@
           "composer",
           "shortcut"
         ],
-        "scope": "both",
+        "scope": "renderer",
         "main": "index.js",
         "minRuntime": ">=1.1.0",
         "permissions": [
-          "settings",
-          "ipc",
-          "screen-capture",
-          "accessibility",
-          "global-shortcut"
+          "settings"
         ]
       },
       "approvedAt": "2026-07-13T23:25:44.476Z",
@@ -109,7 +106,7 @@
       "manifest": {
         "id": "co.tweakers.followup",
         "name": "Codex Follow-up",
-        "version": "0.2.2",
+        "version": "0.2.4",
         "githubRepo": "therealityreport/tweakers",
         "description": "Context-aware next-step prompts for Codex conversations.",
         "author": "hulibrands",
@@ -118,6 +115,7 @@
           "productivity"
         ],
         "scope": "both",
+        "minRuntime": ">=1.0.0",
         "permissions": [
           "settings",
           "ipc"
@@ -136,9 +134,9 @@
       "manifest": {
         "id": "co.tweakers.projects",
         "name": "Projects",
-        "version": "0.7.4",
+        "version": "0.8.6",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Project-colored sidebar rows, folder-local task sorting and pinning, project settings, connection references, and read-only repository inventory.",
+        "description": "Project organization, folder-local task ordering, connection references, and independently switchable thread summary profiles.",
         "author": "hulibrands",
         "tags": [
           "projects",
@@ -169,7 +167,7 @@
       "manifest": {
         "id": "co.tweakers.shadcn-codex-ui",
         "name": "Shadcn Codex UI",
-        "version": "0.2.3",
+        "version": "0.2.7",
         "githubRepo": "therealityreport/tweakers",
         "description": "Render bounded, extensible Rich Blocks v1 in an owned, native-safe message section.",
         "author": "hulibrands",
@@ -197,7 +195,7 @@
       "manifest": {
         "id": "co.tweakers.thread-summary-profiles",
         "name": "Thread Summary Profiles",
-        "version": "0.2.4",
+        "version": "0.2.7",
         "githubRepo": "therealityreport/tweakers",
         "description": "Show read-only, sanitized connection profiles for the validated active thread project.",
         "author": "hulibrands",
@@ -208,6 +206,7 @@
           "read-only"
         ],
         "scope": "renderer",
+        "minRuntime": ">=1.0.0",
         "permissions": [
           "ipc"
         ]
@@ -225,7 +224,7 @@
       "manifest": {
         "id": "co.tweakers.titlebar-controls",
         "name": "Titlebar Controls",
-        "version": "0.2.3",
+        "version": "0.2.6",
         "githubRepo": "therealityreport/tweakers",
         "description": "Reversible native titlebar controls aligned with the customized interface.",
         "author": "hulibrands",
@@ -235,6 +234,7 @@
           "macos"
         ],
         "scope": "renderer",
+        "minRuntime": ">=1.0.0",
         "permissions": []
       },
       "approvedAt": "2026-07-10T00:00:00.000Z",
@@ -250,9 +250,9 @@
       "manifest": {
         "id": "co.tweakers.ui-improvements",
         "name": "UI Improvements",
-        "version": "0.2.5",
+        "version": "0.3.1",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Four independent interface improvements with reversible lifecycle cleanup.",
+        "description": "Independent interface improvements including Titlebar Controls and Shadcn Rich Blocks.",
         "author": "hulibrands",
         "tags": [
           "ui",
@@ -277,7 +277,7 @@
       "manifest": {
         "id": "co.tweakers.usage-limit-resets-tracker",
         "name": "Usage Limit Resets Tracker",
-        "version": "0.4.1",
+        "version": "0.4.5",
         "githubRepo": "therealityreport/tweakers",
         "description": "Track observed usage-limit resets and clearly label observed versus estimated times.",
         "author": "hulibrands",
@@ -287,6 +287,7 @@
           "limits"
         ],
         "scope": "renderer",
+        "minRuntime": ">=1.0.0",
         "permissions": [
           "settings"
         ]
@@ -304,7 +305,7 @@
       "manifest": {
         "id": "co.tweakers.user-questions",
         "name": "User Questions",
-        "version": "1.0.0",
+        "version": "1.0.3",
         "githubRepo": "therealityreport/tweakers",
         "description": "Optional enhancement for the separately installed User Questions service. The standard MCP form remains available when enhancement is absent or incompatible.",
         "author": "hulibrands",

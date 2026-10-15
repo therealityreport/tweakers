@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "allowJs": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "allowImportingTsExtensions": true
+  },
+  "include": ["packages/**/*.ts"],
+  "exclude": ["**/dist/**", "**/assets/**", "**/node_modules/**"]
+}

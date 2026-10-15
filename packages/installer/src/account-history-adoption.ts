@@ -1,3 +1,4 @@
+import { boundedOpenFileCensus } from "./open-file-census.js";
 import { spawnSync } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import {
@@ -2470,7 +2471,7 @@ function defaultSqliteAdapter(): HistoryAdoptionSqliteAdapter {
 export function observeHistoryAdoptionCensus(input: HistoryAdoptionCensusInput): HistoryAdoptionCensus {
   const observedAt = new Date().toISOString();
   try {
-    const ps = spawnSync("/bin/ps", ["-axo", "pid=,command="], {
+    const ps = spawnSync("/bin/ps", ["-axo", "pid=,command="], { timeout: 5000, maxBuffer: 8 * 1024 * 1024,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -2478,10 +2479,7 @@ export function observeHistoryAdoptionCensus(input: HistoryAdoptionCensusInput):
     const processCensus = historyAdoptionProcessCensus(ps.stdout, input.appPath);
     let openFileCount = 0;
     for (const path of input.protectedPaths) {
-      const lsof = spawnSync("/usr/sbin/lsof", ["-nP", "+D", path], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const lsof = boundedOpenFileCensus(path);
       // lsof exits 1 when it found no matches. Any other failure is unknown.
       if (lsof.error || (lsof.status !== 0 && lsof.status !== 1)) return unknownCensus(observedAt);
       if (typeof lsof.stdout === "string") {

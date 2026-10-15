@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, readFileSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { acquireProcessLock } from "@therealityreport/tweakers-sdk/dist/process-lock.js";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { AccountsBrokerV1, assertBrokerCommandResult, assertBrokerRedacted, createBrokerHandshakeProof } from "./broker";
 import type { NativeSharedHistoryMapRequestV1, NativeSharedHistoryMapResultV1 } from "./broker-host";
@@ -213,6 +214,16 @@ export async function startAccountsBrokerSocket(options: AccountsBrokerSocketOpt
 export async function reserveAccountsBrokerSocket(
   options: Pick<AccountsBrokerSocketOptions, "root" | "secret" | "socketFileName" | "maxFrameBytes">,
 ): Promise<AccountsBrokerSocketReservation> {
+  const root = assertBrokerRoot(options.root);
+  assertPrivateBrokerRoot(root);
+  const electionLock = acquireProcessLock(join(root, ".accounts-broker-election.lock"));
+  try { return await reserveAccountsBrokerSocketUnderLock(options); }
+  finally { electionLock.release(); }
+}
+
+async function reserveAccountsBrokerSocketUnderLock(
+  options: Pick<AccountsBrokerSocketOptions, "root" | "secret" | "socketFileName" | "maxFrameBytes">,
+): Promise<AccountsBrokerSocketReservation> {
   if (options.secret.byteLength !== 32) throw new Error("invalid accounts broker capability");
   const root = assertBrokerRoot(options.root);
   assertPrivateBrokerRoot(root);
@@ -253,10 +264,11 @@ export async function reserveAccountsBrokerSocket(
   let closed = false;
   const close = async (): Promise<void> => {
     if (closed) return;
-    closed = true;
     activation = null;
     await closeServer(server, connections);
-    await removeStaleSocket(path);
+    const electionLock = acquireProcessLock(join(root, ".accounts-broker-election.lock"));
+    try { await removeStaleSocket(path); closed = true; }
+    finally { electionLock.release(); }
   };
   return {
     path,
@@ -280,6 +292,43 @@ export interface BrokerControlSocketOptions {
   status: () => BrokerControlStatusV1;
   socketFileName?: string;
   maxFrameBytes?: number;
+}
+
+/** Bounded authenticated liveness probe; no account child or profile fanout. */
+export function probeAccountsBrokerControlStatus(root: string, secret: Buffer): Promise<boolean> {
+  if (secret.byteLength !== 32) return Promise.resolve(false);
+  const path = accountsBrokerSocketPath(root, ACCOUNTS_BROKER_CONTROL_SOCKET_FILE);
+  try { assertPrivateSocket(path); } catch { return Promise.resolve(false); }
+  return new Promise((resolvePromise) => {
+    const socket = createConnection(path);
+    const requestId = randomBytes(12).toString("base64url");
+    let buffered = "";
+    let settled = false;
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolvePromise(value);
+    };
+    const timer = setTimeout(() => finish(false), 2_000);
+    timer.unref();
+    socket.once("error", () => finish(false));
+    socket.once("close", () => finish(false));
+    socket.once("connect", () => socket.write(`${JSON.stringify({ version: 1, method: "status", requestId, secret: secret.toString("base64url") })}\n`));
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      buffered += chunk;
+      if (Buffer.byteLength(buffered, "utf8") > ACCOUNTS_BROKER_MAX_FRAME_BYTES) { finish(false); return; }
+      const newline = buffered.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        const response = JSON.parse(buffered.slice(0, newline)) as unknown;
+        finish(isPlainRecord(response) && response.version === 1 && response.requestId === requestId
+          && isPlainRecord(response.status) && response.status.version === 1 && response.status.state === "available");
+      } catch { finish(false); }
+    });
+  });
 }
 
 /**
@@ -782,6 +831,7 @@ function serveBrokerPeer(socket: Socket, broker: AccountsBrokerV1, secret: Buffe
   let rendererRef: OpaqueRendererRef | null = null;
   let managerRequestConsumed = false;
   let unsubscribe: (() => void) | null = null;
+  let releaseTransport: (() => void) | null = null;
   let handshakeTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => socket.destroy(), ACCOUNTS_BROKER_HANDSHAKE_TIMEOUT_MS);
   handshakeTimer.unref();
   const close = (): void => {
@@ -789,22 +839,25 @@ function serveBrokerPeer(socket: Socket, broker: AccountsBrokerV1, secret: Buffe
     handshakeTimer = null;
     unsubscribe?.();
     unsubscribe = null;
+    releaseTransport?.();
+    releaseTransport = null;
   };
   socket.once("close", close);
-  socket.on("data", (chunk: Buffer) => {
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk: string) => {
     if (managerRequestConsumed) { socket.destroy(); return; }
-    byteLength += chunk.byteLength;
+    byteLength += Buffer.byteLength(chunk, "utf8");
     if (byteLength > maxFrameBytes * 2) {
       socket.destroy();
       return;
     }
-    buffered += chunk.toString("utf8");
+    buffered += chunk;
     while (true) {
       const newline = buffered.indexOf("\n");
       if (newline < 0) return;
       const line = buffered.slice(0, newline);
       buffered = buffered.slice(newline + 1);
-      byteLength = Buffer.byteLength(buffered, "utf8");
+      byteLength -= Buffer.byteLength(line, "utf8") + 1;
       if (Buffer.byteLength(line, "utf8") > maxFrameBytes) {
         socket.destroy();
         return;
@@ -842,6 +895,7 @@ function serveBrokerPeer(socket: Socket, broker: AccountsBrokerV1, secret: Buffe
           return;
         }
         rendererRef = frame.handshake.rendererRef;
+        releaseTransport = broker.retainRendererTransport(rendererRef);
         if (handshakeTimer) clearTimeout(handshakeTimer);
         handshakeTimer = null;
         if (!writeFrame(socket, { version: 1, kind: "handshake-result", ok: true, pool: result.pool! }, maxFrameBytes)) return;
@@ -861,7 +915,7 @@ function serveBrokerPeer(socket: Socket, broker: AccountsBrokerV1, secret: Buffe
         continue;
       }
       if (isNativeBrowserContextFrame(frame)) {
-        void (resolveNativeBrowserContext?.(rendererRef, frame.opaqueAccountId) ?? Promise.resolve(nativeBrowserUnavailable())).then((result) => {
+        void broker.withActiveOperation(() => resolveNativeBrowserContext?.(rendererRef!, frame.opaqueAccountId) ?? Promise.resolve(nativeBrowserUnavailable())).then((result) => {
           if (!writeOwnerFrame(socket, { version: 1, kind: "native-browser-context-result", requestId: frame.requestId, result }, maxFrameBytes)) socket.destroy();
         }).catch(() => {
           if (!writeOwnerFrame(socket, { version: 1, kind: "native-browser-context-result", requestId: frame.requestId, result: nativeBrowserUnavailable() }, maxFrameBytes)) socket.destroy();
@@ -869,7 +923,7 @@ function serveBrokerPeer(socket: Socket, broker: AccountsBrokerV1, secret: Buffe
         continue;
       }
       if (isNativeBrowserRequestFrame(frame)) {
-        void (invokeNativeBrowserRequest?.(rendererRef, frame.opaqueAccountId, frame.method, frame.params) ?? Promise.resolve(null)).then((result) => {
+        void broker.withActiveOperation(() => invokeNativeBrowserRequest?.(rendererRef!, frame.opaqueAccountId, frame.method, frame.params) ?? Promise.resolve(null)).then((result) => {
           if (!writeOwnerFrame(socket, { version: 1, kind: "native-browser-request-result", requestId: frame.requestId, result }, ACCOUNTS_BROKER_MAX_PROJECTION_FRAME_BYTES)) socket.destroy();
         }).catch(() => {
           if (!writeOwnerFrame(socket, { version: 1, kind: "native-browser-request-result", requestId: frame.requestId, result: null }, maxFrameBytes)) socket.destroy();
@@ -905,15 +959,16 @@ function serveControlPeer(
   let byteLength = 0;
   let buffered = "";
   let terminal = false;
-  socket.on("data", (chunk: Buffer) => {
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk: string) => {
     if (terminal) return;
-    byteLength += chunk.byteLength;
+    byteLength += Buffer.byteLength(chunk, "utf8");
     if (byteLength > maxFrameBytes) {
       terminal = true;
       socket.destroy();
       return;
     }
-    buffered += chunk.toString("utf8");
+    buffered += chunk;
     const newline = buffered.indexOf("\n");
     if (newline < 0) return;
     const frame = buffered.slice(0, newline);

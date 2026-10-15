@@ -109,11 +109,11 @@ test("daily edge advisory stays on the first page and failures become quiet skip
     channel: "edge",
     cache: { lastKnownVersion: "0.144.6" },
     now: () => published,
-    fetchJson: async () => {
+    fetchJson: async <T = unknown>() => {
       requests += 1;
       return {
         status: 200,
-        data: [release("rust-v0.145.0-alpha.18", true)],
+        data: [release("rust-v0.145.0-alpha.18", true)] as T,
         nextUrl: "https://example.test/ignored-page-two",
       };
     },
@@ -142,13 +142,13 @@ test("authoritative stable resolution calls latest once while edge follows pagin
   const stable = await resolveCodexSourceRelease({
     channel: "stable",
     now: () => published,
-    fetchJson: async () => {
+    fetchJson: async <T = unknown>() => {
       stableCalls += 1;
       return {
         status: 200,
         etag: "stable-etag",
         bodySha256: "f".repeat(64),
-        data: release("rust-v0.144.6", false),
+        data: release("rust-v0.144.6", false) as T,
       };
     },
   });
@@ -161,17 +161,17 @@ test("authoritative stable resolution calls latest once while edge follows pagin
   const edge = await resolveCodexSourceRelease({
     channel: "edge",
     now: () => published,
-    fetchJson: async (request) => {
+    fetchJson: async <T = unknown>(request: GitHubJsonRequest) => {
       pages.push(request.url);
       if (pages.length === 1) {
         return {
           status: 200,
           etag: "edge-etag",
-          data: [release("rust-v0.145.0-alpha.9", true)],
+          data: [release("rust-v0.145.0-alpha.9", true)] as T,
           nextUrl: "https://api.github.test/page/2",
         };
       }
-      return { status: 200, data: [release("rust-v0.145.0-alpha.18", true)] };
+      return { status: 200, data: [release("rust-v0.145.0-alpha.18", true)] as T };
     },
   });
   assert.deepEqual(pages, [`${CODEX_RELEASE_API_ROOT}?per_page=100`, "https://api.github.test/page/2"]);
@@ -185,11 +185,11 @@ test("authoritative bundled resolution queries the exact installed version tag",
     channel: "bundled",
     bundledVersion: "0.145.0-alpha.18",
     now: () => published,
-    fetchJson: async (request) => {
+    fetchJson: async <T = unknown>(request: GitHubJsonRequest) => {
       requests.push(request);
       return {
         status: 200,
-        data: release("rust-v0.145.0-alpha.18", true),
+        data: release("rust-v0.145.0-alpha.18", true) as T,
       };
     },
   });

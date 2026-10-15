@@ -10,7 +10,7 @@ npm run audit
 
 The installer package is `packages/installer` and publishes the `tweaker` CLI. Runtime code lives in `packages/runtime`; public tweak author types live in `packages/sdk`.
 
-Default tweaks are developed and released from their own repositories. The installer fetches their latest GitHub releases during first install; do not vendor their source into this repository.
+Bundled tweaks are maintained under `tweaks/`. Run `npm run sync:tweaks` after authorized changes to synchronize the catalog and packaged runtime; follow `tweaks/AGENTS.md` for validation and lifecycle requirements.
 
 ## Release Checklist
 

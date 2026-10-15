@@ -63,6 +63,7 @@ interface NativeGenerationV2 {
   digest: string;
 }
 
+const CAPABILITY_RETRY_MS = 60_000;
 export const NATIVE_CATALOG_MAX_THREADS_V1 = 16_384;
 export const NATIVE_CATALOG_MAX_BYTES_V1 = 64 * 1024 * 1024;
 export const NATIVE_TRANSFER_MAX_ROLLOUT_BYTES_V1 = 512 * 1024 * 1024;
@@ -237,9 +238,9 @@ export type NativeTransferPreflightV1 =
   | { state: "busy" | "unsupported" | "collision" | "unavailable"; reason: string };
 
 export type NativeCatalogReconcileResultV1 =
-  | { state: "ready"; scanned: number; projected: number; collisions: number }
-  | { state: "collision"; scanned: number; projected: number; collisions: number }
-  | { state: "busy" | "unsupported" | "collision" | "unavailable"; reason: string };
+  | { state: "ready"; scanned: number; projected: number; collisions: number; capacity: { threads: number; max: number } }
+  | { state: "collision"; scanned: number; projected: number; collisions: number; capacity: { threads: number; max: number } }
+  | { state: "busy" | "unsupported" | "collision" | "unavailable"; reason: string; capacity?: { threads: number; max: number } };
 
 export interface NativeTransferInputV1 {
   operationId: string;
@@ -951,6 +952,7 @@ export class NativeTransferCoordinatorV1 {
   private readonly resumedGenerationProofs = new Set<string>();
   private capability: NativeTransferCapabilityV1 | null = null;
   private capabilityInFlight: Promise<NativeTransferCapabilityV1> | null = null;
+  private capabilityProbedAt = 0;
   private document: NativeCatalogDocumentV1;
   private readonly accounts = new Map<OpaqueAccountId, NativeTransferAccountV1>();
   private readonly accountHomeIdentities = new Map<OpaqueAccountId, NativeAccountHomeIdentitiesV1>();
@@ -989,6 +991,12 @@ export class NativeTransferCoordinatorV1 {
    * failed real probe is a closed unsupported state, never a version guess.
    */
   async probeCapability(): Promise<NativeTransferCapabilityV1> {
+    // A timeout or generic probe failure is usually a slow cold start, not a
+    // real incompatibility. Retry those after a cool-down instead of disabling
+    // transfers for the rest of the broker's lifetime; definitive answers stay.
+    if (this.capability && this.capability.state === "unsupported"
+      && (this.capability.reason === "probe_timeout" || this.capability.reason === "probe_failed")
+      && Date.now() - this.capabilityProbedAt >= CAPABILITY_RETRY_MS) this.capability = null;
     if (this.capability) return this.capability;
     if (this.capabilityInFlight) return this.capabilityInFlight;
     this.capabilityInFlight = Promise.resolve()
@@ -997,6 +1005,7 @@ export class NativeTransferCoordinatorV1 {
       .catch(() => unsupportedCapability("probe_failed"))
       .then((value) => {
         this.capability = value;
+        this.capabilityProbedAt = Date.now();
         return value;
       })
       .finally(() => { this.capabilityInFlight = null; });
@@ -1305,7 +1314,8 @@ export class NativeTransferCoordinatorV1 {
     } catch {
       return { state: "unavailable", reason: "threads_scan_unavailable" };
     }
-    if (sightings.size > NATIVE_CATALOG_MAX_THREADS_V1) return { state: "unavailable", reason: "threads_catalog_capacity" };
+    // Report observed demand at the cap so the broker can surface a useful warning.
+    if (sightings.size > NATIVE_CATALOG_MAX_THREADS_V1) return { state: "unavailable", reason: "threads_catalog_capacity", capacity: { threads: sightings.size, max: NATIVE_CATALOG_MAX_THREADS_V1 } };
 
     if (project && [...sightings.values()].some((rows) => [...rows.values()].some((row) => row.historyMode === "paginated"))) {
       return { state: "unsupported", reason: "paginated_catalog_mirroring_refused" };
@@ -1313,11 +1323,36 @@ export class NativeTransferCoordinatorV1 {
     let collisions = 0;
     let projected = 0;
     const unverifiable: Array<{ row: NativeThreadRowV1; accountId: OpaqueAccountId; recordJson: string | null }> = [];
+    const additions = new Map<string, NativeCatalogThreadV1>();
+    for (const [threadId, byAccount] of sightings) {
+      if (this.document.threads[threadId] || byAccount.size !== 1) continue;
+      const [originAccountId, row] = [...byAccount.entries()][0]!;
+      const originAccount = this.accounts.get(originAccountId);
+      if (!originAccount) continue;
+      const sourceIdentity = pinnedRolloutIdentity(originAccount, row.rolloutPath, row.threadId);
+      if (!sourceIdentity) continue;
+      const sourceDigest = rowDigest(row);
+      additions.set(threadId, {
+        threadId, originAccountId, writerAccountId: originAccountId,
+        sourceRolloutIdentity: sourceIdentity, sourceRowDigest: sourceDigest,
+        projections: { [originAccountId]: {
+          state: "committed", targetPath: row.rolloutPath,
+          rolloutIdentity: sourceIdentity, rowDigest: sourceDigest,
+        } },
+      });
+    }
+    const threadCount = Object.keys(this.document.threads).length + additions.size;
+    if (threadCount > NATIVE_CATALOG_MAX_THREADS_V1) return { state: "unavailable", reason: "threads_catalog_capacity", capacity: { threads: threadCount, max: NATIVE_CATALOG_MAX_THREADS_V1 } };
+    if (additions.size > 0) this.mutate((next) => {
+      for (const [threadId, record] of additions) {
+        if (next.threads[threadId]) throw new Error("native catalog thread changed during reconciliation");
+        next.threads[threadId] = record;
+      }
+    });
     for (const [threadId, byAccount] of sightings) {
       let record = this.document.threads[threadId];
       if (!record) {
-        // A new remote-created row becomes an owner receipt before any
-        // projection. A duplicate with no receipt has no safe owner.
+        // Duplicates have no safe owner; unverifiable paths wait for a later pass.
         if (byAccount.size !== 1) {
           collisions += 1;
           continue;
@@ -1328,34 +1363,10 @@ export class NativeTransferCoordinatorV1 {
           collisions += 1;
           continue;
         }
-        const sourceIdentity = pinnedRolloutIdentity(originAccount, row.rolloutPath, row.threadId);
-        if (!sourceIdentity) {
-          // A concurrent recorder can replace the pathname or append between
-          // the pin checks. Do not make an unqualified busy row terminal;
-          // only a clear per-thread census turns this into a real collision.
-          unverifiable.push({ row, accountId: originAccountId, recordJson: null });
-          continue;
-        }
-        const sourceDigest = rowDigest(row);
-        this.mutate((next) => {
-          if (next.threads[threadId]) throw new Error("native catalog thread changed during reconciliation");
-          next.threads[threadId] = {
-            threadId,
-            originAccountId,
-            writerAccountId: originAccountId,
-            sourceRolloutIdentity: sourceIdentity,
-            sourceRowDigest: sourceDigest,
-            projections: {
-              [originAccountId]: {
-                state: "committed",
-                targetPath: row.rolloutPath,
-                rolloutIdentity: sourceIdentity,
-                rowDigest: sourceDigest,
-              },
-            },
-          };
-        });
-        record = this.document.threads[threadId]!;
+        // A concurrent recorder can replace the pathname between pin checks.
+        // Only a clear per-thread census turns this into a real collision.
+        unverifiable.push({ row, accountId: originAccountId, recordJson: null });
+        continue;
       }
       const knownSightings = this.validateKnownSightings(record, byAccount);
       if (typeof knownSightings !== "string") {
@@ -1401,9 +1412,10 @@ export class NativeTransferCoordinatorV1 {
         collisions += 1;
       }
     }
+    const capacity = { threads: Object.keys(this.document.threads).length, max: NATIVE_CATALOG_MAX_THREADS_V1 };
     return collisions > 0
-      ? { state: "collision", scanned, projected, collisions }
-      : { state: "ready", scanned, projected, collisions };
+      ? { state: "collision", scanned, projected, collisions, capacity }
+      : { state: "ready", scanned, projected, collisions, capacity };
   }
 
   pendingTransfersForRecovery(): readonly Pick<NativeTransferOperationV1, "operationId" | "threadId" | "sourceAccountId" | "targetAccountId" | "phase">[] {

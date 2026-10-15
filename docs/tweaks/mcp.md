@@ -28,7 +28,7 @@ Tweaker writes managed entries between markers:
 
 ```toml
 # BEGIN TWEAKER MANAGED MCP SERVERS
-[mcp_servers.tools]
+[mcp_servers.com-you-tools]
 command = "node"
 args = ["/absolute/path/to/tweak/mcp-server.js"]
 env = { TOOLS_MODE = "codex" }
@@ -41,7 +41,7 @@ The managed block is rewritten when tweaks reload.
 
 The default server name is derived from the tweak id:
 
-- `co.bennett.project-home` -> `project-home`
+- `co.bennett.project-home` -> `co-bennett-project-home`
 - `com.you.tools` -> `com-you-tools`
 
 If a generated name conflicts with another managed name, Tweaker appends

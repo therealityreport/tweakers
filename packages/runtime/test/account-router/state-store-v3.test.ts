@@ -68,6 +68,8 @@ test("v3 migration refuses active or ambiguous work", () => {
     [`bh_${"h".repeat(43)}`]: {
       version: 1,
       handoffRef: `bh_${"h".repeat(43)}`,
+      confirmationId: `bc_${"c".repeat(43)}`,
+      conversationId: `lc_${"l".repeat(43)}`,
       taskRef: `bt_${"t".repeat(43)}`,
       originRendererRef: `br_${"r".repeat(43)}`,
       fromOpaqueAccountId: accountA,

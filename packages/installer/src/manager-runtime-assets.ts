@@ -91,12 +91,21 @@ export function resolveSealedManagerSupportAssets(): SealedManagerSupportAssets 
   };
 }
 
+const verifiedRuntimeCache = new Map<string, { identity: string; evidence: RuntimeTreeFingerprint }>();
+const verifiedManagedCache = new Map<string, { identity: string; evidence: ManagedRuntimeTreeFingerprint }>();
+function fileIdentity(path: string): string {
+  const s = lstatSync(path);
+  return [path, s.dev, s.ino, s.size, s.ctimeMs, s.mtimeMs, s.mode, s.uid, s.nlink].join(":");
+}
+
 export function verifySealedManagerRuntimeAssets(
   assets: SealedManagerRuntimeAssets,
 ): RuntimeTreeFingerprint {
+  const identities: string[] = [];
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   const assertDirectory = (path: string, label: string): void => {
     const stat = lstatSync(path);
+    identities.push(fileIdentity(path));
     if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(path) !== path) {
       throw new Error(`${label} must be a real directory`);
     }
@@ -110,6 +119,7 @@ export function verifySealedManagerRuntimeAssets(
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = resolve(directory, entry.name);
       const stat = lstatSync(path);
+    identities.push(fileIdentity(path));
       if (entry.isDirectory()) {
         assertDirectory(path, "Tweakers manager runtime directory");
         walk(path);
@@ -126,35 +136,46 @@ export function verifySealedManagerRuntimeAssets(
     }
   };
   walk(assets.root);
+  const identity = identities.sort().join("\n");
+  const cached = verifiedRuntimeCache.get(assets.root);
+  if (cached?.identity === identity && cached.evidence.fingerprint === assets.fingerprint) return cached.evidence;
   const evidence = readRuntimeFingerprintEvidence(assets.root);
   if (evidence === null || evidence.fingerprint !== assets.fingerprint) {
     throw new Error("The sealed Tweakers manager runtime failed its compiled fingerprint");
   }
+  if (verifiedRuntimeCache.size >= 16) verifiedRuntimeCache.clear();
+  verifiedRuntimeCache.set(assets.root, { identity, evidence });
   return evidence;
 }
 
 export function verifySealedManagerManagedRuntimeAssets(
   assets: SealedManagerManagedRuntimeAssets,
 ): ManagedRuntimeTreeFingerprint {
-  assertSealedManagerGenerationTree(
+  const identity = assertSealedManagerGenerationTree(
     assets.root,
     assets.fingerprint,
     "Tweakers manager managed-runtime",
   );
+  const cached = verifiedManagedCache.get(assets.root);
+  if (cached?.identity === identity && cached.evidence.fingerprint === assets.fingerprint) return cached.evidence;
   const evidence = readManagedRuntimeFingerprintEvidence(assets.root);
   if (evidence === null || evidence.fingerprint !== assets.fingerprint) {
     throw new Error("The sealed Tweakers manager managed-runtime failed its compiled fingerprint");
   }
+  if (verifiedManagedCache.size >= 16) verifiedManagedCache.clear();
+  verifiedManagedCache.set(assets.root, { identity, evidence });
   return evidence;
 }
 
-function assertSealedManagerGenerationTree(root: string, fingerprint: string, label: string): void {
+function assertSealedManagerGenerationTree(root: string, fingerprint: string, label: string): string {
+  const identities: string[] = [];
   if (basename(root) !== fingerprint) {
     throw new Error(`${label} generation path does not match its fingerprint`);
   }
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   const assertDirectory = (path: string, directoryLabel: string): void => {
     const stat = lstatSync(path);
+    identities.push(fileIdentity(path));
     if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(path) !== path) {
       throw new Error(`${directoryLabel} must be a real directory`);
     }
@@ -168,6 +189,7 @@ function assertSealedManagerGenerationTree(root: string, fingerprint: string, la
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = resolve(directory, entry.name);
       const stat = lstatSync(path);
+    identities.push(fileIdentity(path));
       if (entry.isDirectory()) {
         assertDirectory(path, `${label} directory`);
         walk(path);
@@ -184,6 +206,7 @@ function assertSealedManagerGenerationTree(root: string, fingerprint: string, la
     }
   };
   walk(root);
+  return identities.sort().join("\n");
 }
 
 

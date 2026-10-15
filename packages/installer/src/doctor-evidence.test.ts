@@ -834,13 +834,107 @@ test("exact message IDs produce cited wording changes without inventing features
 });
 
 test("protocol semantic comparison accepts optional additions and rejects consumed contract changes", async () => {
-  const { compareDoctorProtocolShapes } = await import("./doctor-protocol.js");
+  const { compareConsumedDoctorProtocolFields, compareDoctorProtocolShapes } = await import("./doctor-protocol.js");
   const old = { type: "object", properties: {id: {type: "string"}}, required: ["id"] };
   assert.deepEqual(compareDoctorProtocolShapes(old, {...old, properties: {...old.properties, label: {type: "string"}}}), []);
   assert.match(compareDoctorProtocolShapes(old, {...old, properties: {}}).join(), /removed field/);
   assert.match(compareDoctorProtocolShapes(old, {...old, properties: {id: {type: "number"}}}).join(), /changed type/);
   assert.match(compareDoctorProtocolShapes(old, {...old, required: ["id", "label"]}).join(), /newly required/);
   assert.match(compareDoctorProtocolShapes(old, {...old, required: []}, "response").join(), /no longer guaranteed/);
+
+  const before = {properties: {response: {type: "object", properties: {data: {type: "array", items: {type: "object", properties: {id: {type: "string"}, ignored: {type: "string"}}, required: ["id", "ignored"]}}}, required: ["data"]}}};
+  const after = {properties: {response: {type: "object", properties: {data: {type: "array", items: {type: "object", properties: {id: {type: "string"}}, required: ["id"]}}}, required: ["data"]}}};
+  assert.deepEqual(compareConsumedDoctorProtocolFields(before, after, ["response.data[].id"]), []);
+  const changedId = structuredClone(after);
+  changedId.properties.response.properties.data.items.properties.id.type = "number";
+  assert.match(compareConsumedDoctorProtocolFields(before, changedId, ["response.data[].id"]).join(), /changed consumed field schema/);
+  const optionalData = structuredClone(after);
+  optionalData.properties.response.required = [];
+  assert.match(compareConsumedDoctorProtocolFields(before, optionalData, ["response.data[].id"]).join(), /changed consumed field schema/);
+  assert.match(compareConsumedDoctorProtocolFields(before, after, ["response.data[].missing"]).join(), /absent from the baseline schema/);
+});
+
+test("retained Accounts backend rejects upstream workspace routing loss before candidate construction", async () => {
+  const { validateRetainedDoctorBackend, collectDoctorValidation, setDoctorValidationDependenciesForTest } = await import("./doctor-validation.js");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-retained-backend-")));
+  const restore = setDoctorSourceEvidenceDependenciesForTest({
+    run(command, args) {
+      const version = readFileSync(command, "utf8").trim();
+      if (args[0] === "--version") return {status: 0, stdout: `codex-cli ${version}\n`};
+      const schemaRoot = join(args[4]!, "v2");
+      mkdirSync(schemaRoot, {recursive: true});
+      writeFileSync(join(schemaRoot, "ClientRequest.json"), JSON.stringify({oneOf: [{type: "object", properties: {
+        method: {enum: ["account/read"]}, params: {type: "object", properties: {refreshToken: {type: "boolean"}}},
+      }}]}));
+      writeFileSync(join(schemaRoot, "GetAccountResponse.json"), JSON.stringify({type: "object", properties: {
+        account: {type: "string"}, requiresOpenaiAuth: {type: "boolean"},
+        ...(version === "0.155.0-alpha.16" ? {workspaceRouting: {type: "object", properties: {backendOrigin: {type: "string"}}}} : {}),
+      }, required: ["account", "requiresOpenaiAuth"]}));
+      return {status: 0, stdout: ""};
+    },
+  });
+  const restoreValidation = setDoctorValidationDependenciesForTest({
+    run() { return {status: 0, stdout: ""}; },
+    async probeBackend() { return {state: "passed", summary: "fixture", command: {argv: [], exitCode: 0, stdout: "", stderr: ""}}; },
+  });
+  try {
+    const oldApp = await createFixture(root, "retained.app", {backend: "0.153.4"});
+    const newApp = await createFixture(root, "upstream.app", {backend: "0.155.0-alpha.16"});
+    const retained = await collectDoctorSourceEvidence(oldApp, join(root, "retained"));
+    const upstream = await collectDoctorSourceEvidence(newApp, join(root, "upstream"));
+    const output = join(root, "validation"); mkdirSync(output);
+    const check = await validateRetainedDoctorBackend(upstream, retained, output);
+    assert.equal(check.state, "failed");
+    assert.match(check.summary, /account\/read:.*workspaceRouting.*removed field/);
+    assert.match(check.summary, /Disabling Accounts does not replace this backend/);
+    assert.match(check.summary, /verified backend transition/);
+    // The old upstream may also lack this field: compare the candidate with the
+    // new interface's backend, not only with the previous upstream baseline.
+    const validation = await collectDoctorValidation({before: retained, after: upstream,
+      comparison: compareDoctorSourceEvidence(retained, upstream), candidateEvidence: retained,
+      outputRoot: output, tweakersSourceRoot: join(root, "runtime"), compatibilityOnly: true, accountsEnabled: false});
+    assert.equal(validation.protocolCoverage?.interfaces.find(item => item.method === "account/read")?.status, "incompatible");
+    writeFileSync(join(oldApp, "Contents/Resources/codex"), "changed backend");
+    assert.equal((await validateRetainedDoctorBackend(upstream, retained, output)).state, "unsupported");
+  } finally { restoreValidation(); restore(); rmSync(root, {recursive: true, force: true}); }
+});
+
+test("reviewed workspace routing continuity accepts only the exact retained native pair and sole field difference", async () => {
+  const {applyReviewedWorkspaceRoutingContinuity, REVIEWED_WORKSPACE_ROUTING_CONTINUITY: pins} = await import("./doctor-protocol.js");
+  const previous = {asar: {sha256: pins.beforeAsar}} as unknown as DoctorSourceEvidence;
+  const upstream = {asar: {sha256: pins.afterAsar}, fingerprint: "upstream"} as unknown as DoctorSourceEvidence;
+  const retained = {asar: {sha256: pins.candidateAsar}, backend: {sha256: pins.backend, version: "0.153.4"}, fingerprint: "retained"} as unknown as DoctorSourceEvidence;
+  const coverage = {schemaVersion: 1, analysisVersion: 1, inventoryFingerprint: "inventory", fingerprint: "original", beforeFingerprint: "upstream", afterFingerprint: "retained", limitations: [], interfaces: [
+    {method: "account/read", status: "incompatible", changed: true, reasons: ["response.workspaceRouting: removed field"]},
+    {method: "turn/interrupt", status: "incompatible", changed: true, reasons: ["params.threadId: removed field"]},
+  ]} as unknown as import("./doctor-protocol.js").DoctorProtocolCoverage;
+  const {REVIEWED_WORKSPACE_ROUTING_10954: currentPins} = await import("./doctor-protocol.js");
+  const carrier = {path: currentPins.routingPath, kind: "file", unpacked: false, rawSha256: currentPins.routingSha256};
+  const currentPrevious = {...previous, asar: {sha256: currentPins.beforeAsar}} as unknown as DoctorSourceEvidence;
+  const currentUpstream = {...upstream, asar: {sha256: currentPins.afterAsar, members: [carrier]}} as unknown as DoctorSourceEvidence;
+  const currentCandidate = {...retained, asar: {sha256: "candidate-transformed", members: [carrier]}} as unknown as DoctorSourceEvidence;
+  assert.equal(applyReviewedWorkspaceRoutingContinuity(coverage, currentPrevious, currentUpstream, retained, false).interfaces[0]!.status, "compatible");
+  assert.equal(applyReviewedWorkspaceRoutingContinuity(coverage, currentPrevious, currentUpstream, currentCandidate, true).interfaces[0]!.status, "compatible");
+  for (const members of [[], [carrier, carrier], [{...carrier, rawSha256: "changed"}], [{...carrier, unpacked: true}]]) {
+    const changed = {...currentCandidate, asar: {...currentCandidate.asar, members}} as DoctorSourceEvidence;
+    assert.equal(applyReviewedWorkspaceRoutingContinuity(coverage, currentPrevious, currentUpstream, changed, true), coverage);
+  }
+  const accepted = applyReviewedWorkspaceRoutingContinuity(coverage, previous, upstream, retained, true);
+  assert.equal(accepted.interfaces[0]!.status, "compatible");
+  assert.equal(accepted.interfaces[1]!.status, "incompatible", "no other failure is relaxed");
+  assert.notEqual(accepted.fingerprint, coverage.fingerprint);
+  assert.equal(coverage.interfaces[0]!.status, "incompatible", "original evidence stays unchanged");
+  for (const changed of [
+    {...retained, backend: {...retained.backend, sha256: "changed"}},
+    {...retained, backend: {...retained.backend, version: "0.155.0"}},
+    {...retained, asar: {...retained.asar, sha256: "changed"}},
+  ]) assert.equal(applyReviewedWorkspaceRoutingContinuity(coverage, previous, upstream, changed as DoctorSourceEvidence, true), coverage);
+  assert.equal(applyReviewedWorkspaceRoutingContinuity(coverage, {...previous, asar: {...previous.asar, sha256: null}}, upstream, retained, true), coverage);
+  assert.equal(applyReviewedWorkspaceRoutingContinuity(coverage, previous, {...upstream, asar: {...upstream.asar, sha256: null}}, retained, true), coverage);
+  const additional = structuredClone(coverage); additional.interfaces[0]!.reasons.push("response.account: changed type");
+  assert.equal(applyReviewedWorkspaceRoutingContinuity(additional, previous, upstream, retained, true), additional);
+  const unbound = {...coverage, afterFingerprint: "sha256:changed" as const};
+  assert.equal(applyReviewedWorkspaceRoutingContinuity(unbound, previous, upstream, retained, true), unbound);
 });
 
 test("protocol evidence resolves hashed references and refuses missing, unknown, and modified schemas", async () => {
@@ -876,4 +970,126 @@ test("protocol inventory covers interpreted history, feature, and reply interfac
   const before = {type: "object", properties: {threadId: {type: "string"}}, required: ["threadId"]};
   assert.match(compareDoctorProtocolShapes(before, {...before, required: []}, "response.params").join(), /no longer guaranteed/);
   assert.match(compareDoctorProtocolShapes(before, {...before, required: ["threadId", "decision"]}, "params.response").join(), /newly required/);
+});
+
+test("archived baseline retains evidence without a desktop and rejects changed bytes", async () => {
+  const { restoreSealedArchiveFileContents, assertSurvivingArchiveMembers, migrateArchivedDoctorBaseline, readDoctorBaseline, doctorSourceFile, setDoctorBaselineSignatureForTest } = await import("./doctor-baseline.js");
+  const { verifyDoctorSourceBytes } = await import("./doctor-validation.js");
+  const { createHash } = await import("node:crypto");
+  const { spawnSync } = await import("node:child_process");
+  const root=mkdtempSync(join(tmpdir(),"doctor-baseline-"));
+  const restore=installFakeBackend();
+  const restoreSignature=setDoctorBaselineSignatureForTest({sign(){},verify(){}});
+  const {sealOfficialSourceTree}=await import("./official-source-registration.js");
+  mkdirSync(join(root,"variants/tweakers"),{recursive:true});
+  writeFileSync(join(root,"variants/tweakers/state.json"),JSON.stringify({signingIdentityHash:"A".repeat(40)}));
+  const digest=(bytes:Buffer)=>createHash("sha256").update(bytes).digest("hex");
+  try {
+    const app=await createFixture(root,"vendor.app",{extraFiles:{"Contents/MacOS/Desktop":"desktop executable",["Contents/Resources/"+"long-segment/".repeat(24)+"evidence.txt"]:"long archive member"}});
+    const original=await collectDoctorSourceEvidence(app,join(root,"before"));
+    chmodSync(join(app,"Contents/Resources/codex"),0o555);
+    symlinkSync("MacOS/Desktop",join(app,"Contents/DesktopLink"));
+    const archive=join(root,"vendor.tar");
+    assert.equal(spawnSync("/usr/bin/tar",["-cf",archive,"-C",root,"vendor.app"]).status,0);
+    const sourceReceipt=join(root,"source.json");
+    writeFileSync(sourceReceipt,JSON.stringify({generationId:"11111111-1111-4111-8111-111111111111",artifact:{appPath:app,treeSeal:sealOfficialSourceTree(app)},source:{trust:{strictSignature:true,gatekeeper:true,teamIdentifier:"2DC432GLL2"}}}));
+    const inventory=Object.fromEntries(original.shippedFiles.map(f=>[f.path,{type:0o100000,mode:statSync(join(app,f.path)).mode&0o777,size:f.bytes,sha256:f.sha256.slice(7)}]));
+    const archiveReceipt=join(root,"archive.json");
+    writeFileSync(archiveReceipt,JSON.stringify({original:app,archive,archiveSHA256:digest(readFileSync(archive)),retired:true,restorationVerified:true,inventory}));
+    const originalSeal=sealOfficialSourceTree(app);
+    const {chownSync,lchownSync,lstatSync}=await import("node:fs");
+    const desktop=join(app,"Contents/MacOS/Desktop");
+    const originalGroup=statSync(desktop).gid;
+    const alternateGroup=process.getgroups?.().find(gid=>gid!==originalGroup);
+    if(alternateGroup!==undefined) {
+      chownSync(desktop,statSync(desktop).uid,alternateGroup);
+      chownSync(join(app,"Contents"),statSync(app).uid,alternateGroup);
+      lchownSync(join(app,"Contents/DesktopLink"),lstatSync(desktop).uid,alternateGroup);
+    }
+    writeFileSync(desktop,"corrupt restored bytes");
+    assert.throws(()=>restoreSealedArchiveFileContents(archive,"vendor.app",app,{...originalSeal,sha256:"0".repeat(64)}),/identity changed/);
+    restoreSealedArchiveFileContents(archive,"vendor.app",app,originalSeal);
+    assert.deepEqual(sealOfficialSourceTree(app),originalSeal);
+    rmSync(join(app,"Contents/DesktopLink"));
+    rmSync(join(app,"Contents/MacOS/Desktop"));
+    assert.doesNotThrow(()=>assertSurvivingArchiveMembers(archive,"vendor.app",app));
+    writeFileSync(join(app,"new-unarchived-file"),"preserve this");
+    assert.throws(()=>assertSurvivingArchiveMembers(archive,"vendor.app",app),/Unarchived/);
+    rmSync(app,{recursive:true});
+    const baseline=await migrateArchivedDoctorBaseline({root,archiveReceipt,officialReceipt:sourceReceipt,signingIdentityHash:"A".repeat(40)});
+    assert.equal(existsSync(join(baseline,"Contents")),false);
+    assert.throws(()=>doctorSourceFile(baseline,"Contents/MacOS/Desktop"),/not retained/);
+    const evidence=await collectDoctorSourceEvidence(baseline,join(root,"after"));
+    assert.equal(evidence.complete,true);
+    assert.equal(verifyDoctorSourceBytes("before",evidence).state,"passed");
+    writeFileSync(join(baseline,".DS_Store"),"Finder metadata");
+    writeFileSync(join(baseline,"resources/.DS_Store"),"Finder metadata");
+    assert.doesNotThrow(()=>readDoctorBaseline(baseline),"Finder metadata cannot invalidate signed baseline payloads");
+    writeFileSync(join(baseline,"resources/unexpected.js"),"untrusted payload");
+    assert.throws(()=>readDoctorBaseline(baseline),/Unexpected baseline payload/);
+    rmSync(join(baseline,"resources/unexpected.js"));
+    chmodSync(doctorSourceFile(baseline,"Contents/Resources/codex"),0o755);
+    writeFileSync(doctorSourceFile(baseline,"Contents/Resources/codex"),"tampered");
+    assert.throws(()=>readDoctorBaseline(baseline),/changed/);
+    assert.equal(verifyDoctorSourceBytes("before",evidence).state,"failed");
+  } finally {restoreSignature();restore();rmSync(root,{recursive:true,force:true});}
+});
+
+
+test("collector identifies the current signed CodexCLI bundle without the legacy backend file", async () => {
+  const root = mkdtempSync(join(tmpdir(), "doctor-evidence-cli-layout-"));
+  const restore = installFakeBackend();
+  try {
+    const backend = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
+    const app = await createFixture(root, "fixture.app", { backend: null, extraFiles: { [backend]: "0.160.0", "Contents/Resources/codex-cli/CodexCLI.app/Contents/Info.plist": "signed CLI metadata", "Contents/Resources/codex-cli/CodexCLI.app/Contents/_CodeSignature/CodeResources": "signed CLI resource seal" } });
+    const evidence = await collectDoctorSourceEvidence(app, join(root, "output"));
+    assert.equal(evidence.complete, true, JSON.stringify(evidence.unresolvedEvidence));
+    assert.equal(evidence.backend.path, backend);
+    assert.equal(evidence.backend.version, "0.160.0");
+    const { baselineRelativePath } = await import("./doctor-baseline.js");
+    const mapped = baselineRelativePath(backend);
+    assert.ok(mapped && !mapped.includes(".app/"), "retained backend evidence must not create another app bundle");
+    const { captureDoctorBaseline, doctorSourceFile, setDoctorBaselineSignatureForTest } = await import("./doctor-baseline.js");
+    mkdirSync(join(root, "variants/tweakers"), { recursive: true });
+    writeFileSync(join(root, "variants/tweakers/state.json"), JSON.stringify({ signingIdentityHash: "A".repeat(40) }));
+    const undoSignature = setDoctorBaselineSignatureForTest({ sign() {}, verify() {} });
+    try {
+      const baseline = captureDoctorBaseline(root, { generationId: "11111111-1111-4111-8111-111111111111", source: { appPath: app }, artifact: { appPath: app } }, "A".repeat(40), () => {});
+      const executable = doctorSourceFile(baseline, backend);
+      assert.equal(readFileSync(join(dirname(dirname(executable)), "Info.plist"), "utf8"), "signed CLI metadata");
+      assert.equal(readFileSync(join(dirname(dirname(executable)), "_CodeSignature/CodeResources"), "utf8"), "signed CLI resource seal");
+      assert.equal((await collectDoctorSourceEvidence(baseline, join(root, "baseline-output"))).complete, true);
+      const { doctorBaselineNeedsCliContextUpgrade, readDoctorBaseline } = await import("./doctor-baseline.js");
+      assert.equal(doctorBaselineNeedsCliContextUpgrade(baseline), false);
+      // Older signed receipts used a flat CLI file. Keep them readable while
+      // requiring fresh capture from the verified source before execution.
+      const { renameSync } = await import("node:fs");
+      const { createHash } = await import("node:crypto");
+      const old = JSON.parse(readFileSync(join(baseline, "baseline.json"), "utf8"));
+      delete old.storageLayoutVersion; delete old.fingerprint;
+      old.files = old.files.filter((file: { path: string }) => !file.path.startsWith("Contents/Resources/codex-cli/CodexCLI.app/") || file.path === backend);
+      renameSync(executable, join(baseline, "resources/codex-cli-backend"));
+      rmSync(join(baseline, "resources/codex-cli"), { recursive: true });
+      const receipt = JSON.stringify({ ...old, fingerprint: createHash("sha256").update(JSON.stringify(old)).digest("hex") });
+      writeFileSync(join(baseline, "baseline.json"), receipt);
+      writeFileSync(join(baseline, "BaselineReceipt.bundle/Contents/Resources/baseline.json"), receipt);
+      assert.doesNotThrow(() => readDoctorBaseline(baseline));
+      assert.equal(doctorSourceFile(baseline, backend), join(baseline, "resources/codex-cli-backend"));
+      assert.equal(doctorBaselineNeedsCliContextUpgrade(baseline), true);
+
+    } finally { undoSignature(); }
+
+  } finally { restore(); rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("collector reports a killed CLI even when its output streams are empty", async () => {
+  const root = mkdtempSync(join(tmpdir(), "doctor-cli-signal-"));
+  const restore = setDoctorSourceEvidenceDependenciesForTest({ run() { return { status: null, signal: "SIGKILL", stdout: "", stderr: "" }; } });
+  try {
+    const app = await createFixture(root, "fixture.app");
+    const evidence = await collectDoctorSourceEvidence(app, join(root, "output"));
+    assert.ok(evidence.unresolvedEvidence.some(problem => problem.includes("terminated by SIGKILL")));
+    assert.equal(evidence.complete, false);
+  } finally { restore(); rmSync(root, { recursive: true, force: true }); }
 });

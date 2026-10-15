@@ -218,24 +218,10 @@ function renderState(openNativeProjectEditDialog, api, root, response, reload, v
   actions.append(button("Add group", () => addNode(api, state, "group", reload, revision)), button("Add project", () => addNode(api, state, "project", reload, revision)));
   heading.append(actions);
   root.append(heading);
-  const overview = element("div", "mt-4 grid grid-cols-1 gap-2");
-  for (const project of state.nodes.filter((node) => node.type === "project")) {
-    const card = button("", () => view.selectProject?.(project.id));
-    card.className = "border-token-border hover:bg-token-foreground/5 flex w-full items-center gap-3 rounded-lg border p-3 text-left cursor-interaction";
-    const swatch = element("span", "size-3 shrink-0 rounded-full");
-    swatch.style.backgroundColor = project.color;
-    const copy = element("span", "flex min-w-0 flex-1 flex-col gap-1");
-    copy.append(element("span", "truncate text-sm font-medium text-token-text-primary", project.name));
-    copy.append(element("span", "truncate text-sm text-token-text-secondary", project.projectPath || "Needs folder repair — open to repair"));
-    card.append(swatch, copy, element("span", "text-token-text-secondary", "›"));
-    overview.append(card);
-  }
-  if (!overview.childElementCount) overview.append(element("div", "text-sm text-token-text-secondary", "No projects yet."));
-  root.append(overview, settingsSectionTitle("Available connections", "Local adapters that can be assigned to projects."), connectionCard(response.connections));
   const tree = element("div", "border-token-border mt-4 rounded-lg border");
-  renderChildren(api, tree, state, null, response.connections, reload, 0, revision);
+  renderChildren(api, tree, state, null, response.connections, reload, 0, revision, { selectProject: view.selectProject, openNativeProjectEditDialog });
   if (!state.nodes.length) tree.append(element("div", "p-3 text-sm text-token-text-secondary", "No projects yet."));
-  root.append(tree);
+  root.append(tree, settingsSectionTitle("Available connections", "Local adapters that can be assigned to projects."), connectionCard(response.connections));
 }
 
 function settingsSectionTitle(title, description) {
@@ -419,7 +405,7 @@ function connectionCard(connections) {
   return card;
 }
 
-function renderChildren(api, root, state, parentId, connections, reload, depth, revision) {
+function renderChildren(api, root, state, parentId, connections, reload, depth, revision, navigation = {}) {
   const siblings = state.nodes.filter((item) => item.parentId === parentId);
   for (const [siblingIndex, node] of siblings.entries()) {
     const row = element("div", "flex items-center gap-3 p-3");
@@ -429,8 +415,12 @@ function renderChildren(api, root, state, parentId, connections, reload, depth, 
     icon.setAttribute("role", "img");
     icon.setAttribute("aria-label", node.icon.kind === "emoji" ? "Project icon" : `Iconify ${node.icon.value}`);
     if (node.icon.kind === "iconify") { icon.classList.add("iconify"); icon.dataset.icon = node.icon.value; }
-    row.append(icon, element("span", "min-w-0 flex-1 truncate text-sm text-token-text-primary", node.name));
-    row.append(button("Edit", () => editNode(api, state, node, reload, revision)));
+    const name = node.type === "project" ? button(node.name, () => navigation.selectProject?.(node.id)) : element("span", "", node.name);
+    name.className = "min-w-0 flex-1 truncate text-left text-sm text-token-text-primary";
+    row.append(icon, name);
+    row.append(button("Edit", () => node.type === "project"
+      ? navigation.openNativeProjectEditDialog?.(node)
+      : editNode(api, state, node, reload, revision)));
     const up = button("↑", () => moveNode(api, state, siblings, siblingIndex, -1, reload, revision));
     up.title = `Move ${node.name} up`;
     up.disabled = siblingIndex === 0;
@@ -457,7 +447,7 @@ function renderChildren(api, root, state, parentId, connections, reload, depth, 
       }
     }
     root.append(row);
-    if (node.type === "group") renderChildren(api, root, state, node.id, connections, reload, depth + 1, revision);
+    if (node.type === "group") renderChildren(api, root, state, node.id, connections, reload, depth + 1, revision, navigation);
   }
 }
 
@@ -658,6 +648,35 @@ function projectForEditDialog(api, state, dialog) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+function exactNamedProject(projects, name) {
+  if (typeof name !== "string" || !name.trim()) return null;
+  const matches = projects.filter((node) => projectNativeNames(node).includes(name.trim()));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function projectForNativeSave(api, state, form, nativeId, fallback) {
+  if (typeof nativeId !== "string" || !nativeId || !state?.nodes) return null;
+  const projects = state.nodes.filter((node) => node.type === "project");
+  const exact = projects.filter((node) => node.id === nativeId || node.nativeProjectIds?.includes(nativeId));
+  if (exact.length) return exact.length === 1 ? exact[0] : null;
+  // Legacy appearance records can have a different ID. Only the native
+  // form's own identity and original source folders can bridge that gap.
+  // Display names and edited input values cannot establish this binding.
+  let fiber = api.react?.getFiber?.(form) || null;
+  for (let depth = 0; fiber && depth < 30; depth += 1, fiber = fiber.return) {
+    const props = fiber.memoizedProps;
+    if (!isRecord(props) || props.projectId !== nativeId || !Array.isArray(props.initialSources)) continue;
+    const paths = props.initialSources.filter((source) => typeof source === "string" && source.length > 0);
+    const matches = projects.filter((node) => paths.some((path) => node.projectPath === path || node.nativeProjectPaths?.includes(path)));
+    return matches.length === 1 ? matches[0] : null;
+  }
+  // Isolated renderers may not expose React fibers. The exact native form
+  // can still own an appearance draft selected by a unique initial name.
+  // Keep that saved ID and recheck uniqueness, never use edited field values.
+  const named = exactNamedProject(projects, fallback?.initialName);
+  return named?.id === fallback?.id ? named : null;
+}
+
 function editProjectDialogCandidates(doc = document) {
   const candidates = new Set(doc.querySelectorAll?.('[role="dialog"], [data-radix-dialog-content], [data-state="open"]') || []);
   for (const heading of doc.querySelectorAll?.("h1, h2, h3, [role=\"heading\"]") || []) {
@@ -672,33 +691,81 @@ function editProjectDialogCandidates(doc = document) {
     }
   }
   const matching = [...candidates].filter((dialog) => {
-    const text = String(dialog.textContent || "").replace(/\s+/g, " ").trim();
+    const heading = [...(dialog.querySelectorAll?.('h1, h2, h3, [role="heading"]') || [])]
+      .some((node) => /^Edit project$/i.test(String(node.textContent || "").replace(/\s+/g, " ").trim()));
     const buttons = [...(dialog.querySelectorAll?.("button") || [])];
-    return /^Edit project\b/i.test(text) && buttons.some((node) => /^Save$/i.test(String(node.textContent || "").trim()));
+    return heading && buttons.some((node) => /^Save$/i.test(String(node.textContent || "").trim()));
   });
   return matching.filter((dialog) => !matching.some((other) => other !== dialog && other.contains?.(dialog)));
 }
 
 function dialogCloseButton(dialog) {
   const buttons = [...(dialog.querySelectorAll?.("button") || [])];
-  return buttons.find((node) => /^close$/i.test(String(node.getAttribute?.("aria-label") || node.getAttribute?.("title") || "").trim()))
+  return buttons.find((node) => /^close(?: dialog)?$/i.test(String(node.getAttribute?.("aria-label") || node.getAttribute?.("title") || "").trim()))
     || buttons.find((node) => !String(node.textContent || "").trim() && node.querySelector?.("svg")) || null;
 }
 
 function installEditProjectDialogControls(api, getState, saveAppearance, openSettingsProject) {
   if (typeof document === "undefined") return () => {};
-  const inject = () => {
-    for (const dialog of editProjectDialogCandidates(document)) {
+  let pending = null;
+  let disposed = false;
+  const dialogListeners = new Map();
+  const retryDrafts = new Map();
+  const inject = (candidates = editProjectDialogCandidates(document)) => {
+    if (disposed) return;
+    for (const [dialog, remove] of dialogListeners) {
+      if (dialog.isConnected !== false) continue;
+      remove();
+      dialogListeners.delete(dialog);
+    }
+    for (const dialog of candidates) {
       const project = projectForEditDialog(api, getState?.(), dialog);
       if (project && !dialog.querySelector?.("[data-tweaker-project-dialog-appearance]")) {
+        const nameInputs = [...(dialog.querySelectorAll?.("input") || [])]
+          .filter((input) => !input.type || input.type === "text");
+        const initialName = nameInputs.length === 1 ? nameInputs[0].value : null;
+        const initialOwner = exactNamedProject((getState?.()?.nodes || []).filter((node) => node.type === "project"), initialName);
+        const fallback = initialOwner?.id === project.id ? { id: project.id, initialName } : null;
         const section = element("section", "border-token-border bg-token-main-surface-primary mx-5 mb-4 flex flex-col rounded-lg border p-3");
         section.dataset.tweakerProjectDialogAppearance = "true";
-        section.append(projectAppearanceEditor(project, async (choice) => {
-          await saveAppearance?.(project.id, choice);
-          section.remove?.();
-          inject();
+        // The native dialog owns Save/Cancel. Keep appearance edits private to
+        // this dialog until Save, just like the native project fields.
+        const retryDraft = retryDrafts.get(project.id);
+        let changes = { ...(retryDraft || {}) };
+        let draft = { ...project, ...changes };
+        let saved = false;
+        const draw = () => section.replaceChildren(projectAppearanceEditor(draft, (choice) => {
+          changes = { ...changes, ...choice };
+          draft = { ...draft, ...choice };
+          draw();
         }));
+        draw();
         const save = [...(dialog.querySelectorAll?.("button") || [])].find((node) => /^Save$/i.test(String(node.textContent || "").trim()));
+        const form = dialog.matches?.("form") ? dialog : dialog.querySelector?.("form") || dialog.closest?.("form");
+        const onSave = (event) => {
+          if (disposed || saved || !Object.keys(changes).length || event.target !== form) return;
+          const nativeId = event.detail?.projectId;
+          const currentProject = projectForNativeSave(api, getState?.(), form, nativeId, fallback);
+          if (!currentProject || currentProject.id !== project.id) {
+            api.log?.warn?.("Project appearance save rejected: project identity unavailable or changed");
+            window.alert?.("Could not identify this project for its appearance change. Open Edit again to retry.");
+            return;
+          }
+          saved = true;
+          const submitted = { ...changes };
+          retryDrafts.set(project.id, submitted);
+          Promise.resolve(saveAppearance?.(currentProject.id, submitted)).then((result) => {
+            if (result !== false && retryDrafts.get(project.id) === submitted) retryDrafts.delete(project.id);
+          }).catch((error) => {
+            api.log?.warn?.("Project appearance save failed", String(error?.message || "unavailable"));
+            window.alert?.("Could not save project appearance. Open Edit again to retry your choices.");
+          });
+        };
+        form?.addEventListener?.("tweaker:project-save-succeeded", onSave);
+        dialogListeners.set(dialog, () => {
+          form?.removeEventListener?.("tweaker:project-save-succeeded", onSave);
+          if (!saved && retryDraft && retryDrafts.get(project.id) === retryDraft) retryDrafts.delete(project.id);
+        });
         const footer = save?.parentElement;
         if (footer?.parentElement) footer.parentElement.insertBefore(section, footer);
         else dialog.append(section);
@@ -725,13 +792,32 @@ function installEditProjectDialogControls(api, getState, saveAppearance, openSet
       }
     }
   };
-  const observer = new MutationObserver(inject);
+  const schedule = (records) => {
+    if (disposed || pending !== null) return;
+    const hasEditHeading = (node) => [node, ...(node.querySelectorAll?.('h1, h2, h3, [role="heading"]') || [])]
+      .some((heading) => heading.matches?.('h1, h2, h3, [role="heading"]')
+        && /^Edit project$/i.test(String(heading.textContent || "").replace(/\s+/g, " ").trim()));
+    const addedDialog = !Array.isArray(records) || records.some((record) => [...(record.addedNodes || [])].some((node) =>
+      node.nodeType === 1 && (node.matches?.('[role="dialog"], [data-radix-dialog-content], [data-state="open"]')
+        || node.querySelector?.('[role="dialog"], [data-radix-dialog-content], [data-state="open"]')
+        || hasEditHeading(node))));
+    if (!addedDialog) return;
+    pending = (window.requestAnimationFrame || ((callback) => window.setTimeout(callback, 16)))(() => {
+      pending = null;
+      inject();
+    });
+  };
+  const observer = new MutationObserver(schedule);
   observer.observe(document.body, { childList: true, subtree: true });
-  window.addEventListener("tweaker:projects-state-ready", inject);
+  window.addEventListener("tweaker:projects-state-ready", schedule);
   inject();
   return () => {
+    disposed = true;
     observer.disconnect();
-    window.removeEventListener("tweaker:projects-state-ready", inject);
+    for (const remove of dialogListeners.values()) remove();
+    dialogListeners.clear();
+    if (pending !== null) (window.cancelAnimationFrame || window.clearTimeout)?.(pending);
+    window.removeEventListener("tweaker:projects-state-ready", schedule);
     document.querySelectorAll?.("[data-tweaker-project-dialog-appearance], [data-tweaker-project-settings-button]").forEach((node) => node.remove?.());
   };
 }
@@ -761,5 +847,6 @@ module.exports = {
   branchInventoryDisclosure,
   editProjectDialogCandidates,
   dialogCloseButton,
+  projectForNativeSave,
   installEditProjectDialogControls,
 };

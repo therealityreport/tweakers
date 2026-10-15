@@ -1,7 +1,7 @@
 # Writing Tweaker Tweaks
 
 This page is the entry point for tweak authors. The detailed docs are split by
-task so the API reference can stay complete without turning the getting-started
+task so the API reference can remain useful without turning the getting-started
 guide into a wall of text.
 
 ## Start Here
@@ -12,8 +12,8 @@ guide into a wall of text.
   validation rules, update metadata, permissions, and MCP metadata.
 - [Runtime and lifecycle](./tweaks/runtime-lifecycle.md): renderer/main/both
   scopes, loading model, hot reload, storage locations, and cleanup rules.
-- [SDK and API reference](./tweaks/api-reference.md): full coverage of every
-  public export from `@therealityreport/tweakers-sdk`.
+- [SDK and API reference](./tweaks/api-reference.md): selected public SDK APIs;
+  consult the current SDK declarations for the complete surface.
 - [Native bridge](./tweaks/native-bridge.md): AppKit/Metal panels, tweak-owned
   `.node` modules, Swift shims, helpers, permissions, and lifecycle.
 - [UI and DOM patterns](./tweaks/ui-and-dom.md): settings pages, settings

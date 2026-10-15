@@ -15,7 +15,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,9 +23,18 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       - run: bash scripts/check-no-bnnett.sh
       - run: npm run lint
       - run: npm run typecheck
+      - run: npm run typecheck:tests
+      - run: npm run check:tweak-catalog
+      - run: npm run audit -- --audit-level=high
+      # Tests load the built installer, runtime and manager bundle. The removed
+      # root `prepare` script used to build them during `npm ci`.
+      - name: Build packages for tests
+        run: npm run build
       - run: npm test
       # This invokes the ordinary credential-free native-host build. It never
       # calls the separate --release-manager-launcher private-signer path.
@@ -43,7 +52,7 @@ jobs:
             store/index.json \
             packages/installer/assets/runtime \
             ':(exclude)packages/installer/assets/runtime/native/tweaker_native_host.node' \
-            ':(exclude)packages/installer/assets/runtime/native/Tweakers Doctor.app/Contents/MacOS/Tweakers Doctor' \
+            ':(exclude)packages/installer/assets/runtime/native/Tweakers Manager.app/Contents/MacOS/Tweakers Manager' \
             ':(exclude)packages/installer/assets/runtime/.manager-support/app-launcher/Tweakers App Launcher' \
             ':(exclude)packages/installer/assets/runtime/.manager-support/swap-helper/Tweakers Swap Helper.app/Contents/MacOS/Tweakers Swap Helper' \
             ':(exclude)packages/installer/assets/runtime/runtime-fingerprint.json'

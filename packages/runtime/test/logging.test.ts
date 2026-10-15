@@ -41,6 +41,20 @@ test("appendCappedLog retains the pre-rotation content in .1", () => {
   }
 });
 
+test("appendCappedLog retains three prior preload segments", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tweaker-log-"));
+  try {
+    const file = join(dir, "preload.log");
+    for (const value of ["aaaa", "bbbb", "cccc", "dddd", "eeee"]) appendCappedLog(file, value, 5, 3);
+    assert.equal(readFileSync(file, "utf8"), "eeee");
+    assert.equal(readFileSync(`${file}.1`, "utf8"), "dddd");
+    assert.equal(readFileSync(`${file}.2`, "utf8"), "cccc");
+    assert.equal(readFileSync(`${file}.3`, "utf8"), "bbbb");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("appendCappedLog truncates oversized entries to the byte cap", () => {
   const dir = mkdtempSync(join(tmpdir(), "tweaker-log-"));
   try {

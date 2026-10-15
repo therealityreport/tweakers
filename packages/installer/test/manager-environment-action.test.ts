@@ -16,7 +16,7 @@ import {
   type EnvironmentTransactionReceipt,
   type PreparedEnvironmentEvidence,
 } from "../src/manager-environment-action";
-import { createEnvironmentCoordinator } from "../src/environment-transaction";
+import { createEnvironmentCoordinator, type InstallerEnvironmentCoordinator } from "../src/environment-transaction";
 
 const NOW = "2026-08-28T01:00:00.000Z";
 const TRANSACTION_ID = "manager-safe-pre-cutover-cancel";
@@ -44,7 +44,7 @@ test("manager-safe cancellation has exact legacy receipt and archive parity", as
       now: () => NOW,
       timingClock: fixedTimingClock(),
       processAlive: () => false,
-    });
+    }) as InstallerEnvironmentCoordinator;
     writeEnvironmentTransactionReceipt(coordinator.transactionFile, legacy.receipt);
     const legacyResult = await coordinator.cancel(TRANSACTION_ID);
 

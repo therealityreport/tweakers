@@ -32,6 +32,11 @@ class NativeRemoteControllerV1 {
     pairings = new Map();
     pairingGenerations = new Map();
     disposed = false;
+    /** Configuration and registered devices are not live consumers. */
+    hasActiveOperation() {
+        return !this.disposed && (this.queues.size > 0
+            || [...this.pairings.values()].some(pairing => pairing.expiresAtMs > this.clock()));
+    }
     constructor(options) {
         if (!Buffer.isBuffer(options.secret) || options.secret.byteLength < 16)
             throw new Error("remote controller requires an owner-private HMAC key");

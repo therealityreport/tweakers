@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -18,6 +19,8 @@ import {
 } from "../src/integrity.js";
 import { readPlist, writePlist } from "../src/plist.js";
 import type { CodexInstall } from "../src/platform.js";
+import { integrityMachO } from "./fixtures/electron-integrity-macho.js";
+import { assertElectronIntegrityDictionaryDigest } from "../src/electron-integrity-digest.js";
 
 async function stageFixture(): Promise<{ root: string; install: CodexInstall }> {
   const root = mkdtempSync(join(realpathSync(tmpdir()), "tweakers-integrity-"));
@@ -32,6 +35,8 @@ async function stageFixture(): Promise<{ root: string; install: CodexInstall }> 
     await asar.createPackage(source, join(resourcesDir, `${name}.asar`));
   }
   const appHash = readHeaderHash(join(resourcesDir, "app.asar")).headerHash;
+  const electronBinary = join(root, "framework");
+  writeFileSync(electronBinary, integrityMachO(), { mode: 0o755 });
   writePlist(metaPath, {
     ElectronAsarIntegrity: {
       "Resources/app.asar": { algorithm: "SHA256", hash: appHash },
@@ -44,7 +49,7 @@ async function stageFixture(): Promise<{ root: string; install: CodexInstall }> 
       resourcesDir,
       asarPath: join(resourcesDir, "app.asar"),
       metaPath,
-      electronBinary: "",
+      electronBinary,
       executable: "",
       appName: "ChatGPT",
       bundleId: "com.openai.codex",
@@ -65,6 +70,7 @@ test("macOS integrity publication covers every top-level ASAR archive", async ()
     const appHash = readHeaderHash(fixture.install.asarPath).headerHash;
     setIntegrity(fixture.install, appHash);
     assert.doesNotThrow(() => assertResourceAsarIntegrity(fixture.install));
+    assert.doesNotThrow(() => assertElectronIntegrityDictionaryDigest(fixture.install.electronBinary, readPlist(fixture.install.metaPath!).ElectronAsarIntegrity));
 
     const plist = readPlist(fixture.install.metaPath!);
     const entries = plist.ElectronAsarIntegrity as Record<string, { algorithm: string; hash: string }>;
@@ -84,6 +90,25 @@ test("macOS integrity publication covers every top-level ASAR archive", async ()
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("malformed retained metadata and digest slots block publication before plist or framework writes", async () => {
+  const fixture = await stageFixture();
+  try {
+    const pl = readPlist(fixture.install.metaPath!);
+    (pl.ElectronAsarIntegrity as Record<string, unknown>)["Resources/retained.asar"] = { algorithm: "SHA256", hash: false };
+    writePlist(fixture.install.metaPath!, pl);
+    const beforePlist = readFileSync(fixture.install.metaPath!), beforeFramework = readFileSync(fixture.install.electronBinary);
+    assert.throws(() => setIntegrity(fixture.install, readHeaderHash(fixture.install.asarPath).headerHash), /dictionary entry/);
+    assert.deepEqual(readFileSync(fixture.install.metaPath!), beforePlist);
+    assert.deepEqual(readFileSync(fixture.install.electronBinary), beforeFramework);
+    delete (pl.ElectronAsarIntegrity as Record<string, unknown>)["Resources/retained.asar"];
+    writePlist(fixture.install.metaPath!, pl);
+    writeFileSync(fixture.install.electronBinary, integrityMachO({ used: 1, version: 8 }));
+    const currentPlist = readFileSync(fixture.install.metaPath!);
+    assert.throws(() => setIntegrity(fixture.install, readHeaderHash(fixture.install.asarPath).headerHash), /slot version/);
+    assert.deepEqual(readFileSync(fixture.install.metaPath!), currentPlist);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
 test("macOS integrity publication rejects a symlinked ASAR resource", { skip: process.platform === "win32" }, async () => {

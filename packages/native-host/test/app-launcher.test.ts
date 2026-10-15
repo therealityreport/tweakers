@@ -3,15 +3,17 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  linkSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 const launcherName = "Tweakers App Launcher";
@@ -101,6 +103,7 @@ writeFileSync(${JSON.stringify(output)}, JSON.stringify({
     TWEAKER_ACCOUNTS_BROKER_ROOT: process.env.TWEAKER_ACCOUNTS_BROKER_ROOT,
     CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: process.env.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED,
     TWEAKERS_DERIVED_VARIANT: process.env.TWEAKERS_DERIVED_VARIANT,
+    TWEAKERS_ACCEPTANCE_CONFIG_FILE: process.env.TWEAKERS_ACCEPTANCE_CONFIG_FILE,
     ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE,
     TWEAKERS_TEST_PARENT_SECRET: process.env.TWEAKERS_TEST_PARENT_SECRET,
   },
@@ -123,7 +126,7 @@ writeFileSync(${JSON.stringify(output)}, JSON.stringify({
       `${JSON.stringify({ executable: managerLauncher })}\n`,
       { mode: 0o600 },
     );
-    const doctor = join(app, "Contents", "Resources", "tweakers", "native", "Tweakers Doctor.app", "Contents", "MacOS", "Tweakers Doctor");
+    const doctor = join(app, "Contents", "Resources", "tweakers", "native", "Tweakers Manager.app", "Contents", "MacOS", "Tweakers Manager");
     mkdirSync(join(doctor, ".."), { recursive: true });
     writeFileSync(doctor, `#!${process.execPath}\nconst { writeFileSync, renameSync } = require("node:fs");\nwriteFileSync(${JSON.stringify(doctorOutput + ".tmp")}, JSON.stringify({ argv: process.argv.slice(2), secret: process.env.TWEAKERS_TEST_PARENT_SECRET ?? null, codexHome: process.env.CODEX_HOME ?? null }));\nrenameSync(${JSON.stringify(doctorOutput + ".tmp")}, ${JSON.stringify(doctorOutput)});\n`, { mode: 0o755 });
     chmodSync(doctor, 0o755);
@@ -146,7 +149,7 @@ function waitForFile(path: string): boolean {
 test("app launcher source binds all pre-singleton identity inputs and scoped asset publication", () => {
   const source = readFileSync(launcherImplementation, "utf8");
   assert.match(source, /kElectronName\[\] = "Tweakers Electron"/);
-  assert.match(source, /kDoctorRelativeExecutable\[\] = "Resources\/tweakers\/native\/Tweakers Doctor\.app\/Contents\/MacOS\/Tweakers Doctor"/);
+  assert.match(source, /kDoctorRelativeExecutable\[\] = "Resources\/tweakers\/native\/Tweakers Manager\.app\/Contents\/MacOS\/Tweakers Manager"/);
   assert.match(source, /kInstalledLauncherName\[\] = "ChatGPT"/);
   assert.match(source, /Basename\(launcher\) != kInstalledLauncherName/);
   assert.match(source, /variant-user-data-path/);
@@ -198,6 +201,7 @@ test("app launcher starts the preserved Electron with signed pre-singleton isola
         TWEAKER_ACCOUNTS_BROKER_ROOT: "/attacker-compatibility-broker",
         CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: "0",
         TWEAKERS_DERIVED_VARIANT: "0",
+        TWEAKERS_ACCEPTANCE_CONFIG_FILE: "/attacker-config",
         ELECTRON_RUN_AS_NODE: "1",
         TWEAKERS_TEST_PARENT_SECRET: "must-not-cross-the-launcher",
       },
@@ -219,8 +223,8 @@ test("app launcher starts the preserved Electron with signed pre-singleton isola
       CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: "1",
       TWEAKERS_DERIVED_VARIANT: "1",
     });
-    assert.equal(observed.environment.ELECTRON_RUN_AS_NODE, undefined);
-    assert.equal(observed.environment.TWEAKERS_TEST_PARENT_SECRET, undefined);
+    assert.equal(Object.hasOwn(observed.environment, "ELECTRON_RUN_AS_NODE"), false);
+    assert.equal(Object.hasOwn(observed.environment, "TWEAKERS_TEST_PARENT_SECRET"), false);
     assert.deepEqual(observed.environmentKeys, [
       "CODEX_ELECTRON_USER_DATA_PATH",
       "CODEX_HOME",
@@ -244,6 +248,50 @@ test("app launcher starts the preserved Electron with signed pre-singleton isola
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("app launcher delivers only an explicit private acceptance config and consumes its argument", { skip: process.platform !== "darwin" }, () => {
+  const fixture = stageFixture();
+  try {
+    const acceptance = join(dirname(fixture.userData), "acceptance", "12345678-1234-1234-1234-123456789abc");
+    writePrivateDirectory(acceptance);
+    const config = join(acceptance, "config.json");
+    writeFileSync(config, "{}", { mode: 0o600 });
+    for (const flag of [[`--tweakers-acceptance-config=${config}`], ["--tweakers-acceptance-config", config]]) {
+      const result = spawnSync(fixture.launcher, [...flag, "--ordinary-switch=value"], { encoding: "utf8", env: { ...process.env, TWEAKERS_ACCEPTANCE_CONFIG_FILE: "/attacker-config", TWEAKERS_TEST_PARENT_SECRET: "must-not-cross" } });
+      assert.equal(result.status, 0, result.stderr);
+      const observed = JSON.parse(readFileSync(fixture.output, "utf8"));
+      assert.equal(observed.environment.TWEAKERS_ACCEPTANCE_CONFIG_FILE, config);
+      assert.equal(observed.environment.CODEX_HOME, fixture.codexHome);
+      assert.equal(observed.environment.CODEX_ELECTRON_USER_DATA_PATH, fixture.userData);
+      assert.equal(Object.hasOwn(observed.environment, "TWEAKERS_TEST_PARENT_SECRET"), false);
+      assert.deepEqual(observed.argv, [`--user-data-dir=${fixture.userData}`, "--ordinary-switch=value"]);
+    }
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("app launcher refuses invalid acceptance paths, duplicates, public files and links before Electron", { skip: process.platform !== "darwin" }, () => {
+  const fixture = stageFixture();
+  try {
+    const root = dirname(fixture.userData), acceptance = join(root, "acceptance", "12345678-1234-1234-1234-123456789abc");
+    writePrivateDirectory(acceptance);
+    const config = join(acceptance, "config.json"), outside = join(root, "outside.json");
+    writeFileSync(config, "{}", { mode: 0o600 });
+    writeFileSync(outside, "{}", { mode: 0o600 });
+    const reject = (args: string[]) => {
+      const result = spawnSync(fixture.launcher, args, { encoding: "utf8", env: { ...process.env } });
+      assert.notEqual(result.status, 0);
+      assert.equal(existsSync(fixture.output), false);
+    };
+    for (const path of ["", outside, config.replace("12345678-1234-1234-1234-123456789abc", "not-a-uuid"), join(acceptance, "other.json"), `${acceptance}/../12345678-1234-1234-1234-123456789abc/config.json`]) reject([`--tweakers-acceptance-config=${path}`]);
+    reject(["--tweakers-acceptance-config"]);
+    reject([`--tweakers-acceptance-config=${config}`, `--tweakers-acceptance-config=${config}`]);
+    chmodSync(config, 0o644);reject([`--tweakers-acceptance-config=${config}`]);chmodSync(config, 0o600);
+    chmodSync(acceptance, 0o755);reject([`--tweakers-acceptance-config=${config}`]);chmodSync(acceptance, 0o700);
+    rmSync(config);symlinkSync(outside, config);reject([`--tweakers-acceptance-config=${config}`]);rmSync(config);
+    linkSync(outside, config);reject([`--tweakers-acceptance-config=${config}`]);rmSync(config);
+    symlinkSync(join(root, "missing.json"), config);reject([`--tweakers-acceptance-config=${config}`]);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
 test("app launcher fails closed before Electron when its signed launch configuration is malformed", { skip: process.platform !== "darwin" }, () => {

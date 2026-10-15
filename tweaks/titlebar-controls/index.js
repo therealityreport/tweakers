@@ -1,4 +1,7 @@
 "use strict";
+// Generated compatibility entry. Edit the owning tweak's lib/titlebar-controls.js instead.
+// The runtime suppresses this legacy ID only after successful owner-settings migration.
+"use strict";
 
 const STYLE_ID = "tweaker-titlebar-controls-style";
 const ATTR = "data-tweaker-titlebar-controls";
@@ -12,17 +15,17 @@ const CONTROL_SELECTOR = [
   '[title="Forward"]',
 ].join(", ");
 
-const helpers = { detectLayout, detectWindowLayout: detectLayout, alignControls, computeAlignment: alignControls, computeControlTransform, cleanup, teardown: cleanup, isMacPlatform, setTransform, pruneDetachedSnapshots, shouldShowRefresh, refreshTooltip };
+const helpers = { detectLayout, detectWindowLayout: detectLayout, alignControls, computeAlignment: alignControls, computeControlTransform, cleanup, teardown: cleanup, isMacPlatform, setTransform, pruneDetachedSnapshots, shouldShowRefresh, refreshTooltip, canAlignControls };
 const instances = new WeakMap();
 
 module.exports = {
-  start(api) {
+  start(api, options = {}) {
     if (api?.process === "main" || typeof document === "undefined") return;
     // macOS-only tweak. Bail unless we can positively confirm macOS — a titlebar
     // relayout on another OS is at best a no-op and at worst misaligns controls.
     // navigator.platform is increasingly empty, so also consult userAgentData /
     // userAgent instead of short-circuiting the whole guard on an empty string.
-    const state = { api, observers: [], observerConfigs: [], styles: [], listeners: [], snapshots: new Map(), disposed: false, pending: null, refreshButton: null, page: null };
+    const state = { api, styles: [], listeners: [], snapshots: new Map(), disposed: false, pending: null, refreshButton: null, page: null };
     instances.set(this, state);
     const supported = isMacPlatform();
     const onResize = () => schedule(state);
@@ -34,13 +37,10 @@ module.exports = {
       document.addEventListener?.("fullscreenchange", onFullscreen);
       state.listeners.push([window, "resize", onResize], [document, "fullscreenchange", onFullscreen]);
     }
-    const onFocus = () => void refreshRefreshButton(state);
-    window.addEventListener?.("focus", onFocus);
-    state.listeners.push([window, "focus", onFocus]);
     const disposeRefreshStatus = api?.codex?.refresh?.onStatusChanged?.(() => void refreshRefreshButton(state));
     if (disposeRefreshStatus) state.listeners.push({ remove: disposeRefreshStatus });
     void refreshRefreshButton(state);
-    state.page = api.settings?.registerPage?.({
+    state.page = options.integrated ? null : api.settings?.registerPage?.({
       id: "titlebar-controls",
       title: "Titlebar Controls",
       description: "Native-safe titlebar alignment and Tweakers refresh status.",
@@ -193,21 +193,6 @@ function findObserverTarget() {
   return shell || document.documentElement || document;
 }
 
-function pauseObservers(state) {
-  for (const config of state.observerConfigs || []) {
-    config.observer.takeRecords?.();
-    config.observer.disconnect();
-  }
-}
-
-function resumeObservers(state) {
-  if (state.disposed) return;
-  for (const config of state.observerConfigs || []) {
-    config.observer.takeRecords?.();
-    config.observer.observe(config.target, config.options);
-  }
-}
-
 function setTransform(control, value, priority) {
   // Only write when the value actually changes, so our own writes do not feed
   // the MutationObserver a fresh mutation each frame (the old feedback loop).
@@ -236,7 +221,16 @@ function detectLayout(input = document) {
   const contentLeft = parseCssLength(style?.getPropertyValue?.("--titlebar-content-left")) ?? rect.left;
   const contentTop = parseCssLength(style?.getPropertyValue?.("--titlebar-content-top")) ?? rect.top;
   const titlebarHeight = parseCssLength(style?.getPropertyValue?.("--titlebar-height")) ?? rect.height;
-  return { windowLeft: rect.left, contentLeft, contentTop, contentWidth: rect.width, titlebarHeight, shell };
+  return { windowLeft: rect.left, contentLeft, contentTop, contentWidth: rect.width, titlebarHeight, shell,
+    measuredTitlebar: parseCssLength(style?.getPropertyValue?.("--titlebar-content-left")) !== null
+      && (parseCssLength(style?.getPropertyValue?.("--titlebar-height")) ?? 0) > 0 };
+}
+
+function canAlignControls(layout, alignment) {
+  return layout?.measuredTitlebar === true
+    && Number.isFinite(alignment?.left)
+    && alignment.left >= layout.windowLeft
+    && alignment.right <= layout.windowLeft + layout.contentWidth;
 }
 
 function alignControls(layout, controls = {}) {
@@ -250,10 +244,6 @@ function alignControls(layout, controls = {}) {
 
 function apply(state) {
   if (state.disposed) return;
-  // Disconnect our observers for the duration of the writes below; every style
-  // write we make would otherwise be observed and reschedule apply() forever.
-  pauseObservers(state);
-  try {
     pruneDetachedSnapshots(state);
     if (isFullscreen()) {
       restoreControls(state);
@@ -270,6 +260,7 @@ function apply(state) {
     const groupLeft = Math.min(...rects.map((rect) => rect.left));
     const groupRight = Math.max(...rects.map((rect) => rect.right ?? rect.left + rect.width));
     const horizontal = alignControls(layout, { width: groupRight - groupLeft, inset: 8 });
+    if (!canAlignControls(layout, horizontal)) return;
     const translateX = Number.isFinite(horizontal.left) ? horizontal.left - groupLeft : 0;
     for (const control of controls) {
       if (!state.snapshots.has(control)) state.snapshots.set(control, {
@@ -282,9 +273,6 @@ function apply(state) {
       if (control.getAttribute?.(ATTR) !== "active") control.setAttribute?.(ATTR, "active");
       setTransform(control, `translate(${transform.x}px, ${transform.y}px)`, "important");
     }
-  } finally {
-    resumeObservers(state);
-  }
 }
 
 function pruneDetachedSnapshots(state) {
@@ -338,8 +326,6 @@ function cleanup(state) {
     window.clearTimeout?.(state.pending);
     state.pending = null;
   }
-  if (state.observerConfigs) state.observerConfigs.length = 0;
-  for (const observer of state.observers.splice(0)) observer?.disconnect?.();
   for (const entry of state.listeners.splice(0)) {
     if (Array.isArray(entry)) {
       const [target, type, listener] = entry;

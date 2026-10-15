@@ -17,13 +17,12 @@ test("titlebar alignment uses measured layout and avoids overlap", () => {
   assert.ok(result.right <= layout.contentLeft);
 });
 
-test("resize and disable cleanup remove observers and injected styles", () => {
+test("resize and disable cleanup remove injected styles and listeners", () => {
   assert.ok(helpers);
   const cleanup = helpers.cleanup ?? helpers.teardown;
   assert.equal(typeof cleanup, "function");
-  const state = { observers: [1, 2], styles: [1], listeners: [1] };
+  const state = { styles: [1], listeners: [1] };
   cleanup(state);
-  assert.deepEqual(state.observers, []);
   assert.deepEqual(state.styles, []);
   assert.deepEqual(state.listeners, []);
   assert.equal(state.disposed, true);
@@ -66,9 +65,27 @@ test("pruneDetachedSnapshots drops nodes no longer in the DOM, keeps connected o
   assert.equal(state.snapshots.has(detached), false);
 });
 
-test("isMacPlatform is exposed and returns a boolean", () => {
-  assert.equal(typeof helpers.isMacPlatform, "function");
-  assert.equal(typeof helpers.isMacPlatform(), "boolean");
+test("titlebar platform guard recognizes macOS signals and rejects other platforms", () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  try {
+    for (const [navigator, expected] of [
+      [{ platform: "MacIntel" }, true],
+      [{ platform: "", userAgentData: { platform: "macOS" } }, true],
+      [{ platform: "", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X)" }, true],
+      [{ platform: "Win32", userAgentData: { platform: "Windows" } }, false],
+      [{ platform: "Linux x86_64", userAgent: "Mozilla/5.0 (X11; Linux)" }, false],
+      // Preserve the existing shipped-desktop fallback when the host hides all signals.
+      [{ platform: "", userAgent: "" }, true],
+    ]) {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: navigator });
+      assert.equal(helpers.isMacPlatform(), expected, JSON.stringify(navigator));
+    }
+    delete globalThis.navigator;
+    assert.equal(helpers.isMacPlatform(), false);
+  } finally {
+    if (original) Object.defineProperty(globalThis, "navigator", original);
+    else delete globalThis.navigator;
+  }
 });
 
 test("refresh control appears only for actionable development or stable updates", () => {
@@ -103,3 +120,10 @@ function makeFakeControl(initial = "") {
   };
   return control;
 }
+
+ test("unmeasured or off-window titlebar geometry preserves native controls", () => {
+  const layout = { windowLeft: 0, contentLeft: 0, contentWidth: 1000 };
+  assert.equal(helpers.canAlignControls(layout, helpers.alignControls(layout, { width: 120, inset: 8 })), false);
+  assert.equal(helpers.canAlignControls({ ...layout, measuredTitlebar: true }, { left: -128, right: -8 }), false);
+  assert.equal(helpers.canAlignControls({ ...layout, measuredTitlebar: true }, { left: 140, right: 260 }), true);
+});

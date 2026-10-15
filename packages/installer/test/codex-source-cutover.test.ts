@@ -114,7 +114,7 @@ test("installed verifier consumes exact CLI snake_case and exact receipt route i
 
 function plan(): ManagedMcpConfigReconciliationPlan {
   const declaration = (command: string) => ({
-    source: { kind: "config" as const, name: "config.toml" },
+    source: { origin: "config" as const },
     environmentId: "local",
     command,
     args: [],

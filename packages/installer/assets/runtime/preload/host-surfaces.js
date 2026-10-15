@@ -5,7 +5,6 @@ exports.attachMcpFormCarrier = attachMcpFormCarrier;
 exports.attachMcpFormElement = attachMcpFormElement;
 exports.getSharedHistoryTarget = getSharedHistoryTarget;
 exports.queryHostSurfaces = queryHostSurfaces;
-const electron_1 = require("electron");
 const react_hook_1 = require("./react-hook");
 const MAX_MATCHES = 100;
 // Current desktop builds can place a standard MCP form beneath substantially
@@ -38,7 +37,7 @@ const NATIVE_SETTINGS_SURFACES = {
     "mcp-settings": { routeSlugs: ["mcp", "mcp-servers"], headings: ["MCP servers", "MCP 服务器"] },
 };
 const SELECTORS = {
-    "assistant-turns": '[data-testid="conversation-turn"], [data-testid*="assistant-message" i], [data-message-author-role="assistant"], [data-role="assistant"]',
+    "assistant-turns": '[data-testid="conversation-turn"], [data-testid*="assistant-message" i], [data-message-author-role="assistant"], [data-role="assistant"], [data-markdown-text-style="assistant-message"]',
     composer: '#prompt-textarea, [data-testid="composer"] textarea, [data-testid="composer"] [contenteditable="true"], form textarea:not([disabled]), form [contenteditable="true"]',
     "command-menu": '[data-command-menu], [data-slash-menu], [role="listbox"]',
     "account-menu": '[role="menu"], [role="dialog"]',
@@ -428,7 +427,10 @@ async function getSharedHistoryTarget() {
         return native;
     let response;
     try {
-        response = await electron_1.ipcRenderer.invoke(SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL, {
+        // Resolve Electron only when the native target seam is used. Pure host
+        // adapter tests can load this module without an installed Electron binary.
+        const ipcRenderer = require("electron").ipcRenderer;
+        response = await ipcRenderer.invoke(SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL, {
             version: SHARED_HISTORY_MAP_VERSION,
             conversationNativeId: native.target.conversationNativeId,
             composerNativeId: native.target.composerNativeId,
@@ -587,13 +589,24 @@ function ensureObserver() {
             return;
         pendingFrame = requestAnimationFrame(() => {
             pendingFrame = null;
-            for (const entry of listeners)
-                safelyNotify(entry, entry.kinds.map(snapshot));
+            // A shared observer should also share discovery: each surface is scanned
+            // once per frame even when several tweaks subscribe to the same kind.
+            const snapshots = new Map();
+            for (const entry of listeners) {
+                safelyNotify(entry, entry.kinds.map((kind) => {
+                    let value = snapshots.get(kind);
+                    if (!value) {
+                        value = snapshot(kind);
+                        snapshots.set(kind, value);
+                    }
+                    return value;
+                }));
+            }
         });
     });
     sharedObserver.observe(document.documentElement, {
         attributes: true,
-        attributeFilter: ["aria-label", "aria-current", "role", "data-testid", "data-settings-panel-slug", "data-project-id", "data-project-name", "data-workspace-path", "data-usage-limit-key", "data-usage-limit", "disabled"],
+        attributeFilter: ["aria-label", "aria-current", "role", "data-testid", "data-markdown-text-style", "data-settings-panel-slug", "data-project-id", "data-project-name", "data-workspace-path", "data-usage-limit-key", "data-usage-limit", "disabled"],
         childList: true,
         characterData: true,
         subtree: true,
@@ -753,7 +766,8 @@ function semanticFilter(kind, element) {
     const text = compact(element.textContent);
     if (kind === "assistant-turns") {
         const role = element.getAttribute("data-message-author-role") || element.getAttribute("data-role");
-        return role ? role.toLowerCase() === "assistant" : /assistant-message/i.test(element.getAttribute("data-testid") || "");
+        return role ? role.toLowerCase() === "assistant" : element.getAttribute("data-markdown-text-style") === "assistant-message"
+            || /assistant-message/i.test(element.getAttribute("data-testid") || "");
     }
     if (kind === "account-menu")
         return /account|settings|log\s*out/i.test(text);

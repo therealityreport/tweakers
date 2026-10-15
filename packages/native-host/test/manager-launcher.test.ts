@@ -196,12 +196,12 @@ test("manager launcher staging removes its sandbox when setup fails", () => {
 test("native host build rejects a malformed manager signing policy before compilation", () => {
   const sandbox = mkdtempSync(join(tmpdir(), "tweakers-native-host-policy-test-"));
   try {
-    const scripts = join(sandbox, "scripts");
+    const scripts = join(sandbox, "packages/native-host/scripts");
     mkdirSync(scripts, { recursive: true });
-    writeFileSync(join(scripts, "build.mjs"), readFileSync(buildScript, "utf8"));
+    writeFileSync(join(scripts, "build.mjs"), readFileSync(buildScript, "utf8").replace("../../../scripts/owned-entrypoint.mjs", new URL("../../../scripts/owned-entrypoint.mjs", import.meta.url).href));
     const policy = JSON.parse(readFileSync(join(process.cwd(), "packages/native-host/manager-signing-policy.json"), "utf8")) as Record<string, unknown>;
     policy.certificateLeafSha1 = "not-a-sha1";
-    writeFileSync(join(sandbox, "manager-signing-policy.json"), JSON.stringify(policy));
+    writeFileSync(join(sandbox, "packages/native-host/manager-signing-policy.json"), JSON.stringify(policy));
 
     const result = spawnSync(process.execPath, [join(scripts, "build.mjs")], { encoding: "utf8" });
     assert.notEqual(result.status, 0);

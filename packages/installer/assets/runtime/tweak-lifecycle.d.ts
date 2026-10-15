@@ -63,9 +63,9 @@ export declare function lifecycleRecordKey(process: TweakProcess, id: string): s
  * runtime historically stored it unbound, silently breaking `this`-based main
  * cleanup for `scope: "both"` tweaks (followup).
  */
-export declare function bindMainTweakStop<T extends {
-    stop?: (...args: unknown[]) => unknown;
-}>(tweak: T | null | undefined): T["stop"] | undefined;
+export declare function bindMainTweakStop<T extends object>(tweak: T | null | undefined): T extends {
+    stop: infer F;
+} ? F extends (...args: never[]) => unknown ? OmitThisParameter<F> | undefined : undefined : undefined;
 /**
  * A whole-app restart racing the sequential tweak-load loop leaves innocent
  * tweaks in "starting"; only repeated interruptions indicate the tweak itself
@@ -82,15 +82,17 @@ export declare const INTERRUPTED_ATTEMPTS_BEFORE_QUARANTINE = 2;
 export declare function recoverInterruptedTweaks(journal: TweakLifecycleJournal, now?: string): TweakLifecycleJournal;
 export interface ReloadTweaksDeps {
     logInfo(message: string): void;
-    stopAllMainTweaks(): void;
+    stopAllMainTweaks(): void | Promise<void>;
     clearTweakModuleCache(): void;
     loadAllMainTweaks(): void | Promise<void>;
-    broadcastReload(): void;
+    broadcastReload(): void | Promise<void>;
 }
 export interface SetTweakEnabledAndReloadDeps extends ReloadTweaksDeps {
     setTweakEnabled(id: string, enabled: boolean): void;
 }
 export declare function isMainProcessTweakScope(scope: TweakScope | undefined): boolean;
+/** All lifecycle and source publication changes share this queue. */
+export declare function enqueueTweakLifecycle<T>(run: () => Promise<T>): Promise<T>;
 export declare function loadTweaksInitially(deps: Pick<ReloadTweaksDeps, "loadAllMainTweaks">): Promise<void>;
 export declare function reloadTweaks(reason: string, deps: ReloadTweaksDeps): Promise<void>;
 export declare function setTweakEnabledAndReload(id: string, enabled: unknown, deps: SetTweakEnabledAndReloadDeps): Promise<true>;

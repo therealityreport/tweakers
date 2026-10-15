@@ -1,11 +1,16 @@
 {
   "id": "co.tweakers.titlebar-controls",
   "name": "Titlebar Controls",
-  "version": "0.2.3",
+  "version": "0.2.6",
   "githubRepo": "therealityreport/tweakers",
   "description": "Reversible native titlebar controls aligned with the customized interface.",
   "author": "hulibrands",
-  "tags": ["ui", "titlebar", "macos"],
+  "tags": [
+    "ui",
+    "titlebar",
+    "macos"
+  ],
   "scope": "renderer",
-  "permissions": []
+  "permissions": [],
+  "minRuntime": ">=1.0.0"
 }

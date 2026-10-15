@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "macOS menu-bar mode switcher for the Tweakers app mode toggle",
+  "description": "Legacy standalone macOS menu-bar switcher retained for compatibility and migration tests",
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node ../../scripts/local-work.mjs workspace-build switcher"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "tweakersBuildCommand": "node scripts/build.mjs"
 }

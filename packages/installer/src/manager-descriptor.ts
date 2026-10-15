@@ -361,6 +361,64 @@ export function assertTweakersManagerDescriptor(value: unknown): asserts value i
   }
 }
 
+interface ManagerGenerationIdentity {
+  generationId: string;
+  sealSha256: string;
+  runtimeFingerprint: string;
+  managedRuntimeFingerprint: string;
+}
+
+export interface TweakersManagerGenerationRecord {
+  version: 1;
+  current: ManagerGenerationIdentity;
+  previous: ManagerGenerationIdentity | null;
+}
+
+function parseManagerGenerationRecord(text: string): TweakersManagerGenerationRecord {
+  const value = JSON.parse(text) as TweakersManagerGenerationRecord;
+  if (value?.version !== 1 || !value.current || value.previous === undefined) throw new Error("Invalid previous-generation record");
+  for (const identity of [value.current, value.previous]) {
+    if (identity === null) continue;
+    for (const field of ["generationId", "sealSha256", "runtimeFingerprint", "managedRuntimeFingerprint"] as const) {
+      if (typeof identity[field] !== "string" || !/^[a-f0-9]{64}$/.test(identity[field])) throw new Error("Invalid previous-generation identity");
+    }
+  }
+  return value;
+}
+
+function managerGenerationIdentity(executable: string, paths: TweakersManagerDescriptorPaths, owner: UserOwnership): ManagerGenerationIdentity {
+  const generationRoot = dirname(executable);
+  if (dirname(generationRoot) !== paths.generationsRoot || basename(executable) !== TWEAKERS_MANAGER_LAUNCHER_NAME) throw new Error("Previous manager generation is outside managed ownership");
+  assertSafeAncestors(generationRoot, owner, "previous manager generation");
+  const sealFile = join(generationRoot, TWEAKERS_MANAGER_SEAL_NAME);
+  const bundle = join(generationRoot, TWEAKERS_MANAGER_BUNDLE_NAME);
+  assertExactOwnedRegularFile(sealFile, owner, MANAGER_DATA_MODE, "previous manager seal");
+  assertExactOwnedRegularFile(bundle, owner, MANAGER_DATA_MODE, "previous manager bundle");
+  const seal = parseTweakersManagerTargetSeal(readFileSync(sealFile, "utf8"));
+  if (seal.generationId !== basename(generationRoot) || sha256File(bundle) !== seal.managerSha256) throw new Error("Previous manager generation identity drift");
+  return { generationId: seal.generationId, sealSha256: sha256File(sealFile),
+    runtimeFingerprint: readManagerBundleRuntimeFingerprint(bundle), managedRuntimeFingerprint: seal.managedRuntimeFingerprint };
+}
+
+/** Retention must also preserve Doctor references; this record alone never authorizes deletion. */
+export function readTweakersManagerGenerationRecord(userRoot: string, descriptorRoot?: string): TweakersManagerGenerationRecord {
+  const paths = tweakersManagerDescriptorPaths(userRoot, descriptorRoot);
+  const owner = targetUserOwnership();
+  if (!owner || owner.uid === 0) throw new Error("Generation retention requires the target user");
+  const snapshot = captureDescriptorSnapshot(join(paths.managerRoot, "previous-generation.json"), owner);
+  if (snapshot.text === null) throw new Error("Previous-generation record missing; retention cannot infer rollback");
+  const record = parseManagerGenerationRecord(snapshot.text);
+  const descriptor = captureDescriptorSnapshot(paths.descriptorFile, owner);
+  if (descriptor.text === null) throw new Error("Manager descriptor missing; retention blocked");
+  const current = managerGenerationIdentity(parseTweakersManagerDescriptor(descriptor.text).executable, paths, owner);
+  if (JSON.stringify(current) !== JSON.stringify(record.current)) throw new Error("Previous-generation record disagrees with manager descriptor; recovery required");
+  if (record.previous) {
+    const previous = managerGenerationIdentity(join(paths.generationsRoot, record.previous.generationId, TWEAKERS_MANAGER_LAUNCHER_NAME), paths, owner);
+    if (JSON.stringify(previous) !== JSON.stringify(record.previous)) throw new Error("Previous-generation rollback identity drift");
+  }
+  return record;
+}
+
 /**
  * Build/reuse one immutable generation and publish its descriptor only after
  * the generation validates. The host's trust record is intentionally neither
@@ -455,6 +513,20 @@ export function publishTweakersManagerDescriptor(
 
   ensureDescriptorDirectory(paths.descriptorRoot, owner);
   const priorDescriptor = captureDescriptorSnapshot(paths.descriptorFile, owner);
+  const generationRecordPath = join(paths.managerRoot, "previous-generation.json");
+  const priorGenerationRecord = captureDescriptorSnapshot(generationRecordPath, owner);
+  const previousDescriptor = priorDescriptor.text === null ? null : parseTweakersManagerDescriptor(priorDescriptor.text);
+  const previousIdentity = previousDescriptor === null ? null : managerGenerationIdentity(previousDescriptor.executable, paths, owner);
+  const currentIdentity = managerGenerationIdentity(join(generationRoot, TWEAKERS_MANAGER_LAUNCHER_NAME), paths, owner);
+  const oldRecord = priorGenerationRecord.text === null ? null : parseManagerGenerationRecord(priorGenerationRecord.text);
+  if (oldRecord && JSON.stringify(oldRecord.current) !== JSON.stringify(previousIdentity)) {
+    throw new Error("Previous-generation record disagrees with manager descriptor; recovery required");
+  }
+  const generationRecord: TweakersManagerGenerationRecord = {
+    version: 1, current: currentIdentity,
+    previous: previousIdentity?.generationId === generationId ? oldRecord?.previous ?? null : previousIdentity,
+  };
+  const generationRecordText = `${JSON.stringify(generationRecord, null, 2)}\n`;
   const descriptor: TweakersManagerDescriptorV1 = {
     schemaVersion: MANAGER_DESCRIPTOR_SCHEMA_VERSION,
     managerId: TWEAKERS_MANAGER_ID,
@@ -468,15 +540,24 @@ export function publishTweakersManagerDescriptor(
   const descriptorText = serializeTweakersManagerDescriptor(descriptor);
   const restoreOnFailure = (): void => {
     restoreDescriptorSnapshot(paths.descriptorFile, priorDescriptor, descriptorText, owner);
+    restoreDescriptorSnapshot(generationRecordPath, priorGenerationRecord, generationRecordText, owner);
   };
   try {
     dependencies.beforeDescriptorPublish?.();
+    // Write recovery ownership first. A crash between these atomic writes makes
+    // readers reject the mismatch, never guess a rollback or retire a dependency.
+    writeDescriptorAtomically(generationRecordPath, generationRecordText, owner);
     writeDescriptorAtomically(paths.descriptorFile, descriptorText, owner);
     const written = parseTweakersManagerDescriptor(readFileSync(paths.descriptorFile, "utf8"));
     if (serializeTweakersManagerDescriptor(written) !== descriptorText) {
       throw new Error("Tweakers manager descriptor did not round-trip after atomic publication");
     }
     dependencies.afterDescriptorPublish?.();
+    // Best effort and deferred: retention waits for the publishing lifecycle
+    // owner to finish, so a compensating restore never races a retirement.
+    void import("./generation-retention.js")
+      .then((retention) => retention.scheduleGenerationRetention(paths.userRoot, "manager generation published"))
+      .catch(() => { /* Retention never affects publication. */ });
     return {
       paths,
       generationId,
@@ -606,6 +687,38 @@ export function validateTweakersManagerGeneration(input: ValidateTweakersManager
   // The existing seal binds the code bytes; the caller-provided signing
   // evidence proves the source/published launcher bears the stable identity.
   assertSigningEvidence(input.signing);
+}
+
+/** Read a generation's sealed runtime bindings without executing or validating its signature. */
+export function readTweakersManagerGenerationBindings(generationRoot: string): { generationId: string; runtimeFingerprint: string; managedRuntimeFingerprint: string } {
+  const seal = parseTweakersManagerTargetSeal(readFileSync(join(generationRoot, TWEAKERS_MANAGER_SEAL_NAME), "utf8"));
+  if (seal.generationId !== basename(generationRoot)) throw new Error("Manager generation seal does not match its directory");
+  return {
+    generationId: seal.generationId,
+    runtimeFingerprint: readManagerBundleRuntimeFingerprint(join(generationRoot, TWEAKERS_MANAGER_BUNDLE_NAME)),
+    managedRuntimeFingerprint: seal.managedRuntimeFingerprint,
+  };
+}
+
+/** Validate a retained generation independently of the current descriptor.
+ * This inspects sealed bytes only; historical JavaScript is never executed. */
+export function verifyRetainedTweakersManagerGeneration(generationId: string): { generationId: string; sealSha256: string; moduleRoot: string; runtimeRoot: string } {
+  if (!/^[a-f0-9]{64}$/.test(generationId)) throw new Error("Invalid retained Manager generation");
+  const paths = tweakersManagerDescriptorPaths(canonicalTweakersManagerRoot());
+  const generationRoot = join(paths.generationsRoot, generationId);
+  const owner = targetUserOwnership();
+  if (!owner) throw new Error("Retained Manager ownership is unavailable");
+  const sealFile = join(generationRoot, TWEAKERS_MANAGER_SEAL_NAME);
+  assertExactOwnedRegularFile(sealFile, owner, MANAGER_DATA_MODE, "retained Manager seal");
+  const seal = parseTweakersManagerTargetSeal(readFileSync(sealFile, "utf8"));
+  const bundle = join(generationRoot, TWEAKERS_MANAGER_BUNDLE_NAME);
+  const signing = verifyTweakersManagerLauncherSignature(join(generationRoot, TWEAKERS_MANAGER_LAUNCHER_NAME));
+  const node = resolveNodeTarget(seal.nodePath, owner);
+  if (readManagerBundleManagedRuntimeFingerprint(bundle) !== seal.managedRuntimeFingerprint) throw new Error("Retained Manager compiled runtime binding drifted");
+  validateTweakersManagerGeneration({generationRoot, paths, owner, seal, signing, node});
+  return {generationId, sealSha256: sha256File(sealFile),
+    moduleRoot: join(paths.managerRoot, "managed-runtime-generations", seal.managedRuntimeFingerprint, "packages", "installer", "dist"),
+    runtimeRoot: join(paths.managerRoot, "runtime-generations", readManagerBundleRuntimeFingerprint(bundle))};
 }
 
 function publishImmutableGeneration(input: {

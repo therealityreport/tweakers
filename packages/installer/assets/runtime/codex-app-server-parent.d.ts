@@ -1,4 +1,7 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import type { StartupPolicyHandshakeV1 } from "./account-router/startup-policy";
+import { type DesktopAppToolsContextV1 } from "./account-router/desktop-app-tools";
+export declare const ACCOUNTS_STARTUP_POLICY_ENV = "TWEAKERS_ACCOUNTS_STARTUP_POLICY_V1";
 declare const INSTALL_MARKER: unique symbol;
 export declare const ACCOUNTS_BROKER_IDENTITY_FD_ENV = "TWEAKERS_ACCOUNTS_BROKER_IDENTITY_FD";
 export declare const ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS = 20000;
@@ -29,6 +32,10 @@ export interface CodexAppServerParentCleanupResult {
     failed: number;
 }
 export interface CodexAppServerParentInstallOptions {
+    /** Main-owned context of the reviewed pre-window native policy reader. */
+    startupPolicyHandshake?: () => StartupPolicyHandshakeV1 | null;
+    onAppServerSpawn?: (child: ChildProcess) => void;
+    onDesktopAppToolsContext?: (child: ChildProcess, context: DesktopAppToolsContextV1) => void;
     onAuthenticationRecovery?: () => void;
     childProcess?: MutableChildProcessModule;
     resourcesPath?: string;
@@ -39,6 +46,8 @@ export interface CodexAppServerParentInstallOptions {
     secondaryVariant?: boolean;
     /** Shared task index requested by the derived shell; never renderer-owned. */
     secondaryVariantSharedSqliteHome?: string;
+    /** Main-owned native manifest reader, injectable for bounded source checks. */
+    readDesktopAppToolsManifest?: (path: string, encoding: BufferEncoding) => string;
 }
 /**
  * The only parent-visible router input is a redacted, versioned config.  It

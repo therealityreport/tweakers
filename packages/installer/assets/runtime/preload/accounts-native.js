@@ -158,6 +158,13 @@ function createAccountsNativeBridge() {
     });
     const api = Object.freeze({
         status,
+        // Data-only change notification so the Accounts tweak can tell the user
+        // when compatibility is revoked after startup. Handlers receive the same
+        // frozen `{ surface, generation }` event as the transport and read
+        // `status()` themselves; they never receive native elements.
+        subscribe(handler) {
+            return transport.subscribe(handler);
+        },
         register(next) {
             if (!next || typeof next.request !== "function" || disposed)
                 return () => { };

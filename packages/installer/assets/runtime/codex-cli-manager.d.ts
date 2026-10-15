@@ -67,6 +67,8 @@ export interface CodexCliManager {
     listManagedVersions(): string[];
     listStagingOperations(): string[];
 }
+/** Resolve the physical executable, never the vendor's bin/codex launcher. */
+export declare function resolveBundledCodexBinary(resourcesPath: string): string;
 export declare function deriveCodexCliPaths(home: string, activeUserRoot?: string): CodexCliPaths;
 export declare function validateArchiveEntries(entries: ArchiveEntry[]): void;
 export declare function createCodexCliManager(input: {

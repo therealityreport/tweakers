@@ -42,6 +42,7 @@ export function createTweak(target: string, opts: CreateTweakOpts = {}): void {
     description: "A Tweakers tweak.",
     scope,
     main: "index.js",
+    minRuntime: ">=1.1.0",
     permissions: permissionsForScope(scope),
   };
 
@@ -63,7 +64,7 @@ export function createTweak(target: string, opts: CreateTweakOpts = {}): void {
       validate: "tweaker validate-tweak .",
     },
     devDependencies: {
-      "@therealityreport/tweakers-sdk": "^0.1.3",
+      "@therealityreport/tweakers-sdk": "^1.1.0",
     },
   });
   writeFileSync(resolve(dir, "README.md"), readme(manifest), "utf8");
@@ -92,7 +93,8 @@ function templateForScope(scope: TweakScope): string {
     api.ipc.handle("ping", () => "pong from main");
   },
   stop() {
-    // Clean up timers, listeners, or external resources here.
+    // Prefer api.lifecycle.add(dispose) during start for timers and external resources.
+    // Async stop is awaited before the next activation.
   },
 };
 `;
@@ -145,7 +147,8 @@ function templateForScope(scope: TweakScope): string {
     });
   },
   stop() {
-    // Clean up timers, listeners, or external resources here.
+    // Prefer api.lifecycle.add(dispose) during start for timers and external resources.
+    // Async stop is awaited before the next activation.
   },
 };
 `;

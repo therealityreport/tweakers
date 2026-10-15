@@ -121,3 +121,143 @@ test("pruneDetached drops disconnected hidden sources and panels", () => {
   assert.equal(state.panels.has(connectedPanel), true);
   assert.equal(state.panels.has(detachedPanel), false);
 });
+
+test("navigation invalidates a pending Followup policy before it can enable another project", async () => {
+  const previousDocument = global.document;
+  let workspacePath = "/project-a";
+  const pending = [];
+  const state = {
+    api: { ipc: { invoke(_channel, request) { return new Promise((resolve) => pending.push({ request, resolve })); } } },
+    policy: { enabled: false }, policyContext: null, policyPending: false, disposed: false,
+    roots: new WeakMap(), hidden: new Map(), panels: new Set(),
+  };
+  global.document = { querySelector: () => workspacePath ? { getAttribute: (name) => name === "data-workspace-path" ? workspacePath : null } : null };
+  try {
+    helpers.refreshPolicy(state);
+    let removedPanels = 0;
+    state.panels.add({ remove() { removedPanels += 1; } });
+    workspacePath = "/project-b";
+    helpers.refreshPolicy(state);
+    assert.equal(pending.length, 2, "the new project gets its own policy while the old request is pending");
+    assert.equal(removedPanels, 1, "navigation removes the previous project's follow-up controls immediately");
+    pending[0].resolve({ schemaVersion: 1, enabled: true, exactItems: 5 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(state.policy.enabled, false, "project A cannot enable Followup in project B");
+    pending[1].resolve({ schemaVersion: 1, enabled: true, exactItems: 5 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(state.policy.enabled, true);
+    workspacePath = null;
+    helpers.refreshPolicy(state);
+    assert.equal(state.policy.enabled, false, "a projectless route does not retain the previous project's policy");
+    assert.equal(state.policyContext, null);
+  } finally { global.document = previousDocument; }
+});
+
+test("Followup rechecks the current route when policy delivery precedes the host notification", async () => {
+  const previousDocument = global.document;
+  let workspacePath = "/project-a";
+  const pending = [];
+  const state = {
+    api: { ipc: { invoke(_channel, request) { return new Promise((resolve) => pending.push({ request, resolve })); } } },
+    policy: { enabled: false }, policyContext: null, policyPending: false, disposed: false,
+    roots: new WeakMap(), hidden: new Map(), panels: new Set(),
+  };
+  global.document = { querySelector: () => ({ getAttribute: (name) => name === "data-workspace-path" ? workspacePath : null }) };
+  try {
+    helpers.refreshPolicy(state);
+    workspacePath = "/project-b";
+    pending[0].resolve({ schemaVersion: 1, enabled: true, exactItems: 5 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(state.policy.enabled, false);
+    assert.equal(pending.length, 2, "delivery triggers a policy request for the new route");
+    assert.equal(pending[1].request.project.workspacePath, "/project-b");
+    pending[1].resolve({ schemaVersion: 1, enabled: false, exactItems: 5 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(state.policy.enabled, false);
+    assert.equal(state.policyPending, false);
+  } finally { global.document = previousDocument; }
+});
+
+test("a stopped Followup ignores an already pending policy response", async () => {
+  const previousDocument = global.document;
+  let resolvePolicy;
+  const state = {
+    api: { ipc: { invoke() { return new Promise((resolve) => { resolvePolicy = resolve; }); } } },
+    policy: { enabled: false }, policyContext: null, policyPending: false, disposed: false,
+    roots: new WeakMap(), hidden: new Map(), panels: new Set(),
+  };
+  global.document = { querySelector: () => ({ getAttribute: (name) => name === "data-workspace-path" ? "/project-a" : null }) };
+  try {
+    helpers.refreshPolicy(state);
+    state.disposed = true;
+    resolvePolicy({ schemaVersion: 1, enabled: true, exactItems: 5 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(state.policy.enabled, false);
+  } finally { global.document = previousDocument; }
+});
+
+test("enabled Followup cannot render a new project with an old policy during a coalesced scan", async () => {
+  const { createSemanticDom } = require("../../user-questions/test/semantic-dom");
+  const { document } = createSemanticDom();
+  const previous = { document: global.document, window: global.window };
+  document.getElementById = () => null;
+  const workspace = document.createElement("main");
+  workspace.setAttribute("data-workspace-path", "/project-a");
+  document.body.append(workspace);
+  const message = (id) => {
+    const root = document.createElement("article");
+    root.setAttribute("data-message-author-role", "assistant");
+    root.setAttribute("data-message-id", id);
+    const code = document.createElement("code");
+    code.textContent = JSON.stringify(require("./fixtures/valid-payload.json"));
+    root.append(code);
+    workspace.append(root);
+    return root;
+  };
+  const oldMessage = message("project-a-message");
+  let currentMessage = oldMessage;
+  let notifyHost;
+  let nextTimer = 0;
+  const timers = new Map();
+  const requests = [];
+  const api = {
+    process: "renderer",
+    ipc: { invoke(_channel, request) {
+      requests.push(request);
+      return Promise.resolve({ schemaVersion: 1, enabled: request.project.workspacePath === "/project-a", exactItems: 5 });
+    } },
+    react: { host: {
+      observe(_topics, callback) { notifyHost = callback; return () => {}; },
+      query() { return [{ element: currentMessage }]; },
+    } },
+  };
+  global.document = document;
+  global.window = {
+    setTimeout(callback) { const timer = ++nextTimer; timers.set(timer, callback); return timer; },
+    clearTimeout(timer) { timers.delete(timer); },
+  };
+  const instance = {};
+  try {
+    tweak.start.call(instance, api);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(oldMessage.querySelector("[data-tweaker-followup-panel]"), "project A starts with a confirmed enabled policy");
+    notifyHost();
+    assert.equal(timers.size, 1, "an enabled A scan is waiting for its debounce timer");
+    workspace.setAttribute("data-workspace-path", "/project-b");
+    currentMessage = message("project-b-message");
+    notifyHost();
+    assert.equal(Boolean(oldMessage.querySelector("[data-tweaker-followup-panel]")), false, "the B notification immediately removes A's controls even with a pending timer");
+    const queued = [...timers.values()];
+    timers.clear();
+    for (const callback of queued) callback();
+    assert.equal(Boolean(currentMessage.querySelector("[data-tweaker-followup-panel]")), false, "a coalesced B notification cannot render with A's enabled policy");
+    assert.equal(Boolean(oldMessage.querySelector("[data-tweaker-followup-panel]")), false, "old policy controls remain removed after timer delivery");
+    assert.equal(requests.length, 2);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(Boolean(currentMessage.querySelector("[data-tweaker-followup-panel]")), false, "B's disabled policy stays disabled after delivery");
+  } finally {
+    tweak.stop.call(instance);
+    global.document = previous.document;
+    global.window = previous.window;
+  }
+});

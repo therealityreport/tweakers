@@ -39,9 +39,9 @@ import {
 } from "../src/macos-variant";
 
 const secret = Buffer.alloc(32, 17);
-const opaqueAccountId = `ar_${"a".repeat(43)}`;
-const opaqueAccountIdB = `ar_${"c".repeat(43)}`;
-const opaqueAccountIdC = `ar_${"e".repeat(43)}`;
+const opaqueAccountId = `ar_${"a".repeat(43)}` as const;
+const opaqueAccountIdB = `ar_${"c".repeat(43)}` as const;
+const opaqueAccountIdC = `ar_${"e".repeat(43)}` as const;
 // Shared recursively key-sorted canonical JSON vector: runtime, UI, installer.
 const quotaFingerprint = "sha256:b26118045c98f42a6dcd1e53ba871d63b1a4b23b4aaf8f35969645bf719826b7";
 const adoptionThreadId = "01a05546-cf93-7383-96ed-dc76ce3d1b3c";
@@ -102,7 +102,7 @@ function quotaConfig(mode: "manual" | "quota_aware" = "quota_aware") {
     mode,
     policy: mode === "quota_aware" ? "quota_aware_v1" : null,
     generation: 7,
-    fingerprint: quotaFingerprint,
+    fingerprint: quotaFingerprint as `sha256:${string}`,
     protocolFingerprint: "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10",
     primaryOpaqueAccountId: opaqueAccountId,
     accounts: [{
@@ -127,7 +127,7 @@ function restageConfig(
   options: {
     generation: number;
     mode?: "manual" | "quota_aware";
-    primaryOpaqueAccountId?: string;
+    primaryOpaqueAccountId?: `ar_${string}`;
     accounts?: ReturnType<typeof quotaConfig>["accounts"];
   },
 ) {
@@ -157,7 +157,7 @@ function restageConfig(
   };
   return {
     ...config,
-    fingerprint: `sha256:${createHash("sha256").update(canonicalJson(canonical), "utf8").digest("hex")}`,
+    fingerprint: `sha256:${createHash("sha256").update(canonicalJson(canonical), "utf8").digest("hex")}` as const,
   };
 }
 
@@ -169,7 +169,7 @@ function writePrivate(path: string, value: string | Buffer): void {
 function writeAdoptionIntent(
   routerRoot: string,
   config = quotaConfig(),
-  configFingerprint = config.fingerprint,
+  configFingerprint: `sha256:${string}` = config.fingerprint,
   legacyOwnerOpaqueAccountId = opaqueAccountId,
 ) {
   const intent = createHistoryAdoptionIntent({
@@ -781,6 +781,8 @@ test("independent live health rejects stale, exited, PID-reused, and malformed r
   try {
     const now = Date.parse("2026-09-04T12:00:00.000Z");
     const record = independentLiveHealth({ observedAt: "2026-09-04T11:59:00.000Z" });
+    const tweaks = Object.fromEntries(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.map((id) => [id, { enabled: true }]));
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks }));
     writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify(record));
     assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
       nowMs: () => now,
@@ -790,6 +792,33 @@ test("independent live health rejects stale, exited, PID-reused, and malformed r
       expectedAccountsBrokerRoot: record.accountsBrokerRoot,
       verifyCurrentIdentity: () => true,
     }).state, "current");
+    const currentProcess = {
+      nowMs: () => now,
+      processAlive: () => true,
+      readProcessStartToken: () => record.processStartToken,
+      readProcessCommand: () => `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE} --user-data-dir=${record.appUserDataRoot}`,
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+      verifyCurrentIdentity: () => true,
+    };
+    const withoutFollowup = record.initializedTweakIds.filter((id) => id !== "co.tweakers.followup");
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks: { ...tweaks, "co.tweakers.followup": { enabled: false } } }));
+    writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify({ ...record, initializedTweakIds: withoutFollowup }));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, currentProcess).state, "current");
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks: { ...tweaks, "co.tweakers.followup": { enabled: true } } }));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, currentProcess).state, "invalid", "enabled tweak cannot be missing");
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks: { ...tweaks, "co.tweakers.followup": { enabled: "false" } } }));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, currentProcess).state, "invalid", "malformed enabled flag fails closed");
+    const missingSetting = { ...tweaks };
+    delete missingSetting["co.tweakers.followup"];
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks: missingSetting }));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, currentProcess).state, "invalid", "missing bundled setting fails closed");
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks: { ...tweaks, "co.tweakers.followup": { enabled: false } } }));
+    for (const initializedTweakIds of [[...withoutFollowup, "co.tweakers.followup"], [...withoutFollowup, withoutFollowup[0]]]) {
+      writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify({ ...record, initializedTweakIds }));
+      assert.equal(inspectIndependentTweakersLiveHealth(fixture, currentProcess).state, "invalid", "extra or duplicate ID fails closed");
+    }
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks }));
+    writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify(record));
     assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
       nowMs: () => now,
       processAlive: () => true,
@@ -875,6 +904,7 @@ test("independent live health rejects current global-v3 broker config byte drift
       accountsBrokerConfigSha256: createHash("sha256").update(configBytes).digest("hex"),
       sharedHistoryBrokerState: "connected" as const,
     };
+    writePrivate(join(fixture, "config.json"), JSON.stringify({ tweaks: Object.fromEntries(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.map((id) => [id, { enabled: true }])) }));
     writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify(record));
     const currentProcess = {
       nowMs: () => now,
@@ -926,7 +956,7 @@ function brokerV3Config(policy = "quota_aware_v2") {
   };
   return {
     ...canonical,
-    fingerprint: `sha256:${createHash("sha256").update(canonicalJson(canonical), "utf8").digest("hex")}`,
+    fingerprint: `sha256:${createHash("sha256").update(canonicalJson(canonical), "utf8").digest("hex")}` as const,
     updatedAt: "2026-09-04T12:00:00.000Z",
   };
 }

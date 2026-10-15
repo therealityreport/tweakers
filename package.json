@@ -1,7 +1,7 @@
 {
   "name": "@therealityreport/tweakers",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "license": "MIT",
   "description": "Tweak system for the OpenAI Codex desktop app",
   "type": "module",
@@ -17,23 +17,24 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-runtime && npm run build --workspace @therealityreport/tweakers-loader && npm run build --workspace @therealityreport/tweakers-installer",
+    "build": "node scripts/local-work.mjs build",
+    "deps:install": "node scripts/local-work.mjs dependencies",
     "build:manager-launcher:release": "node packages/native-host/scripts/build.mjs --release-manager-launcher",
     "browser": "tsx packages/installer/src/cli.ts browser",
-    "lint": "eslint packages/*/src --ext .ts --no-error-on-unmatched-pattern",
+    "lint": "eslint packages/*/src tweaks scripts --ext .ts,.js,.mjs,.cjs --no-error-on-unmatched-pattern",
     "check:tweak-catalog": "node scripts/check-tweak-catalog.mjs store/index.json",
-    "sync:tweaks": "node scripts/sync-tweaks.mjs",
+    "sync:tweaks": "node scripts/local-work.mjs sync",
     "check:public-history": "scripts/check-public-history.sh",
-    "clean": "rm -rf packages/*/dist packages/installer/assets/runtime",
-    "test": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-switcher && find packages -mindepth 3 -maxdepth 4 -type f -name '*.test.ts' -print0 | xargs -0 node --import ./scripts/test-root-preload.mjs --import tsx --test && node --import ./scripts/test-root-preload.mjs --test scripts/*.test.mjs && npm run test:tweaks && npm test --workspace @therealityreport/tweakers-mcp-lifecycle",
+    "clean": "node scripts/local-work.mjs clean",
+    "test": "node scripts/local-work.mjs test",
     "test:user-questions": "node --import ./scripts/test-root-preload.mjs scripts/test-tweaks.mjs --tweak user-questions",
     "test:tweaks": "node --import ./scripts/test-root-preload.mjs scripts/test-tweaks.mjs",
-    "typecheck": "tsc --noEmit -p packages/installer/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p packages/sdk/tsconfig.json",
+    "typecheck": "node scripts/local-work.mjs typecheck",
     "audit": "npm audit --workspaces --include-workspace-root",
-    "prepare": "npm run build"
+    "dev:codex": "npm exec --package=@openai/codex@0.153.4 -- codex",
+    "typecheck:tests": "tsc -p tsconfig.tests.json"
   },
   "devDependencies": {
-    "@openai/codex": "0.153.4",
     "@types/node": "^22.0.0",
     "@typescript-eslint/eslint-plugin": "^8.64.0",
     "@typescript-eslint/parser": "^8.64.0",
@@ -42,7 +43,7 @@
     "typescript": "^5.6.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^22.13.0 || >=24.0.0"
   },
   "bin": {
     "tweaker": "bin/tweaker.js",

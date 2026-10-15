@@ -60,7 +60,7 @@ test("bundled Guard candidate installs process-only bytes and passes the no-task
     const lifecycleFixture = join(root, "lifecycle.json");
     writeFileSync(processFixture, JSON.stringify({ processes: [] }));
     writeFileSync(lifecycleFixture, JSON.stringify({
-      schema_version: 2,
+      schema_version: 3,
       matcher_registry_version: "mcp-family-descriptors-v6",
       generated_at: 1_000,
       job: { ok: true, mode: "status", error: null },

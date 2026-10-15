@@ -1,6 +1,8 @@
 # SDK and API Reference
 
-This is the full public API surface exported by `@therealityreport/tweakers-sdk`.
+This describes selected public SDK APIs. Consult the current declarations in
+`packages/sdk/src/index.ts` and its re-exported modules for the complete
+surface and exact signatures.
 
 Use it for types:
 
@@ -28,11 +30,13 @@ Constants:
 
 - [`VALID_TWEAK_SCOPES`](#valid_tweak_scopes)
 - [`VALID_TWEAK_PERMISSIONS`](#valid_tweak_permissions)
+- [`RESERVED_TWEAK_MCP_ENV_KEYS`](#reserved_tweak_mcp_env_keys)
 
 Types and interfaces:
 
 - [`Tweak`](#tweak)
 - [`TweakApi`](#tweakapi)
+- [`AccountsNativeApi`](#accountsnativeapi)
 - [`TweakManifest`](#tweakmanifest)
 - [`TweakAuthor`](#tweakauthor)
 - [`TweakScope`](#tweakscope)
@@ -46,15 +50,21 @@ Types and interfaces:
 - [`SettingsSection`](#settingssection)
 - [`SettingsPage`](#settingspage)
 - [`SettingsHandle`](#settingshandle)
+- [`SettingsOpenResult`](#settingsopenresult)
 - [`ReactApi`](#reactapi)
+- [`HostUiApi`](#hostuiapi)
 - [`ReactFiberNode`](#reactfibernode)
 - [`TweakIpc`](#tweakipc)
+- [`TweakIpcInvokeContext`](#tweakipcinvokecontext)
 - [`TweakFs`](#tweakfs)
 - [`CodexApi`](#codexapi)
 - [`CodexRuntimeType`](#codexruntimetype)
 - [`CodexRuntimeInfo`](#codexruntimeinfo)
 - [`CodexRuntimeCapabilities`](#codexruntimecapabilities)
 - [`CodexRuntimeApi`](#codexruntimeapi)
+- [`CodexRefreshApi`](#codexrefreshapi)
+- [`CodexCaptureApi`](#codexcaptureapi)
+- [`CodexHotkeysApi`](#codexhotkeysapi)
 - [`CodexWindowsApi`](#codexwindowsapi)
 - [`CodexViewCreateOptions`](#codexviewcreateoptions)
 - [`CodexViewRef`](#codexviewref)
@@ -141,10 +151,40 @@ const VALID_TWEAK_PERMISSIONS = [
   "native-module",
   "native-view",
   "native-helper",
+  "screen-capture",
+  "accessibility",
+  "global-shortcut",
 ] as const
 ```
 
 Known permission declaration values.
+
+## `RESERVED_TWEAK_MCP_ENV_KEYS`
+
+`TWEAKER_TWEAK_DATA_DIR` and `TWEAKER_TWEAK_ID` are runtime-owned MCP launch
+variables. A tweak manifest must not supply them in `mcp.env`.
+
+The package also re-exports specialized contracts from
+`accounts-native-compatibility.ts`, `promotion-policy.ts`, and `doctor.ts`.
+Those modules contain build compatibility records and hashes, promotion policy
+canonicalization, and Manager/Doctor report types. Their current public
+functions include:
+
+```ts
+validateAccountsNativeCompatibility(
+  value: unknown,
+  readAsset: (path: string) => string,
+  hash: (source: string) => string,
+): AccountsNativeCompatibilityStatusV1
+canonicalPromotionPolicyText(raw: string): string
+canonicalPromotionPolicyState(value: unknown): string
+isTweakersManagerSection(value: unknown): value is TweakersManagerSection
+isDoctorReportV1(value: unknown): value is DoctorReportV1
+```
+
+Read the declarations in those modules for the exact exported constants,
+record types, and compatibility requirements. They are shared application
+contracts, not a replacement for the tweak lifecycle APIs below.
 
 ## `Tweak`
 
@@ -180,6 +220,7 @@ interface TweakApi {
   ipc: TweakIpc;
   fs: TweakFs;
   codex?: CodexApi;
+  accountsNative?: AccountsNativeApi;
 }
 ```
 
@@ -195,10 +236,41 @@ Available by process:
 | `react` | yes | no |
 | `ipc` | yes | yes |
 | `fs` | yes | yes |
-| `codex` | yes | yes |
+| `codex` | yes in the current renderer host | yes in the current main host |
+| `accountsNative` | optional, renderer only | no |
 
 Check `api.process` or optional properties before using process-specific APIs in
 `scope: "both"` tweaks.
+
+## `AccountsNativeApi`
+
+```ts
+type AccountsNativeRequestSurface = "profile" | "apps" | "plugins" | "mcp" | "usage";
+type AccountsNativeSlotSurface = AccountsNativeRequestSurface | "account-menu" | "thread-summary";
+interface AccountsNativeStatus {
+  compatible: boolean;
+  enabled: boolean;
+  generation: number;
+  reason?: string;
+}
+interface AccountsNativeSelection { accountId: string | null; generation: number }
+interface AccountsNativeAdapter {
+  project?(surface: AccountsNativeRequestSurface, kind: string, input: unknown): unknown;
+  request(surface: AccountsNativeRequestSurface, method: string,
+    params: Readonly<Record<string, unknown>>,
+    selection: AccountsNativeSelection): Promise<unknown>;
+}
+interface AccountsNativeApi {
+  status(): AccountsNativeStatus;
+  register(adapter: AccountsNativeAdapter): () => void;
+  select(surface: AccountsNativeSlotSurface, accountId: string | null): void;
+}
+```
+
+`api.accountsNative` is renderer-only and optional. Check `status()` for
+compatibility and enablement before using guarded native Accounts slots. Keep
+the cleanup returned by `register()` and call it from `stop()`; `select()`
+changes only the named slot's account selection, not routing ownership.
 
 ## `TweakManifest`
 
@@ -261,6 +333,9 @@ type TweakPermission =
   | "native-module"
   | "native-view"
   | "native-helper"
+  | "screen-capture"
+  | "accessibility"
+  | "global-shortcut"
 ```
 
 Declared capabilities for user visibility/review. Native permissions and Owl
@@ -355,6 +430,7 @@ Renderer logs go to DevTools and `<userRoot>/log/preload.log`. Main logs go to
 interface SettingsApi {
   register(section: SettingsSection): SettingsHandle;
   registerPage(page: SettingsPage): SettingsHandle;
+  openPage(pageId: string): Promise<SettingsOpenResult>;
 }
 ```
 
@@ -362,6 +438,17 @@ Renderer-only. `settings` is undefined in main.
 
 Use `register` for compact controls nested under the tweak card. Use
 `registerPage` for a full sidebar page.
+`openPage` opens Settings and activates a registered, tweak-scoped page.
+
+## `SettingsOpenResult`
+
+```ts
+type SettingsOpenFailureReason =
+  | "not-registered" | "settings-command-unavailable" | "mount-timeout";
+type SettingsOpenResult =
+  | { ok: true }
+  | { ok: false; reason: SettingsOpenFailureReason };
+```
 
 ## `SettingsSection`
 
@@ -414,6 +501,7 @@ interface ReactApi {
   getFiber(node: Element): ReactFiberNode | null;
   findOwnerByName(node: Element, name: string): ReactFiberNode | null;
   waitForElement(selector: string, timeoutMs?: number): Promise<Element>;
+  host: HostUiApi;
 }
 ```
 
@@ -428,6 +516,29 @@ const owner = api.react.findOwnerByName(composer, "Composer");
 ```
 
 Component names and fiber shapes can change in upstream Codex builds.
+
+## `HostUiApi`
+
+```ts
+interface HostUiApi {
+  query(kind: HostSurfaceKind): HostSurfaceMatch[];
+  snapshot(kind: HostSurfaceKind): HostSurfaceSnapshot;
+  observe(kinds: HostSurfaceKind[],
+    listener: (snapshots: HostSurfaceSnapshot[]) => void): () => void;
+  getSharedHistoryTarget(): Promise<HostSharedHistoryTargetResult>;
+  getActiveProject(): HostProjectContext | null;
+  attachFiles(files: HostAttachmentFile[]): Promise<HostAttachmentResult>;
+  attachMcpFormCarrier(nonce: string): HostMcpFormAttachResult;
+}
+```
+
+`api.react.host` exposes semantic renderer queries (`query`, `snapshot`, and
+`observe`) for supported host surfaces. It also provides `getActiveProject()`,
+`getSharedHistoryTarget()`, `attachFiles(files)`, and
+`attachMcpFormCarrier(nonce)`. Consult the SDK declarations for the exact
+surface union and result types. Check the returned status and `isCurrent()`
+before using a shared-history target or MCP form controller; `observe()`
+returns a cleanup function that belongs in `stop()`.
 
 ## `ReactFiberNode`
 
@@ -451,8 +562,12 @@ Minimal exposed React fiber shape. Treat it as unstable.
 interface TweakIpc {
   on(channel: string, handler: (...args: unknown[]) => void): () => void;
   send(channel: string, ...args: unknown[]): void;
+  sendToPrimary?(channel: string, ...args: unknown[]): boolean;
+  sendToRenderer?(webContentsId: number, channel: string, ...args: unknown[]): boolean;
   invoke<T = unknown>(channel: string, ...args: unknown[]): Promise<T>;
   handle?(channel: string, handler: (...args: unknown[]) => unknown): void;
+  handleWithContext?(channel: string,
+    handler: (context: TweakIpcInvokeContext, ...args: unknown[]) => unknown): () => void;
 }
 ```
 
@@ -464,8 +579,19 @@ tweaker:<tweak-id>:<channel>
 
 Renderer supports `on`, `send`, and `invoke`.
 
-Main supports `on` and `handle`. Main-side `send` and `invoke` intentionally
-throw because they are renderer-to-main operations in the current runtime.
+Main supports `on`, `handle`, `handleWithContext`, `sendToPrimary`, and
+`sendToRenderer` when present. `handleWithContext` supplies the bounded sender
+webContents ID and returns a registration-specific cleanup function; call it
+from `stop()`. Main-side `send` and `invoke` intentionally throw because they
+are renderer-to-main operations in the current runtime.
+
+## `TweakIpcInvokeContext`
+
+```ts
+interface TweakIpcInvokeContext {
+  readonly sender: Readonly<{ webContentsId: number }>;
+}
+```
 
 ## `TweakFs`
 
@@ -497,13 +623,20 @@ interface CodexApi {
   views: CodexViewsApi;
   cdp: CodexCdpApi;
   native: CodexNativeApi;
+  refresh: CodexRefreshApi;
+  capture: CodexCaptureApi;
+  hotkeys: CodexHotkeysApi;
   createBrowserView(options: CodexCreateViewOptions): Promise<unknown>;
   createWindow(options: CodexCreateWindowOptions): Promise<CodexWindowRef>;
 }
 ```
 
-Available in renderer and main. Renderer calls are proxied to the main process
-where required.
+The current runtime supplies `api.codex` in both process hosts. Availability
+differs by method: `refresh` reports local refresh status and can start the
+user-confirmed flow; `capture`, `hotkeys`, and `createBrowserView` throw from
+renderer code. Check `api.process`, the optional SDK property, declared
+permissions, and runtime capabilities before use. Renderer calls supported by
+the bridge are proxied to main where required.
 
 These APIs depend on Codex window services exposed by the patch. They may need
 runtime updates when upstream Codex changes its Owl/Electron internals. See
@@ -512,6 +645,69 @@ currently observes.
 
 `createWindow()` and `createBrowserView()` are kept for backwards
 compatibility. Prefer the namespaced APIs for new tweaks.
+
+## `CodexRefreshApi`
+
+```ts
+interface CodexLocalRefreshStatus {
+  available: boolean;
+  source: "development" | "stable" | "current";
+  phase: "idle" | "preparing" | "quitting" | "promoting" | "complete" | "failed";
+  developmentSourceRoot: string | null;
+  detail: string;
+  error: string | null;
+  checkedAt: string;
+}
+interface CodexRefreshApi {
+  getStatus(): Promise<CodexLocalRefreshStatus>;
+  start(source?: "smart" | "development" | "stable"):
+    Promise<{ started: boolean; status: CodexLocalRefreshStatus }>;
+  onStatusChanged(listener: (status: CodexLocalRefreshStatus) => void): () => void;
+}
+```
+
+`start()` enters the local refresh flow and can lead to an app restart. Use it
+only from a user-confirmed action. In renderer code, remove status listeners in
+`stop()`; the current main host's `onStatusChanged` is a no-op registration.
+
+## `CodexCaptureApi`
+
+```ts
+interface CodexCaptureApi {
+  getPermissionStatus(): Promise<CodexPermissionStatus>;
+  requestAccessibility(): Promise<boolean>;
+  openPermissionSettings(kind: "screen-recording" | "accessibility" | "input-monitoring"): Promise<void>;
+  captureFrontmostWindow(options?: { includeAccessibilityText?: boolean;
+    maxTextCharacters?: number }): Promise<FrontmostWindowCapture>;
+}
+```
+
+Main-only; renderer calls throw. Declare `screen-capture` for capture and
+`accessibility` when including accessibility text or requesting access.
+`CodexPermissionStatus` reports screen recording, accessibility,
+input monitoring, and whether restart is required. `FrontmostWindowCapture`
+contains app/window metadata, a PNG encoded as base64, and bounded
+accessibility text/status. See the current SDK declarations for those exact
+result shapes.
+
+## `CodexHotkeysApi`
+
+```ts
+interface CodexHotkeysApi {
+  registerCaptureHotkey(options: {
+    preferred?: "DoubleCommand";
+    fallbackAccelerator: string;
+    suppressNativeAppshots?: boolean;
+  }, listener: () => void): Promise<CodexHotkeyRegistration>;
+}
+interface CodexHotkeyRegistration {
+  active: "DoubleCommand" | "fallback";
+  unregister(): Promise<void>;
+}
+```
+
+Main-only; renderer calls throw. Declare `global-shortcut` and await
+`unregister()` in tweak cleanup.
 
 ## `CodexRuntimeType`
 
@@ -889,3 +1085,26 @@ interface CodexWindowRef {
 ```
 
 Returned by `createWindow`.
+
+## Native capture and history
+
+Renderer tweaks can use `api.nativeCapture.appshots.getState()` and
+`setHotkey("DoubleCommand" | null)` to access the existing native Codex RPC
+service. Double Command means both Command keys together. Capture and attachment
+remain in Codex's native flow. `computerHistory.getState()` is read-only; recording
+and privacy controls remain with the native Computer History plugin.
+
+The independently signed Tweakers desktop currently reports these services as
+unavailable: the native helper requires a trusted vendor signing identity, and a
+supported shared-service attachment has not been established. Its derived-only
+startup policy blocks recorder startup, bundled capture-plugin reconciliation,
+computer-use workers, and shortcut changes. It preserves the native desktop's
+stored settings and running service. The adapter is not proof of working capture
+or attachment in Tweakers.
+
+Missing or changed native services fail visibly. The retired
+`api.codex.capture.captureFrontmostWindow` and `registerCaptureHotkey` calls now
+reject rather than selecting a different window or registering a competing shortcut.
+
+See [Runtime and lifecycle](runtime-lifecycle.md) for `api.lifecycle` and the
+isolated `api.backend` hook contract introduced in runtime 1.1.

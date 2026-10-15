@@ -7,10 +7,15 @@ import {
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { isDeveloperIdSignedBackup, verifySignature } from "./codesign.js";
+import { acceptedCombinedPayloadText } from "@therealityreport/tweakers-sdk";
+import { isDeveloperIdSignedBackup, signatureInfo, verifyCodeModeHostSigningPosture, verifySignature } from "./codesign.js";
+import { assertAcceptedAccountsRecoveryRuntime } from "./accounts-transfer-compatibility.js";
 import { fingerprintAppContents } from "./environment-profile.js";
 import { assertInternalStoragePath } from "./internal-storage.js";
 import { locateCodex } from "./platform.js";
+import { isCodexBackendClosureEvidence, isCodexGeneratedRuntimeEvidence,
+  type CodexBackendClosureEvidence, type CodexGeneratedRuntimeEvidence, type SignatureEvidence } from "./codex-derived-receipt.js";
+import { parseCodexReleaseTag } from "./codex-source-release.js";
 import {
   readRuntimeFingerprintEvidence,
   RUNTIME_FINGERPRINT_FILE,
@@ -68,15 +73,20 @@ export interface PrebuiltCombinedCandidateCliOptions {
 }
 
 export interface AcceptedPrebuiltCodexBuildReceipt {
-  schemaVersion: 1;
+  schemaVersion: 2;
   kind: "tweakers-prebuilt-codex-build";
   status: "accepted";
   acceptedAt: string;
+  verification: { level: "source-verified" | "isolated-canary"; installedAcceptance: "required" };
+  upstream: { repository: "https://github.com/openai/codex.git"; tag: string; commit: string };
+  closure: CodexBackendClosureEvidence;
+  runtime: CodexGeneratedRuntimeEvidence;
   source: {
     commit: string;
     tree: string;
     cargoLockSha256: string;
     reviewedDiffSha256: string;
+    patchSeriesSha256: string;
   };
   build: {
     command: string;
@@ -94,6 +104,7 @@ export interface AcceptedPrebuiltCodexBuildReceipt {
     sha256: string;
     version: string;
     architecture: PrebuiltCodexArchitecture;
+    signature: SignatureEvidence;
   };
 }
 
@@ -110,6 +121,9 @@ export interface PrebuiltCombinedCandidateAuthority {
     sourceTree: string;
     cargoLockSha256: string;
     reviewedDiffSha256: string;
+    upstream: AcceptedPrebuiltCodexBuildReceipt["upstream"];
+    patchSeriesSha256: string;
+    verification: AcceptedPrebuiltCodexBuildReceipt["verification"];
     buildCommand: string;
     toolchain: string;
     testEvidence: Array<{
@@ -123,7 +137,9 @@ export interface PrebuiltCombinedCandidateAuthority {
     sha256: string;
     version: string;
     architecture: PrebuiltCodexArchitecture;
+    signature: SignatureEvidence;
   };
+  closure: CodexBackendClosureEvidence;
   runtime: {
     sourceRoot: string;
     fingerprint: string;
@@ -148,6 +164,8 @@ export interface PreparedPrebuiltCombinedCandidateEvidence {
   candidateAppFingerprint: string;
   embeddedBackendSha256: string;
   embeddedBackendVersion: string;
+  embeddedCodeModeHostSha256: string;
+  embeddedResources: Array<{ relativePath: string; sha256: string }>;
   stagedRuntime: RuntimeTreeFingerprint;
   stagedRuntimeDocumentSha256: string;
   rollback: PrebuiltRollbackEvidence;
@@ -172,6 +190,8 @@ export interface PrebuiltCombinedCandidateValidationDependencies {
   verifyCandidateApp(path: string): boolean;
   verifyLastKnownGoodApp(path: string): boolean;
   verifySignedBackup(path: string): boolean;
+  verifyBackendSignature(path: string, expected: SignatureEvidence): boolean;
+  verifyCodeModeHostPosture(path: string): boolean;
 }
 
 const defaultDependencies: PrebuiltCombinedCandidateValidationDependencies = {
@@ -184,6 +204,13 @@ const defaultDependencies: PrebuiltCombinedCandidateValidationDependencies = {
   verifyCandidateApp: (path) => verifySignature(path).ok,
   verifyLastKnownGoodApp: (path) => verifySignature(path).ok,
   verifySignedBackup: isDeveloperIdSignedBackup,
+  verifyCodeModeHostPosture: verifyCodeModeHostSigningPosture,
+  verifyBackendSignature: (path, expected) => {
+    if (!verifySignature(path).ok) return false;
+    const result = signatureInfo(path);
+    return result.ok && result.teamIdentifier === expected.teamIdentifier
+      && (result.authority[0] ?? (result.adHoc ? "ad-hoc" : "local identity")) === expected.identity;
+  },
 };
 
 export function resolvePrebuiltCombinedCandidateCliInput(
@@ -315,6 +342,7 @@ export function validatePrebuiltCombinedCandidate(
   ) {
     throw new Error("Prebuilt Codex binary architecture does not match its accepted-build receipt");
   }
+  assertAcceptedBackendClosure(receipt, deps);
 
   const runtime = deps.runtimeEvidence(runtimeRoot);
   if (
@@ -331,6 +359,10 @@ export function validatePrebuiltCombinedCandidate(
   const runtimeDocumentSha256 = deps.fingerprintFile(runtimeDocument);
   if (runtimeDocumentSha256 !== input.expectedRuntimeDocumentSha256.toLowerCase()) {
     throw new Error("Reviewed runtime fingerprint document digest does not match");
+  }
+  if (receipt.runtime.fingerprint !== runtime.fingerprint || receipt.runtime.fileCount !== runtime.fileCount
+    || receipt.runtime.documentSha256 !== runtimeDocumentSha256) {
+    throw new Error("Generated runtime does not match accepted backend closure evidence");
   }
 
   const sourceAppFingerprint = deps.sourceAppFingerprint(sourceAppRoot);
@@ -354,6 +386,9 @@ export function validatePrebuiltCombinedCandidate(
       sourceTree: receipt.source.tree,
       cargoLockSha256: receipt.source.cargoLockSha256,
       reviewedDiffSha256: receipt.source.reviewedDiffSha256,
+      upstream: receipt.upstream,
+      patchSeriesSha256: receipt.source.patchSeriesSha256,
+      verification: receipt.verification,
       buildCommand: receipt.build.command,
       toolchain: receipt.build.toolchain,
       testEvidence: receipt.tests.map(({ name, command, receiptSha256: digest }) => ({
@@ -367,7 +402,9 @@ export function validatePrebuiltCombinedCandidate(
       sha256: binarySha256,
       version,
       architecture,
+      signature: receipt.binary.signature,
     },
+    closure: receipt.closure,
     runtime: {
       sourceRoot: runtimeRoot,
       fingerprint: runtime.fingerprint,
@@ -415,31 +452,53 @@ export function capturePreparedPrebuiltCombinedCandidateEvidence(
   ) {
     throw new Error("Prepared candidate backend does not match the accepted prebuilt backend");
   }
+  if (!deps.verifyBackendSignature(embeddedBackend, authority.backend.signature)) {
+    throw new Error("Prepared candidate backend signature does not match the accepted build");
+  }
+  const embeddedHelper = requireExactInternalFile(join(candidateRoot, "Contents", "Resources", "codex-code-mode-host"), "Prepared code-mode helper");
+  const embeddedCodeModeHostSha256 = deps.fingerprintFile(embeddedHelper);
+  if (embeddedCodeModeHostSha256 !== authority.closure.codeModeHost.sha256
+    || deps.probeArchitecture(embeddedHelper) !== authority.closure.codeModeHost.architecture
+    || !deps.verifyBackendSignature(embeddedHelper, authority.closure.codeModeHost.signature)) {
+    throw new Error("Prepared candidate code-mode helper does not match the accepted backend closure");
+  }
+  if (!deps.verifyCodeModeHostPosture(embeddedHelper)) {
+    throw new Error("Prepared code-mode helper signing posture is invalid");
+  }
+  const embeddedResources = authority.closure.resources.map(resource => {
+    const path = requireExactInternalFile(join(candidateRoot, "Contents", "Resources", resource.relativePath), "Prepared backend resource");
+    const sha256 = deps.fingerprintFile(path);
+    if (sha256 !== resource.sha256) throw new Error("Prepared candidate backend resource differs from accepted closure");
+    return { relativePath: resource.relativePath, sha256 };
+  });
 
   const candidateRuntimeRoot = requireExactInternalDirectory(
     paths.candidateRuntimeRoot,
     "Prepared candidate runtime",
   );
   const stagedRuntime = deps.runtimeEvidence(candidateRuntimeRoot);
-  if (
-    stagedRuntime === null
-    || stagedRuntime.fingerprint !== authority.runtime.fingerprint
-    || stagedRuntime.fileCount !== authority.runtime.fileCount
-  ) {
-    throw new Error("Prepared candidate runtime does not match the reviewed runtime");
-  }
+  if (stagedRuntime === null) throw new Error("Prepared candidate runtime does not match the reviewed runtime");
   const stagedRuntimeDocumentSha256 = deps.fingerprintFile(requireExactInternalFile(
     join(candidateRuntimeRoot, RUNTIME_FINGERPRINT_FILE),
     "Prepared candidate runtime fingerprint document",
   ));
-  if (stagedRuntimeDocumentSha256 !== authority.runtime.documentSha256) {
-    throw new Error("Prepared candidate runtime document does not match the reviewed runtime");
+  if (stagedRuntime.fingerprint !== authority.runtime.fingerprint || stagedRuntime.fileCount !== authority.runtime.fileCount
+    || stagedRuntimeDocumentSha256 !== authority.runtime.documentSha256) {
+    // Only the maintained recovery derivation can authorize a changed tree.
+    // Fixture dependencies cannot replace this verifier or its real observations.
+    const actual = assertAcceptedAccountsRecoveryRuntime(candidateRuntimeRoot, authority.runtime);
+    if (actual.fingerprint !== stagedRuntime.fingerprint || actual.fileCount !== stagedRuntime.fileCount
+      || actual.documentSha256 !== stagedRuntimeDocumentSha256) {
+      throw new Error("Prepared candidate recovery observations differ from the complete staged runtime");
+    }
   }
 
   return {
     candidateAppFingerprint,
     embeddedBackendSha256,
     embeddedBackendVersion,
+    embeddedCodeModeHostSha256,
+    embeddedResources,
     stagedRuntime,
     stagedRuntimeDocumentSha256,
     rollback: capturePrebuiltRollbackEvidence(paths, deps),
@@ -520,7 +579,7 @@ export function capturePrebuiltRollbackEvidence(
   };
 }
 
-function readAcceptedBuildReceipt(
+export function readAcceptedBuildReceipt(
   receiptPath: string,
   now: Date,
 ): AcceptedPrebuiltCodexBuildReceipt {
@@ -543,14 +602,17 @@ function validAcceptedBuildReceipt(value: unknown): value is AcceptedPrebuiltCod
   if (
     !plainRecord(value)
     || !exactKeys(value, [
-      "schemaVersion", "kind", "status", "acceptedAt", "source", "build", "tests", "binary",
+      "schemaVersion", "kind", "status", "acceptedAt", "verification", "upstream", "closure", "runtime", "source", "build", "tests", "binary",
     ])
-    || value.schemaVersion !== 1
+    || value.schemaVersion !== 2
     || value.kind !== "tweakers-prebuilt-codex-build"
     || value.status !== "accepted"
     || typeof value.acceptedAt !== "string"
+    || !plainRecord(value.verification) || !exactKeys(value.verification, ["level", "installedAcceptance"])
+    || !["source-verified", "isolated-canary"].includes(String(value.verification.level))
+    || value.verification.installedAcceptance !== "required"
     || !plainRecord(value.source)
-    || !exactKeys(value.source, ["commit", "tree", "cargoLockSha256", "reviewedDiffSha256"])
+    || !exactKeys(value.source, ["commit", "tree", "cargoLockSha256", "reviewedDiffSha256", "patchSeriesSha256"])
     || typeof value.source.commit !== "string"
     || !GIT_OBJECT_RE.test(value.source.commit)
     || typeof value.source.tree !== "string"
@@ -559,6 +621,13 @@ function validAcceptedBuildReceipt(value: unknown): value is AcceptedPrebuiltCod
     || !SHA256_RE.test(value.source.cargoLockSha256)
     || typeof value.source.reviewedDiffSha256 !== "string"
     || !SHA256_RE.test(value.source.reviewedDiffSha256)
+    || typeof value.source.patchSeriesSha256 !== "string" || !SHA256_RE.test(value.source.patchSeriesSha256)
+    || !plainRecord(value.upstream) || !exactKeys(value.upstream, ["repository", "tag", "commit"])
+    || value.upstream.repository !== "https://github.com/openai/codex.git"
+    || typeof value.upstream.tag !== "string" || !parseCodexReleaseTag(value.upstream.tag)
+    || value.upstream.commit !== value.source.commit
+    || !isCodexBackendClosureEvidence(value.closure)
+    || !isCodexGeneratedRuntimeEvidence(value.runtime)
     || !plainRecord(value.build)
     || !exactKeys(value.build, ["command", "toolchain", "architecture"])
     || !boundedText(value.build.command, 4_096)
@@ -568,13 +637,15 @@ function validAcceptedBuildReceipt(value: unknown): value is AcceptedPrebuiltCod
     || value.tests.length === 0
     || value.tests.length > 64
     || !plainRecord(value.binary)
-    || !exactKeys(value.binary, ["path", "sha256", "version", "architecture"])
+    || !exactKeys(value.binary, ["path", "sha256", "version", "architecture", "signature"])
     || typeof value.binary.path !== "string"
     || typeof value.binary.sha256 !== "string"
     || !SHA256_RE.test(value.binary.sha256)
     || typeof value.binary.version !== "string"
     || !VERSION_RE.test(value.binary.version)
     || value.binary.architecture !== "arm64"
+    || !validSignature(value.binary.signature)
+    || parseCodexReleaseTag(value.upstream.tag)?.normalized !== value.binary.version
   ) return false;
   return value.tests.every((entry) => (
     plainRecord(entry)
@@ -587,18 +658,48 @@ function validAcceptedBuildReceipt(value: unknown): value is AcceptedPrebuiltCod
   ));
 }
 
-function combinedPayloadIdentity(
+function validSignature(value: unknown): value is SignatureEvidence {
+  return plainRecord(value) && exactKeys(value, ["identity", "teamIdentifier", "designatedRequirement"])
+    && boundedText(value.identity, 1024)
+    && (value.teamIdentifier === null || boundedText(value.teamIdentifier, 256))
+    && (value.designatedRequirement === null || boundedText(value.designatedRequirement, 4096));
+}
+
+/** Shared companion verifier for prebuilt authority and installer staging. */
+export function assertAcceptedBackendClosure(
+  receipt: Pick<AcceptedPrebuiltCodexBuildReceipt, "binary" | "closure">,
+  overrides: Partial<PrebuiltCombinedCandidateValidationDependencies> = {},
+): void {
+  const deps = { ...defaultDependencies, ...overrides };
+  const backend = requireExactInternalFile(receipt.binary.path, "Accepted backend");
+  const helper = requireExactInternalFile(receipt.closure.codeModeHost.path, "Accepted code-mode helper");
+  if (deps.fingerprintFile(backend) !== receipt.binary.sha256 || !deps.verifyBackendSignature(backend, receipt.binary.signature)) {
+    throw new Error("Accepted backend fingerprint or signature changed");
+  }
+  if (deps.fingerprintFile(helper) !== receipt.closure.codeModeHost.sha256
+    || deps.probeArchitecture(helper) !== receipt.closure.codeModeHost.architecture
+    || !deps.verifyBackendSignature(helper, receipt.closure.codeModeHost.signature)) {
+    throw new Error("Accepted code-mode helper fingerprint, architecture or signature changed");
+  }
+  if (!deps.verifyCodeModeHostPosture(helper)) {
+    throw new Error("Accepted code-mode helper signing posture is invalid");
+  }
+  for (const resource of receipt.closure.resources) {
+    if (!validResourceRelativePath(resource.relativePath)) throw new Error("Accepted backend resource path is unsafe");
+    const file = requireExactInternalFile(resource.sourcePath, "Accepted backend resource");
+    if (deps.fingerprintFile(file) !== resource.sha256) throw new Error("Accepted backend resource fingerprint changed");
+  }
+}
+
+function validResourceRelativePath(path: string): boolean {
+  return !isAbsolute(path) && !path.includes("\\") && path.split("/").every(part => part !== "" && part !== "." && part !== "..")
+    && !["codex", "codex-code-mode-host", "app.asar", "tweakers"].includes(path.split("/")[0]!);
+}
+
+export function combinedPayloadIdentity(
   authority: Omit<PrebuiltCombinedCandidateAuthority, "payloadIdentity">,
 ): string {
-  return createHash("sha256").update(JSON.stringify({
-    schemaVersion: authority.schemaVersion,
-    transactionId: authority.transactionId,
-    installerPayloadHash: authority.installerPayloadHash,
-    acceptedBuildReceipt: authority.acceptedBuildReceipt,
-    backend: authority.backend,
-    runtime: authority.runtime,
-    sourceApp: authority.sourceApp,
-  })).digest("hex");
+  return createHash("sha256").update(acceptedCombinedPayloadText(authority)).digest("hex");
 }
 
 function requireCliValue(value: string | undefined, flag: string): string {

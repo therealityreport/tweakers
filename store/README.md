@@ -12,9 +12,10 @@ GitHub Pages publishes from the privacy-scrubbed `gh-pages` branch. Editing
 `store/index.json` alone does not update the live URL; the synchronized Pages
 branch must also be published.
 
-Registry entries must pin installs to `approvedCommitSha`. Tweaker downloads
-from GitHub's commit archive URL for that SHA and validates the downloaded
-`manifest.json` before replacing an installed tweak.
+Available remote entries must pin an `approvedCommitSha` and install from that
+reviewed commit archive. Bundled entries use
+`source: { kind: "bundled", path: "tweaks/<folder>" }` and the packaged source.
+Unavailable metadata-only entries may omit install coordinates.
 
 Publishing flow:
 

@@ -15,6 +15,7 @@ import {
   officialSourcePaths,
   readRegisteredOfficialSourceStatusProjection,
   registerStableOfficialSource,
+  canReuseRegisteredSourceEvidence,
   sealOfficialSourceTree,
   type OfficialSourceObservation,
   type RegisteredOfficialSourceStatus,
@@ -28,6 +29,18 @@ const MANAGER = {
   path: "/private/Tweakers Manager Launcher",
   sha256: "a".repeat(64),
 };
+
+test("consumed download evidence remains reusable for comparison but cannot stand in for a fresh construction source", () => {
+  const prior = { state: "ready", sourceDigest: "same-release", artifactPath: "/old/download/ChatGPT.app", constructionState: "consumed" } as RegisteredOfficialSourceStatus;
+  assert.equal(canReuseRegisteredSourceEvidence(prior, "same-release"), true);
+  assert.equal(canReuseRegisteredSourceEvidence(prior, "same-release", prior.artifactPath!), false);
+  assert.equal(canReuseRegisteredSourceEvidence(prior, "same-release", "/new/download/ChatGPT.app"), false);
+  const available = { ...prior, constructionState: "available" as const };
+  assert.equal(canReuseRegisteredSourceEvidence(available, "same-release", available.artifactPath!), true);
+  assert.equal(canReuseRegisteredSourceEvidence(available, "same-release", "/new/download/ChatGPT.app"), false);
+  assert.equal(canReuseRegisteredSourceEvidence(available, "changed-release"), false);
+  assert.equal(canReuseRegisteredSourceEvidence({ ...available, state: "stale" }, "same-release"), false);
+});
 
 test("official-source tree seal accepts relative symlinks whose resolved targets stay inside the app root", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-official-source-seal-"));

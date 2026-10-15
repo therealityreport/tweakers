@@ -35,6 +35,9 @@ test("sealed manager executes its pinned MCP helper and rejects changed runtime 
     entryPoints: [fileURLToPath(new URL("../src/mcp-mode-bridge.ts", import.meta.url))],
     outfile: bundle, bundle: true, format: "esm", platform: "node", logLevel: "silent",
     define: { __TWEAKERS_MANAGER_RUNTIME_FINGERPRINT__: JSON.stringify(evidence.fingerprint) },
+    // Same mapping as scripts/build-manager.mjs: @electron/asar requires
+    // Electron's original-fs, which is plain node:fs outside Electron.
+    plugins: [{ name: "node-original-fs", setup(context) { context.onResolve({ filter: /^original-fs$/ }, () => ({ path: "node:fs", external: true })); } }],
   });
   const imported = await import(pathToFileURL(bundle).href);
   const helper = join(runtime, "mcp-mode-headless.js");

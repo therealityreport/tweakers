@@ -78,6 +78,7 @@ export interface NativeHistoryWriterObservationV1 {
 export interface NativeHistoryWriterCensusDependenciesV1 {
     spawn?: typeof spawnSync;
     uid?: () => number | undefined;
+    home?: () => string;
 }
 export interface NativeHistoryAsyncWriterCensusDependenciesV1 {
     run?: (command: string, args: readonly string[]) => Promise<{
@@ -136,7 +137,11 @@ export declare function observeNativeHistoryWritersV1(binding: NativeHistorySour
  * have no native-source writer exception while their inherited config changes.
  */
 export declare function observeNativeAccountWritersV1(binding: NativeHistorySourceBindingV1, opaqueAccountId: OpaqueAccountId, ownedPids?: readonly number[], dependencies?: NativeHistoryWriterCensusDependenciesV1): NativeHistoryWriterObservationV1;
-/** Native operations run in the selected broker child, without an external materialization write. */
+/** Fence the exact unpublished execution home; it has no signed auth entry yet. */
+export declare function observeNativeExecutionHomeWritersV1(binding: NativeHistorySourceBindingV1, account: OpaqueAccountId, destination: string, dependencies?: NativeHistoryWriterCensusDependenciesV1): NativeHistoryWriterObservationV1;
+/** Configuration operations of an official child use only its published, signed execution home. */
+export declare function observeNativeExecutionHomeOperationWritersV1(binding: NativeHistorySourceBindingV1, opaqueAccountId: OpaqueAccountId, nativeChildPid: number, dependencies?: NativeHistoryWriterCensusDependenciesV1): NativeHistoryWriterObservationV1;
+/** Legacy operations retain the selected original account-root fence. */
 export declare function observeNativeAccountOperationWritersV1(binding: NativeHistorySourceBindingV1, opaqueAccountId: OpaqueAccountId, nativeChildPid: number, dependencies?: NativeHistoryWriterCensusDependenciesV1): NativeHistoryWriterObservationV1;
 export declare function nativeHistoryAccountSourceForV1(binding: NativeHistorySourceBindingV1, opaqueAccountId: OpaqueAccountId): NativeHistoryAccountSourceV1 | null;
 /**

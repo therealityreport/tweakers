@@ -19,6 +19,7 @@ export interface DoctorFindingV1 {
   evidence: string[];
 }
 export interface DoctorReportV1 {
+  upstreamCurrency?: { version: 1; jobId: string; checkedAt: string; state: "current" | "update-available" | "unavailable"; installedVersion: string | null; installedBuild: string | null; latestVersion: string | null; latestBuild: string | null };
   schemaVersion: 1;
   workflowVersion?: 2;
   kind: "tweakers-independent-doctor";
@@ -760,6 +761,7 @@ function technicalReportSummary(report: DoctorReportV1): string {
   return [
     `Tweakers: ${versionAndBuild(report.target.version, report.target.build)}`,
     `Health: ${report.health.state} (${report.health.broker})`,
+    ...(report.upstreamCurrency ? [`Upstream: ${report.upstreamCurrency.state} (checked ${report.upstreamCurrency.checkedAt})`] : []),
     `Update: ${updateStateLabel(report.update)} — ${report.update.progress || "No update work is running."}`,
     compatibility ? `Compatibility: ${compatibility.status}\nChecks: ${compatibility.checks.length}\nRepair attempts: ${compatibility.repairs.length}` : reviewSummary,
     `Paths: ${report.target.appPath}\nRuntime: ${report.target.runtimeRoot ?? "Not available"}\nBroker: ${report.target.brokerRoot ?? "Not available"}`,
@@ -786,6 +788,11 @@ function versionAndBuild(version: string | null, build: string | null): string {
 function isDoctorReport(value: unknown): value is DoctorReportV1 {
   if (!value || typeof value !== "object") return false;
   const report = value as Partial<DoctorReportV1>;
+  const currency = report.upstreamCurrency;
+  const validCurrency = currency === undefined || (!!currency && currency.version === 1
+    && typeof currency.jobId === "string" && typeof currency.checkedAt === "string"
+    && ["current", "update-available", "unavailable"].includes(currency.state)
+    && [currency.installedVersion, currency.installedBuild, currency.latestVersion, currency.latestBuild].every(value => value === null || typeof value === "string"));
   const usageDetails = report.update?.usageDetails;
   const review = report.update?.review;
   const validReview = review === undefined || (
@@ -835,7 +842,7 @@ function isDoctorReport(value: unknown): value is DoctorReportV1 {
     && Array.isArray(report.findings)
     && Array.isArray(report.actions)
     && (report.workflowVersion === undefined || report.workflowVersion === 2)
-    && validUsageDetails && validReview && validCompatibility
+    && validCurrency && validUsageDetails && validReview && validCompatibility
     && validAdoption
     && report.actions.length >= 4 && report.actions.length <= 9
     && (["scan", "repair", "retry", "update"] as const).every((id) =>

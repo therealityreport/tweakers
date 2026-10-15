@@ -15,7 +15,7 @@ function installIndependentStartupRecovery(dialog, openDoctor) {
             }
             catch {
                 await original.call(dialog, { ...options, message: "Tweakers needs recovery.", buttons: ["Quit"], cancelId: 0,
-                    detail: "Open Tweakers Doctor from the managed launcher, or run tweaker doctor --target independent --ui." });
+                    detail: "Open Tweakers Manager → Doctor from the managed launcher, or run tweaker doctor --target independent --ui." });
                 return { response: options.cancelId ?? Math.max(0, (options.buttons?.length ?? 1) - 1), checkboxChecked: false };
             }
         }

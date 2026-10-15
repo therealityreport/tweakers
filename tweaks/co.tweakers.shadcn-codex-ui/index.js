@@ -1,4 +1,7 @@
 "use strict";
+// Generated compatibility entry. Edit the owning tweak's lib/rich-blocks.js instead.
+// The runtime suppresses this legacy ID only after successful owner-settings migration.
+"use strict";
 
 const OWNER = "co.tweakers.shadcn-codex-ui";
 const STYLE_ID = "tweaker-shadcn-codex-ui-style";
@@ -6,6 +9,7 @@ const MOUNT_ATTR = "data-co-tweakers-shadcn-codex-ui-rich-block-owner";
 const ENABLED_KEY = "enabled";
 const NORMALIZED_PAYLOADS = new WeakSet();
 const RICH_BLOCK_MOUNTS = new WeakMap();
+const RICH_PAYLOAD_CACHE = new WeakMap();
 const INVALID_VALUE = Symbol("invalid-rich-block-value");
 
 // Rich Blocks v1 is deliberately extensible. The built-in kinds below receive
@@ -47,7 +51,7 @@ const helpers = {
 };
 
 module.exports = {
-  start(api) {
+  start(api, options = {}) {
     if (api?.process === "main" || typeof document === "undefined") return;
     const state = {
       api,
@@ -58,11 +62,11 @@ module.exports = {
       mounts: new Map(),
       style: null,
       settings: null,
-      enabled: api?.storage?.get?.(ENABLED_KEY, true) !== false,
+      enabled: options.integrated || api?.storage?.get?.(ENABLED_KEY, true) !== false,
     };
     states.set(this, state);
     state.style = installStyle();
-    if (typeof api?.settings?.registerPage === "function") {
+    if (!options.integrated && typeof api?.settings?.registerPage === "function") {
       state.settings = api.settings.registerPage({
         id: "shadcn-codex-ui",
         title: "Shadcn Codex UI",
@@ -247,9 +251,10 @@ function reconcileRichBlock(message, rawPayload) {
   // Never replace a mount owned by another adapter.
   if (previous && previous.owner !== OWNER) return null;
   const payloadHash = JSON.stringify(payload);
+  const messageId = message.id || message.getAttribute?.("data-message-id") || null;
   if (
     previous?.owner === OWNER &&
-    previous.messageId === message.id &&
+    previous.messageId === messageId &&
     previous.payloadHash === payloadHash &&
     (previous.host == null || previous.host.isConnected !== false)
   ) return previous;
@@ -257,16 +262,17 @@ function reconcileRichBlock(message, rawPayload) {
   if (isDomNode(message)) {
     const host = document.createElement("section");
     host.setAttribute(MOUNT_ATTR, OWNER);
-    host.setAttribute("data-message-id", String(message.id || message.getAttribute?.("data-message-id") || ""));
+    host.setAttribute("data-tweakers-host-surface-owned", "true");
+    host.setAttribute("data-message-id", String(messageId || ""));
     host.className = "tweaker-rich-blocks flex flex-col gap-2 pt-3";
     renderBlocks(host, payload.blocks);
     const content = message.querySelector?.("[data-message-content], [data-testid*=message-content], .markdown, [class*=markdown]") || message;
     content.appendChild(host);
-    const mount = { owner: OWNER, messageId: message.id || message.getAttribute?.("data-message-id") || null, payloadHash, payload, host, message };
+    const mount = { owner: OWNER, messageId, payloadHash, payload, host, message };
     RICH_BLOCK_MOUNTS.set(message, mount);
     return mount;
   }
-  const mount = { owner: OWNER, messageId: message.id, payloadHash, payload, message };
+  const mount = { owner: OWNER, messageId, payloadHash, payload, message };
   RICH_BLOCK_MOUNTS.set(message, mount);
   return mount;
 }
@@ -281,7 +287,7 @@ function collectRichBlockRoots(root) {
   if (Array.isArray(root)) return root.filter((item) => item?.kind === "message");
   const source = root || (typeof document !== "undefined" ? document : null);
   const nodes = Array.from(source?.querySelectorAll?.(
-    '[data-message-author-role="assistant"], [data-role="assistant"], [data-message-id]',
+    '[data-message-author-role="assistant"], [data-role="assistant"], [data-message-id], [data-markdown-text-style="assistant-message"]',
   ) || []);
   return nodes.filter((node) => {
     const role = node.getAttribute?.("data-message-author-role") || node.getAttribute?.("data-role") || node.getAttribute?.("data-author-role");
@@ -293,11 +299,13 @@ function collectRichBlockRoots(root) {
 function mergeRichBlockRoots(hostRoots, nativeRoots) {
   const merged = new Map();
   for (const root of [...hostRoots, ...nativeRoots]) {
-    if (!root) continue;
+    if (!root || root.closest?.('[data-tweakers-host-surface-owned="true"]')) continue;
     const id = root.id || root.getAttribute?.("data-message-id");
     merged.set(id ? `id:${id}` : root, root);
   }
-  return Array.from(merged.values()).slice(-RICH_BLOCK_PROTOCOL.bounds.messageCandidates);
+  const candidates = Array.from(merged.values());
+  return candidates.filter((root) => !candidates.some((other) => other !== root && other.contains?.(root)))
+    .slice(-RICH_BLOCK_PROTOCOL.bounds.messageCandidates);
 }
 
 function scan(state) {
@@ -307,6 +315,14 @@ function scan(state) {
   // The host can return an early capped page. Merge it with native candidates,
   // deduplicate by message id, then retain the newest bounded window.
   const roots = mergeRichBlockRoots(hostRoots, collectRichBlockRoots(document));
+  // A streamed turn can gain an assistant ancestor after its child was mounted.
+  // Retire the child before parsing the ancestor so owned output cannot be input.
+  for (const [message, mount] of Array.from(state.mounts)) {
+    if (roots.some((root) => root !== message && root.contains?.(message))) {
+      disposeRichBlockMount(message, mount);
+      state.mounts.delete(message);
+    }
+  }
   for (const message of roots) {
     const payload = findPayload(message); // Parsed once; reconcile reuses normalized payloads.
     const mount = reconcileRichBlock(message, payload);
@@ -323,12 +339,20 @@ function scan(state) {
 
 function findPayload(message) {
   const raw = message.getAttribute?.("data-rich-payload") || message.querySelector?.("[data-rich-payload]")?.getAttribute?.("data-rich-payload");
-  if (raw) return parseRichPayload(raw);
+  if (raw) return cachedRichPayload(message, raw);
   for (const node of Array.from(message.querySelectorAll?.("pre, code") || []).reverse()) {
-    const payload = parseRichPayload(node.textContent || "");
+    const payload = cachedRichPayload(node, node.textContent || "");
     if (payload) return payload;
   }
   return null;
+}
+
+function cachedRichPayload(node, content) {
+  const previous = RICH_PAYLOAD_CACHE.get(node);
+  if (previous?.content === content) return previous.payload;
+  const payload = parseRichPayload(content);
+  RICH_PAYLOAD_CACHE.set(node, { content, payload });
+  return payload;
 }
 
 function renderBlocks(host, blocks) {

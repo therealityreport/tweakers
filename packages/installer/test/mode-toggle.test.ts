@@ -266,6 +266,7 @@ test("production mode compatibility prepares, submits through launchd, then poll
     const { deps, calls } = makeDeps({
       legacyModeEngineForTests: false,
       environmentCommand: async (action, options) => {
+        if (!options) throw new Error("Expected environment command options");
         sequence.push(`${action}:${options.quiet === true ? "quiet" : "loud"}:${options.observe === true ? "observe" : "mutate"}`);
         if (action === "status") return compatibilityEnvironmentResult("status");
         if (action === "prepare") return compatibilityEnvironmentResult("prepared");
@@ -300,6 +301,7 @@ test("production mode preserves approval from confirmation through launchd submi
       legacyModeEngineForTests: false,
       now: () => "2026-08-18T12:00:00.000Z",
       environmentCommand: async (action, options) => {
+        if (!options) throw new Error("Expected environment command options");
         observed.push({ action, approvalAt: options.approvalAt });
         if (action === "status") return compatibilityEnvironmentResult("status");
         if (action === "prepare") return compatibilityEnvironmentResult("prepared");
@@ -326,6 +328,7 @@ test("production mode keeps the chatgpt/tweakers command names while carrying a 
       legacyModeEngineForTests: false,
       now: () => "2026-08-18T12:00:00.000Z",
       environmentCommand: async (action, options) => {
+        if (!options) throw new Error("Expected environment command options");
         if (action === "status") {
           sequence.push("status");
           return compatibilityEnvironmentResult("status");

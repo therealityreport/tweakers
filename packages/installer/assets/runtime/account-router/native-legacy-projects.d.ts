@@ -1,6 +1,9 @@
 import { type OpaqueAccountId } from "./types";
 export interface NativeDesktopProjectsProjectionV1 {
     version: 1;
+    access: "read_only" | "read_write";
+    source: "saved_local" | "app_server";
+    authorityGeneration: number;
     values: {
         "local-projects": Record<string, {
             id: string;
@@ -8,6 +11,7 @@ export interface NativeDesktopProjectsProjectionV1 {
             rootPaths: string[];
             createdAt: number;
             updatedAt: number;
+            metadata?: Record<string, unknown>;
         }>;
         "thread-project-assignments": Record<string, {
             projectKind: "local";
@@ -42,7 +46,7 @@ export declare class NativeLegacyProjectsV1 {
     legacyPublicProjectIdForThread(nativeThreadId: string): string | null;
     unresolvedMembershipCount(): number | null;
     /** Read a bounded, data-only snapshot for the native desktop project UI. */
-    desktopProjection(nativeProjects: readonly unknown[]): NativeDesktopProjectsProjectionV1 | null;
+    desktopProjection(nativeProjects: readonly unknown[], authority?: Pick<NativeDesktopProjectsProjectionV1, "access" | "source" | "authorityGeneration">): NativeDesktopProjectsProjectionV1 | null;
     isRemoved(publicProjectId: string, nativeThreadId: string): boolean;
     /** Call after a successful native user-driven removal/reassignment, under the broker writer guard. */
     removeThreadFromProject(publicProjectId: string, nativeThreadId: string): boolean;

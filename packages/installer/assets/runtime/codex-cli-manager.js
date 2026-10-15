@@ -1,5 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.resolveBundledCodexBinary = resolveBundledCodexBinary;
 exports.deriveCodexCliPaths = deriveCodexCliPaths;
 exports.validateArchiveEntries = validateArchiveEntries;
 exports.createCodexCliManager = createCodexCliManager;
@@ -14,6 +15,26 @@ const EMPTY_STATE = { schemaVersion: 1, current: null, previous: null, updatedAt
 const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 const RECEIPT_FILE = "receipt.json";
 const ALLOWED_ASSET = "codex-package-aarch64-apple-darwin.tar.gz";
+/** Resolve the physical executable, never the vendor's bin/codex launcher. */
+function resolveBundledCodexBinary(resourcesPath) {
+    for (const relativePath of ["codex", (0, node_path_1.join)("codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex")]) {
+        const binary = (0, node_path_1.join)(resourcesPath, relativePath);
+        let stat;
+        try {
+            stat = (0, node_fs_1.lstatSync)(binary);
+        }
+        catch (error) {
+            if (error.code === "ENOENT")
+                continue;
+            throw error;
+        }
+        if (!stat.isFile() || stat.isSymbolicLink() || (0, node_fs_1.realpathSync)(binary) !== (0, node_path_1.join)((0, node_fs_1.realpathSync)(resourcesPath), relativePath)) {
+            throw new Error("Bundled Codex backend must be a regular file without symlink traversal outside its layout");
+        }
+        return binary;
+    }
+    throw new Error("Supported bundled Codex backend is missing");
+}
 function deriveCodexCliPaths(home, activeUserRoot) {
     const root = (0, node_path_1.join)(activeUserRoot ?? (0, node_path_1.join)((0, node_path_1.resolve)(home), "Library", "Application Support", "Tweakers"), "codex-cli");
     return { root, releases: (0, node_path_1.join)(root, "releases"), staging: (0, node_path_1.join)(root, "staging"), state: (0, node_path_1.join)(root, "state.json"), lock: (0, node_path_1.join)(root, "operation.lock") };

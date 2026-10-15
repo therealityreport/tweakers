@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import { KNOWN_SCHEMA2_PREDECESSOR, isKnownSchema2Predecessor } from "./mcp-lifecycle-predecessor.js";
 import {
   MCP_LIFECYCLE_GUARD_LABEL,
   MCP_LIFECYCLE_LABELS,
@@ -75,6 +76,8 @@ export interface McpLifecycleHealthOptions {
   managedReceiptPath?: string;
   sourceRoot?: string;
   deep?: boolean;
+  /** Explicit exact-predecessor adoption only; never automatic reconciliation. */
+  allowKnownSchema2Predecessor?: boolean;
 }
 
 export function inspectMcpLifecycleHealth(
@@ -179,7 +182,9 @@ export function inspectMcpLifecycleHealth(
 
   const lifecycleStatusPath = join(options.targetHome, ".codex", "tmp", "codex-mcp-lifecycle-status.json");
   const lifecycleStatus = readStatus(lifecycleStatusPath, pathExists, readFile);
-  const lifecycleState = statusHealth(lifecycleStatus, checkedAt, new Set([1, 2]));
+  const predecessorCompatible = options.allowKnownSchema2Predecessor === true
+    && knownPredecessorAssetsCompatible(options.managedReceiptPath, assets, pathExists, readFile, mode);
+  const lifecycleState = reaperStatusHealth(lifecycleStatus, checkedAt, predecessorCompatible);
   checks.push(check(
     "status:reaper",
     "Reaper status",
@@ -238,6 +243,7 @@ export function inspectMcpLifecycleHealth(
     labelStates,
     expectedLabelStates,
     labelStateError,
+    predecessorCompatible,
   });
   const status = aggregate(checks);
   return {
@@ -332,6 +338,7 @@ function buildRepairPreview(input: {
   labelStates: readonly McpLifecycleLabelState[] | undefined;
   expectedLabelStates: readonly McpLifecycleLabelState[];
   labelStateError: string | null;
+  predecessorCompatible: boolean;
 }): McpLifecycleRepairPreview {
   const changedAssets = input.assets
     .filter((asset) => (
@@ -345,7 +352,7 @@ function buildRepairPreview(input: {
       backup: join(input.backupRoot, relative(input.targetHome, asset.destinationPath)),
       kind: asset.asset.kind,
     }));
-  const state = statusHealth(input.lifecycleStatus, input.checkedAt, new Set([1, 2]));
+  const state = reaperStatusHealth(input.lifecycleStatus, input.checkedAt, input.predecessorCompatible);
   const terminating = lifecycleHasTerminatingTree(input.lifecycleStatus);
   const labelError = input.labelStateError ?? labelTransitionError(input.labelStates);
   const reloadDeferredReason = input.guardState.status !== "ok"
@@ -593,6 +600,47 @@ function readStatus(
   }
 }
 
+function knownPredecessorAssetsCompatible(
+  receiptPath: string | undefined, assets: McpLifecycleResolvedAsset[],
+  pathExists: (path: string) => boolean, readFile: (path: string) => Buffer,
+  mode: (path: string) => number,
+): boolean {
+  if (!receiptPath || !pathExists(receiptPath)) return false;
+  try {
+    const receipt = JSON.parse(readFile(receiptPath).toString("utf8"));
+    if (!isKnownSchema2Predecessor(receipt) || assets.length !== 5) return false;
+    return assets.every((asset) => {
+      if (!pathExists(asset.destinationPath) || mode(asset.destinationPath) !== asset.mode) return false;
+      const actual = createHash("sha256").update(readFile(asset.destinationPath)).digest("hex");
+      const candidate = createHash("sha256").update(asset.content).digest("hex");
+      const previous = asset.asset.kind === "file"
+        ? KNOWN_SCHEMA2_PREDECESSOR.assetDigests[asset.asset.id as keyof typeof KNOWN_SCHEMA2_PREDECESSOR.assetDigests]
+        : asset.asset.source_sha256 === KNOWN_SCHEMA2_PREDECESSOR.assetDigests[asset.asset.id as keyof typeof KNOWN_SCHEMA2_PREDECESSOR.assetDigests]
+          ? candidate : null;
+      if (asset.asset.kind !== "file" && previous === null) return false;
+      // Private promotion can temporarily contain old and candidate assets.
+      // Every byte still belongs to one of the two frozen generations.
+      return actual === previous || actual === candidate;
+    });
+  } catch { return false; }
+}
+
+function reaperStatusHealth(value: Record<string, unknown> | null, now: Date, predecessorCompatible: boolean) {
+  if (value?.schema_version !== 2) return statusHealth(value, now, new Set([3]));
+  if (!predecessorCompatible || value.producer_version !== "0.6.0"
+    || value.cleanup_policy_version !== "strict-detached-v5"
+    || value.matcher_registry_version !== "mcp-family-descriptors-v6") {
+    return { status: "error" as const, detail: "schema v2 requires exact explicit predecessor migration proof" };
+  }
+  const counts = record(value.counts);
+  const states = new Set(["observed", "idle_pending", "eligible", "terminating", "exited", "partial_failure", "blocked_active_work", "ambiguous", "detached_candidate"]);
+  if (!counts || typeof counts.would_kill !== "number" || !Number.isInteger(counts.would_kill) || counts.would_kill < 0
+    || !Array.isArray(value.trees) || value.trees.some((tree) => !record(tree) || !states.has(String(record(tree)?.state)))) {
+    return { status: "error" as const, detail: "predecessor heartbeat has malformed cleanup state" };
+  }
+  return statusHealth(value, now, new Set([2]));
+}
+
 function statusHealth(
   value: Record<string, unknown> | null,
   now: Date,
@@ -694,7 +742,7 @@ function guardV3ContractError(
   const lifecycleSchemaVersion = lifecycleStatus?.schema_version;
   const lifecycleJob = lifecycleStatus ? record(lifecycleStatus.job) : null;
   if (!lifecycleStatus
-    || lifecycleSchemaVersion !== 2
+    || lifecycleSchemaVersion !== manifest.lifecycle_schema_version
     || lifecycleStatus.matcher_registry_version !== manifest.matcher_registry_version
     || lifecycleJob?.ok !== true
     || record(lifecycleStatus.counts) === null

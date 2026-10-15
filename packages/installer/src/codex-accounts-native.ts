@@ -3,6 +3,11 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ACCOUNTS_NATIVE_MAIN_PATHS, patchAccountsNativeMainSources } from "./codex-accounts-native-main.js";
 import { patchCodexAccountsNative8881Sources, patchCodexAccountsNative9275Sources } from "./codex-accounts-native-8881.js";
+import { patchCodexAccountsNative10492Sources } from "./codex-accounts-native-10492.js";
+import { patchCodexAccountsNative20398Sources } from "./codex-accounts-native-20398.js";
+import { patchCodexAccountsNative20156Sources } from "./codex-accounts-native-20156.js";
+import { patchCodexAccountsNative10954Sources } from "./codex-accounts-native-10954.js";
+import { patchCodexAccountsNative9922Sources } from "./codex-accounts-native-9922.js";
 import {
   ACCOUNTS_NATIVE_REQUIRED_HOOKS,
   validateAccountsNativeCompatibility,
@@ -53,6 +58,17 @@ export function patchCodexAccountsNativeSources(
 ): AccountsNativePatchResult {
   // Select an explicit recipe, never infer compatibility from the installed
   // version or accept new hashes without reviewing the corresponding hooks.
+  if (sources.has("webview/assets/app-initial-1ab6fbe93c4f.js")) return patchCodexAccountsNative20398Sources(sources, previousRecord);
+  if (sources.has("webview/assets/app-initial-6350d04672d0.js")) return patchCodexAccountsNative20156Sources(sources, previousRecord);
+  if (sources.has("webview/assets/app-initial-51da50e6c6e3.js")) {
+    return patchCodexAccountsNative10954Sources(sources, previousRecord);
+  }
+  if (sources.has("webview/assets/app-initial-512cdcfeac48.js") || sources.has("webview/assets/app-initial-e1f6333a805b.js")) {
+    return patchCodexAccountsNative10492Sources(sources, previousRecord);
+  }
+  if (sources.has("webview/assets/app-initial-a498f911edeb.js")) {
+    return patchCodexAccountsNative9922Sources(sources, previousRecord);
+  }
   if (sources.has("webview/assets/app-initial-9b95fa538c62.js")) {
     return patchCodexAccountsNative8881Sources(sources, previousRecord);
   }
@@ -273,7 +289,7 @@ export function patchCodexAccountsNativeSources(
     edit(data, "await Sb(i,t).sendRequest(`config/batchWrite`,{edits:pWn({pluginId:g.plugin.id,enabled:!0}),filePath:E?.configWriteTarget?.filePath??null,expectedVersion:null,reloadUserConfig:!0})",
       `await ${BRIDGE}.capturedRpc(__twInstallScope,"config/batchWrite",{edits:pWn({pluginId:g.plugin.id,enabled:!0}),filePath:E?.configWriteTarget?.filePath??null,expectedVersion:null,reloadUserConfig:!0},()=>Sb(i,t).sendRequest(\`config/batchWrite\`,{edits:pWn({pluginId:g.plugin.id,enabled:!0}),filePath:E?.configWriteTarget?.filePath??null,expectedVersion:null,reloadUserConfig:!0}))`);
     edit(data, "let e=await vO.safeGet(`/wham/profiles/me`)",
-      `let e=await ${BRIDGE}.request("profile","profile.statistics",{},()=>vO.safeGet(\`/wham/profiles/me\`))`);
+      `let __twNativeProfile=await vO.safeGet(\`/wham/profiles/me\`);let e=await ${BRIDGE}.request("profile","profile.statistics",{native:__twNativeProfile},()=>__twNativeProfile)`);
     edit(data, "let e=await vO.safeGet(`/wham/usage`,{additionalHeaders:{\"OAI-App-Brand\":mO.toLowerCase()}})",
       `let e=await ${BRIDGE}.usage(await vO.safeGet(\`/wham/usage\`,{additionalHeaders:{"OAI-App-Brand":mO.toLowerCase()}}))`);
     edit(data, "function C5i(){return vO.safeGet(`/wham/rate-limit-reset-credits`)}",
@@ -313,7 +329,7 @@ export function patchCodexAccountsNativeSources(
       edit(ui, `defaultMessage:\`${original}\``, `defaultMessage:${BRIDGE}.project("usage","depleted-message",${JSON.stringify(original)})`);
     }
     edit("profile-108e93a1eff6.js", "className:`flex flex-col items-center`,children:xt",
-      `className:\`flex flex-col items-center\`,children:${BRIDGE}.render("profile",xt,{jsx:$.jsx,react:Q})`);
+      `className:\`flex flex-col items-center\`,children:[xt,${BRIDGE}.render("profile",null,{jsx:$.jsx,react:Q})]`);
     // The native Apps and Plugins browser shares this page. Each selector gets
     // its own account binding; the native list components and actions stay put.
     edit("plugins-page-71720e4235f5.js", "className:`flex h-full min-h-0 flex-col`,children:[_l,yl]",
@@ -340,12 +356,12 @@ export function patchCodexAccountsNativeInExtractedApp(appDir: string, previousR
   const assetsDir = join(appDir, "webview", "assets");
   const sources = new Map<string, string>();
   if (existsSync(assetsDir)) for (const name of readdirSync(assetsDir)) {
-    if (!/^(app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-.*\.js$/.test(name)) continue;
+    if (!/^(app-initial|app-shared|app-primary|profile|plugins-page|plugins-settings|page|mcp-settings|local-conversation-thread|apps-availability)-.*\.js$/.test(name)) continue;
     sources.set(PREFIX + name, readFileSync(join(assetsDir, name), "utf8"));
   }
   const mainDir = join(appDir, ".vite", "build");
   if (existsSync(mainDir)) for (const name of readdirSync(mainDir)) {
-    if (/^(main|src)-[^/]+\.js$/.test(name)) sources.set(`.vite/build/${name}`, readFileSync(join(mainDir, name), "utf8"));
+    if (/^(main|src|application-network-startup)-[^/]+\.js$/.test(name)) sources.set(`.vite/build/${name}`, readFileSync(join(mainDir, name), "utf8"));
   }
   const prepared = patchCodexAccountsNativeSources(sources, previousRecord);
   if (prepared.changed) for (const [path, source] of prepared.sources) {
@@ -418,6 +434,10 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
     if (key[0] === "profile" && key[1] === "usage") return "profile";
     if (key[0] === "rate-limit-reset-credits") return "usage";
     if (key[0] === "rate-limit-status") return "usage";
+    if (key[0] === "consumer-task-usage-v2") return "usage";
+    if (key[0] === "consumer-plan-limit-history") return "usage";
+    if (key[0] === "usage-settings" && key[1] === "usage-billing"
+      && (key[2] === "personal-history" || key[2] === "credit-history")) return "usage";
     if (key[0] === "apps") return "apps";
     if (key[0] === "plugins") return null;
     if (key[0] === "mcp") return "mcp";
@@ -488,6 +508,12 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       return context.jsx(NativeSlot, { surface, original, context: { ...context, react } });
     },
     react() { return nativeReact; },
+    subscribe(surface: string, listener: () => void) {
+      if (!initialized) return () => {};
+      return transport.subscribe((event: any) => {
+        if (event.surface === null || event.surface === surface) listener();
+      });
+    },
     capture,
     mutationScope,
     scopedKey(surface: string, key: unknown[]) {
@@ -540,6 +566,27 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
     },
     isCurrent(captured: any) { return captured === undefined || (captured ? current(captured.surface, captured) : !status()); },
     ensure(captured: any) { if (captured ? !current(captured.surface, captured) : captured === null && status()) throw stale(); },
+    oauthResultCapture(result: any, fallback: any) { return result && typeof result === "object" && oauthResults.has(result) ? oauthResults.get(result) : fallback; },
+    async awaitCaptured(captured: any, run: () => unknown) {
+      bridge.ensure(captured);
+      const result = await run();
+      bridge.ensure(captured);
+      return result;
+    },
+    boundQueryClient(captureScope: () => any, client: any) {
+      const guarded = new Set(["getQueryData", "setQueryData", "invalidateQueries", "cancelQueries", "fetchQuery"]);
+      return new Proxy(client, { get(target, key) {
+        const member = Reflect.get(target, key);
+        if (typeof member !== "function") return member;
+        if (!guarded.has(String(key))) return member.bind(target);
+        return (...args: any[]) => {
+          const captured = captureScope();
+          bridge.ensure(captured);
+          const result: any = Reflect.apply(member, target, args);
+          return result && typeof result.then === "function" ? Promise.resolve(result).then(value => { bridge.ensure(captured); return value; }) : result;
+        };
+      } });
+    },
     oauthResultCurrent(result: any) { const captured = result && typeof result === "object" ? oauthResults.get(result) : null; return !captured || current("apps", captured); },
     request,
     options(options: any) {
@@ -633,6 +680,7 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       try { return transport.project(surface, kind, input); } catch { return input; }
     },
     usage(native: unknown) { return request("usage", "usage.status", { native }, () => native); },
+    analytics(params: unknown, fallback: () => unknown) { return request("usage", "usage.analytics.read", params, fallback); },
     signalEpoch(atom: any) {
       const epoch = atom(0);
       epoch.onMount = (set: any) => initialized ? transport.subscribe(() => set((n: number) => n + 1)) : undefined;

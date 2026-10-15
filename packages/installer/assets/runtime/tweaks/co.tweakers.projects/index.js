@@ -283,20 +283,51 @@ function atomicWrite(fs, dir, target, bytes) {
   }
 }
 
+const nativeProjectCache = new Map();
+const MAX_NATIVE_STATE_BYTES = 64 * 1024 * 1024;
+
 function readNativeLocalProjects(env = process.env) {
   const fs = require("node:fs");
   const path = require("node:path");
+  let file;
   try {
     const codexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()
       ? env.CODEX_HOME.trim()
       : path.join(env.HOME || "", ".codex");
     if (!path.isAbsolute(codexHome)) return [];
-    const file = path.join(codexHome, ".codex-global-state.json");
+    file = path.join(codexHome, ".codex-global-state.json");
     const stat = fs.lstatSync(file);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8 * 1024 * 1024) return [];
-    return normalizeNativeLocalProjects(JSON.parse(fs.readFileSync(file, "utf8")));
+    if (!stat.isFile() || stat.isSymbolicLink()) return [];
+    const cached = nativeProjectCache.get(file);
+    if (stat.size > MAX_NATIVE_STATE_BYTES) {
+      if (!cached?.warned) console.warn(`Projects: native state exceeds ${MAX_NATIVE_STATE_BYTES} bytes; retaining last good projection`);
+      nativeProjectCache.set(file, { ...cached, projects: cached?.projects || [], warned: true });
+      return cached?.projects || [];
+    }
+    const revision = `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    if (cached?.revision === revision || cached?.pendingRevision === revision || cached?.failedRevision === revision) return cached.projects;
+    const accept = (contents) => normalizeNativeLocalProjects(JSON.parse(contents));
+    // Seed once at startup. Later changes are parsed off the request path so
+    // a large native registry does not block each Projects get/observation.
+    if (!cached) {
+      const projects = accept(fs.readFileSync(file, "utf8"));
+      nativeProjectCache.set(file, { revision, projects });
+      return projects;
+    }
+    cached.pendingRevision = revision;
+    void fs.promises.readFile(file, "utf8").then((contents) => {
+      const current = fs.lstatSync(file);
+      if (`${current.dev}:${current.ino}:${current.mtimeMs}:${current.size}` !== revision) return;
+      cached.projects = accept(contents);
+      cached.revision = revision;
+      cached.failedRevision = null;
+    }).catch((error) => {
+      cached.failedRevision = revision;
+      console.warn(`Projects: native state refresh failed (${error?.code || "invalid-data"}); retaining last good projection`);
+    }).finally(() => { if (cached.pendingRevision === revision) cached.pendingRevision = null; });
+    return cached.projects;
   } catch {
-    return [];
+    return nativeProjectCache.get(file)?.projects || [];
   }
 }
 
@@ -539,24 +570,41 @@ function mergeLegacyAssignments(projectState, legacy) {
 function bindNativeProjectIdentities(state, nativeProjects) {
   if (!state?.nodes) return state;
   const runtimeState = clone(state);
+  const native = (Array.isArray(nativeProjects) ? nativeProjects : []).filter(isRecord);
+  const currentNativeIds = new Set(native.map((project) => project.id));
+  const nonProjectIds = new Set(runtimeState.nodes.filter((node) => node.type !== "project").map((node) => node.id));
+  const nativeIdsByPath = new Map();
+  for (const project of native) {
+    for (const rootPath of [...(Array.isArray(project.rootPaths) ? project.rootPaths : []), ...(Array.isArray(project.rootPathAliases) ? project.rootPathAliases : [])]) {
+      const owners = nativeIdsByPath.get(rootPath) || new Set();
+      owners.add(project.id);
+      nativeIdsByPath.set(rootPath, owners);
+    }
+  }
   const projectsByPath = new Map();
   for (const node of runtimeState.nodes) {
     delete node.nativeProjectIds;
     delete node.nativeProjectNames;
     delete node.nativeProjectPaths;
-    if (node.type !== "project" || !node.projectPath) continue;
+    // A current native-ID owner cannot acquire another native ID merely
+    // because both projects use the same root. Path matching is legacy-only.
+    if (node.type !== "project" || !node.projectPath || currentNativeIds.has(node.id)) continue;
     const matches = projectsByPath.get(node.projectPath) || [];
     matches.push(node);
     projectsByPath.set(node.projectPath, matches);
   }
-  for (const nativeProject of Array.isArray(nativeProjects) ? nativeProjects : []) {
-    const matches = new Set();
+  for (const nativeProject of native) {
+    if (nonProjectIds.has(nativeProject.id)) continue;
+    const matches = new Set(runtimeState.nodes.filter((node) => node.type === "project" && node.id === nativeProject.id));
     const identityPaths = [
       ...(Array.isArray(nativeProject?.rootPaths) ? nativeProject.rootPaths : []),
       ...(Array.isArray(nativeProject?.rootPathAliases) ? nativeProject.rootPathAliases : []),
     ];
-    for (const rootPath of identityPaths) {
-      for (const project of projectsByPath.get(rootPath) || []) matches.add(project);
+    if (matches.size === 0) {
+      for (const rootPath of identityPaths) {
+        if (nativeIdsByPath.get(rootPath)?.size !== 1) continue;
+        for (const project of projectsByPath.get(rootPath) || []) matches.add(project);
+      }
     }
     if (matches.size !== 1) continue;
     const [project] = matches;
@@ -568,6 +616,37 @@ function bindNativeProjectIdentities(state, nativeProjects) {
     ])];
   }
   return runtimeState;
+}
+
+/** Discover additions without changing saved appearances, order, or disk state.
+ * New nodes use the native ID, so equal labels and registry reorder cannot
+ * change their identity. Unbound legacy names remain ambiguous until repaired. */
+function reconcileNativeProjectDiscovery(state, nativeProjects) {
+  const next = normalizeState(state);
+  const native = Array.isArray(nativeProjects) ? nativeProjects : [];
+  const currentNativeIds = new Set(native.filter(isRecord).map((project) => project.id));
+  const bound = bindNativeProjectIdentities(next, native);
+  const represented = new Set(bound.nodes.filter((node) => node.type === "project")
+    .flatMap((node) => [node.id, ...(node.nativeProjectIds || [])]));
+  const ids = new Set(next.nodes.map((node) => node.id));
+  for (const candidate of native) {
+    if (!isRecord(candidate) || represented.has(candidate.id) || ids.has(candidate.id)
+      || next.nodes.length >= MAX_NODES) continue;
+    if (next.nodes.some((node) => node.type === "project" && !node.projectPath && !currentNativeIds.has(node.id)
+      && projectNativeNames(node).includes(candidate.name))) continue;
+    try {
+      const id = safeId(candidate.id);
+      const seeded = seedProjectsFromNativeRegistry([candidate]).nodes[0];
+      if (!seeded) continue;
+      const node = normalizeState({ schemaVersion: 1, nodes: [{ ...seeded, id }] }).nodes[0];
+      next.nodes.push(node);
+      ids.add(id);
+      represented.add(id);
+    } catch {
+      // An invalid native entry must not discard the last usable projection.
+    }
+  }
+  return next;
 }
 
 function projectNativeNames(project) {
@@ -722,6 +801,7 @@ module.exports = {
   updateChromeProfileAssignment,
   mergeLegacyAssignments,
   bindNativeProjectIdentities,
+  reconcileNativeProjectDiscovery,
   projectNativeNames,
   projectForNativeIdentity,
   seedProjectsFromNativeSurface,
@@ -1619,6 +1699,7 @@ const {
   mergeLegacyProjectColors,
   readLegacyProjectColorPreferences,
   readNativeLocalProjects,
+  reconcileNativeProjectDiscovery,
   seedProjectsFromNativeRegistry,
 } = require("./state");
 const {
@@ -1716,13 +1797,17 @@ function createProjectService(api, dependencies = {}) {
       try {
         switch (message?.action) {
           case "get": {
+            const nativeProjects = readNative();
+            // Discovery is an in-memory projection. Only the existing explicit
+            // save path writes additions and their selected appearance.
+            replaceObject(state, reconcileNativeProjectDiscovery(state, nativeProjects));
             const publicState = require("./state").normalizeState(state);
             return {
               ok: true,
               state: clone(publicState),
               revision: revisionForState(publicState),
               storageStatus,
-              nativeProjects: readNative(),
+              nativeProjects,
               connections: await getConnections(message?.refreshConnections === true),
             };
           }
@@ -2702,7 +2787,7 @@ function openBridgedProjectMenu(doc, request, context, handlers = {}) {
   const colorIcon = doc.createElement("span");
   colorIcon.className = "size-4 shrink-0 rounded-full ring-[0.5px] ring-border";
   colorIcon.style?.setProperty?.("background-color", context.project.color);
-  const colorTrigger = ownedProjectMenuItem(doc, "Project color", null, openColor, { icon: colorIcon, submenu: true });
+  const colorTrigger = ownedProjectMenuItem(doc, "Edit color / boldness", null, openColor, { icon: colorIcon, submenu: true });
   colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
   colorTrigger.setAttribute("aria-haspopup", "menu");
   colorTrigger[PROJECT_MENU_OPEN_SUBMENU] = openColor;
@@ -2780,7 +2865,7 @@ function interceptNativeProjectMenu(doc, nativeMenu, context, handlers = {}) {
     await handlers.saveAppearance?.(context.project.id, { taskSort });
     close();
   });
-  const colorTrigger = ownedProjectMenuItem(doc, "Project color", template, openColor, { submenu: true });
+  const colorTrigger = ownedProjectMenuItem(doc, "Edit color / boldness", template, openColor, { submenu: true });
   colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
   add(colorTrigger);
   const sortTrigger = ownedProjectMenuItem(doc, "Sort", template, openSort, { submenu: true });
@@ -2930,7 +3015,7 @@ function openProjectSettingsSubmenu(doc, nativeMenu, anchor, context, handlers =
     await handlers.saveAppearance?.(context.project.id, { taskSort });
     dispose();
   });
-  const colorTrigger = ownedProjectMenuItem(doc, "Project color", anchor, openColor, { submenu: true });
+  const colorTrigger = ownedProjectMenuItem(doc, "Edit color / boldness", anchor, openColor, { submenu: true });
   colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
   colorTrigger.setAttribute("aria-haspopup", "menu");
   const sortTrigger = ownedProjectMenuItem(doc, "Task sorting", anchor, openSort, { submenu: true });
@@ -3060,26 +3145,41 @@ function openNativeProjectEditDialog(project) {
     const container = closestProjectContainer(row) || row;
     const menuButton = [...(container?.querySelectorAll?.('button, [role="button"]') || [])]
       .find((node) => node !== row && (/more|menu|options/i.test(String(node.getAttribute?.("aria-label") || node.getAttribute?.("title") || "")) || !String(node.textContent || "").trim()));
-    if (!menuButton) { window.alert("Open this project's menu in the sidebar and choose Edit project."); return; }
+    if (!menuButton) return false;
     const clickEdit = () => {
       const item = [...document.querySelectorAll?.('[role="menuitem"], [role="menu"] button') || []]
-        .find((node) => /^Edit project$/i.test(String(node.textContent || "").replace(/\s+/g, " ").trim()));
+        .find((node) => /^Edit(?: project)?$/i.test(String(node.textContent || "").replace(/\s+/g, " ").trim()));
       if (!item) return false;
       item.click?.();
       return true;
     };
     menuButton.click?.();
-    if (clickEdit()) return;
+    if (clickEdit()) return true;
     const observer = new MutationObserver(() => { if (clickEdit()) observer.disconnect(); });
     observer.observe(document.body, { childList: true, subtree: true });
     window.setTimeout(() => observer.disconnect(), 1500);
+    return true;
   };
   const settingsMarker = document.querySelector?.("[data-settings-panel-slug]");
   let shell = settingsMarker;
   while (shell?.parentElement && !shell.querySelector?.('button[aria-label="Close"]')) shell = shell.parentElement;
   const close = shell?.querySelector?.('button[aria-label="Close"]');
-  if (close) { close.click?.(); window.setTimeout(finish, 50); }
-  else finish();
+  const home = settingsMarker && [...document.querySelectorAll?.('button, [role="button"]') || []]
+    .find((node) => /^Home$/i.test(String(node.getAttribute?.("aria-label") || node.textContent || "").trim()));
+  const navigate = close || home;
+  if (navigate) {
+    let timer;
+    const observer = new MutationObserver(() => {
+      if (finish()) { observer.disconnect(); window.clearTimeout(timer); }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    timer = window.setTimeout(() => {
+      observer.disconnect();
+      window.alert("Open this project's menu in the sidebar and choose Edit.");
+    }, 5000);
+    navigate.click?.();
+    if (finish()) { observer.disconnect(); window.clearTimeout(timer); }
+  } else if (!finish()) window.alert("Open this project's menu in the sidebar and choose Edit.");
 }
 
 function installProjectColorControls(api, getState, saveAppearance) {
@@ -3225,22 +3325,25 @@ function installProjectColorControls(api, getState, saveAppearance) {
 function resolveProjectContext(api, state, target) {
   if (!state?.nodes || !(target instanceof Element)) return null;
   const projects = state.nodes.filter((node) => node.type === "project").sort((a, b) => b.name.length - a.name.length);
-  const targetContainer = target.closest?.('[role="listitem"]');
+  const nonProjectIds = new Set(state.nodes.filter((node) => node.type !== "project").map((node) => node.id));
+  const targetContainer = target.closest?.('[data-app-action-sidebar-project-row]') || target.closest?.('[role="listitem"]');
   for (const match of api.react?.host?.query?.("projects") || []) {
     const element = match.element;
     if (!(element instanceof HTMLElement)) continue;
     const container = element.closest?.('[role="listitem"]') || element;
     if (!(element === target || element.contains(target) || target.contains?.(element) || (targetContainer && targetContainer === container))) continue;
     const identity = element.getAttribute?.("data-app-action-sidebar-project-id") || element.getAttribute?.("data-workspace-path") || element.getAttribute?.("data-project-path");
+    if (identity && nonProjectIds.has(identity)) return null;
     const project = unambiguousProjectForNativeIdentity(projects, projectLabelForRow(element), identity);
     if (project) return { project, element, container, source: "semantic" };
   }
   if (!(targetContainer instanceof HTMLElement)) return null;
-  const projectAction = targetContainer.querySelector?.("[data-app-action-sidebar-project-id]");
+  const projectAction = targetContainer.hasAttribute?.("data-app-action-sidebar-project-id") ? targetContainer : targetContainer.querySelector?.("[data-app-action-sidebar-project-id]");
   const donorRowShape = targetContainer.classList?.contains?.("group/cwd") || projectAction instanceof HTMLElement;
   if (!donorRowShape) return null;
   const label = projectLabelForRow(projectAction instanceof HTMLElement ? projectAction : targetContainer);
   const identity = projectAction?.getAttribute?.("data-app-action-sidebar-project-id") || targetContainer.getAttribute?.("data-workspace-path") || targetContainer.getAttribute?.("data-project-path");
+  if (identity && nonProjectIds.has(identity)) return null;
   const project = unambiguousProjectForNativeIdentity(projects, label, identity);
   if (!project) return null;
   return { project, element: projectAction instanceof HTMLElement ? projectAction : targetContainer, container: targetContainer, source: "live-row" };
@@ -3711,7 +3814,7 @@ function installProjectTaskControls(api, getState, saveProject) {
   };
 }
 
-function applyNativeProjectColors(api, state) {
+function applyNativeProjectColors(api, state, { layout = true } = {}) {
   if (!state?.nodes) return;
   clearNativeProjectColors();
   ensureProjectColorStyle();
@@ -3739,7 +3842,7 @@ function applyNativeProjectColors(api, state) {
     applyCollapsedProjectActiveCount(api, container, header, project);
   }
   applyPinnedProjectColors(api, projects);
-  applyUniformNativeRowSpacing();
+  if (layout) applyUniformNativeRowSpacing();
 }
 
 function collectProjectIdentities(value, out, depth = 0) {
@@ -3775,7 +3878,11 @@ function closestThreadRow(node) {
 }
 
 function visibleSectionHeading(doc, label) {
-  return [...(doc.querySelectorAll?.("h1, h2, h3, div, span") || [])]
+  const navigation = [...(doc.querySelectorAll?.("nav, aside, [role=\"navigation\"]") || [])];
+  const headings = navigation.length
+    ? navigation.flatMap((scope) => [...(scope.querySelectorAll?.("h1, h2, h3, div, span") || [])])
+    : [...(doc.querySelectorAll?.("h1, h2, h3, div, span") || [])];
+  return headings
     .filter((node) => String(node.textContent || "").replace(/\s+/g, " ").trim() === label)
     .map((node) => ({ node, rect: node.getBoundingClientRect?.() }))
     .filter(({ rect }) => rect && Number.isFinite(rect.top) && (rect.height === undefined || rect.height > 0))
@@ -3907,13 +4014,37 @@ function applyCollapsedProjectActiveCount(api, group, header, project) {
   host.setAttribute("data-tweaker-project-active-count", String(count > 99 ? "99+" : count));
 }
 
-function measureNativeProjectRowGap(groups) {
+function createProjectLayoutPass() {
+  const rects = new Map();
+  const writes = [];
+  return {
+    rect(node) {
+      if (!rects.has(node)) rects.set(node, node?.getBoundingClientRect?.());
+      return rects.get(node);
+    },
+    style(node, name, value) {
+      writes.push(() => {
+        if (node?.style?.getPropertyValue?.(name) === value) return;
+        if (value) node?.style?.setProperty?.(name, value);
+        else node?.style?.removeProperty?.(name);
+      });
+    },
+    attribute(node, name, value) {
+      writes.push(() => {
+        if (node?.getAttribute?.(name) !== value) node?.setAttribute?.(name, value);
+      });
+    },
+    commit() { for (const write of writes) write(); },
+  };
+}
+
+function measureNativeProjectRowGap(groups, pass = createProjectLayoutPass()) {
   const gaps = [];
   const nodes = [...groups].filter((node) => node?.getBoundingClientRect && node.parentElement);
   for (let index = 1; index < nodes.length; index += 1) {
     if (nodes[index - 1].parentElement !== nodes[index].parentElement) continue;
-    const previous = nodes[index - 1].getBoundingClientRect();
-    const current = nodes[index].getBoundingClientRect();
+    const previous = pass.rect(nodes[index - 1]);
+    const current = pass.rect(nodes[index]);
     const gap = current.top - previous.bottom;
     if (Number.isFinite(gap) && gap > 0 && gap <= 32) gaps.push(gap);
   }
@@ -3927,10 +4058,10 @@ function median(values) {
   return sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
 }
 
-function visibleProjectTaskRows(group) {
+function visibleProjectTaskRows(group, pass = createProjectLayoutPass()) {
   return [...(group?.querySelectorAll?.("[data-tweaker-project-color-task]") || [])]
     .filter((row) => {
-      const rect = row.getBoundingClientRect?.();
+      const rect = pass.rect(row);
       return rect && rect.width > 0 && rect.height > 0;
     });
 }
@@ -3944,16 +4075,16 @@ function projectNavigationForNode(node) {
   return null;
 }
 
-function nativeProjectsHeadingInset(group, navigationRect, headerRect) {
+function nativeProjectsHeadingInset(group, navigationRect, headerRect, pass) {
   const documentRef = group?.ownerDocument || (typeof document === "object" ? document : null);
   if (!documentRef?.querySelectorAll) return 0;
   const navigationRight = Number.isFinite(navigationRect.right)
     ? navigationRect.right
     : navigationRect.left + navigationRect.width;
   const headerTop = Number.isFinite(headerRect.top) ? headerRect.top : Number.POSITIVE_INFINITY;
-  const candidates = [...documentRef.querySelectorAll("h1, h2, h3, div, span")]
+  const candidates = [...((projectNavigationForNode(group) || group.parentElement || group).querySelectorAll?.("h1, h2, h3, div, span") || [])]
     .filter((node) => String(node.textContent || "").replace(/\s+/g, " ").trim() === "Projects")
-    .map((node) => node.getBoundingClientRect?.())
+    .map((node) => pass.rect(node))
     .filter((rect) => rect && Number.isFinite(rect.left) && rect.left >= navigationRect.left && rect.left < navigationRight)
     .filter((rect) => (rect.height === undefined || rect.height > 0) && (!Number.isFinite(rect.top) || rect.top <= headerTop))
     .map((rect) => ({
@@ -3965,35 +4096,37 @@ function nativeProjectsHeadingInset(group, navigationRect, headerRect) {
   return candidates[0]?.inset || 0;
 }
 
-function measureNativeProjectRowEndInset(group, header) {
+function measureNativeProjectRowEndInset(group, header, pass = createProjectLayoutPass()) {
   const navigation = projectNavigationForNode(group);
-  const navigationRect = navigation?.getBoundingClientRect?.();
-  const headerRect = header?.getBoundingClientRect?.();
+  const navigationRect = pass.rect(navigation);
+  const headerRect = pass.rect(header);
   if (!navigationRect || !headerRect) return 0;
   const navigationWidth = Number.isFinite(navigationRect.width)
     ? navigationRect.width
     : navigationRect.right - navigationRect.left;
   const headerInset = headerRect.left - navigationRect.left;
-  const inset = headerInset > 0 ? headerInset : nativeProjectsHeadingInset(group, navigationRect, headerRect);
+  const inset = headerInset > 0 ? headerInset : nativeProjectsHeadingInset(group, navigationRect, headerRect, pass);
   if (!Number.isFinite(navigationWidth) || navigationWidth <= 0 || !Number.isFinite(inset) || inset <= 0) return 0;
   return Math.min(inset, MAX_PROJECT_ROW_END_INSET, navigationWidth / 4);
 }
 
-function applyProjectGroupEndInset(group, header) {
-  const inset = measureNativeProjectRowEndInset(group, header);
-  if (inset > 0) group.style?.setProperty?.("--tweaker-project-row-end-inset", `${inset}px`);
-  else group.style?.removeProperty?.("--tweaker-project-row-end-inset");
+function applyProjectGroupEndInset(group, header, pass = null) {
+  const ownPass = !pass;
+  pass ||= createProjectLayoutPass();
+  const inset = measureNativeProjectRowEndInset(group, header, pass);
+  pass.style(group, "--tweaker-project-row-end-inset", inset > 0 ? `${inset}px` : "");
+  if (ownPass) pass.commit();
   return inset;
 }
 
-function measureNativeProjectRowGeometry(groups) {
-  const collapsed = groups.filter((group) => visibleProjectTaskRows(group).length === 0);
+function measureNativeProjectRowGeometry(groups, pass = createProjectLayoutPass()) {
+  const collapsed = groups.filter((group) => visibleProjectTaskRows(group, pass).length === 0);
   const references = collapsed.length >= 2 ? collapsed : groups;
   const headers = references.map((group) => group.querySelector?.("[data-tweaker-project-color-row]"))
     .filter((row) => row?.getBoundingClientRect)
-    .map((row) => row.getBoundingClientRect())
+    .map((row) => pass.rect(row))
     .filter((rect) => rect.width > 0 && rect.height > 0);
-  let gap = measureNativeProjectRowGap(collapsed.length >= 2 ? collapsed : groups);
+  let gap = measureNativeProjectRowGap(collapsed.length >= 2 ? collapsed : groups, pass);
   if (gap === null && references[0]?.parentElement && typeof getComputedStyle === "function") {
     const computed = getComputedStyle(references[0].parentElement);
     const value = Number.parseFloat(computed.rowGap || computed.gap);
@@ -4006,38 +4139,115 @@ function measureNativeProjectRowGeometry(groups) {
   };
 }
 
-function applyProjectTaskGeometry(group, header, geometry) {
-  const headerRect = header?.getBoundingClientRect?.();
+function applyProjectTaskGeometry(group, header, geometry, pass = null) {
+  const ownPass = !pass;
+  pass ||= createProjectLayoutPass();
+  const headerRect = pass.rect(header);
   if (!headerRect || headerRect.width <= 0 || headerRect.height <= 0) return;
   const rows = [...(group.querySelectorAll?.("[data-tweaker-project-color-task], [data-tweaker-project-show-more]") || [])];
   for (const row of rows) {
-    const rect = row.getBoundingClientRect?.();
-    const offset = rect && rect.width > 0 ? headerRect.left - rect.left : 0;
-    row.style?.setProperty?.("--tweaker-project-native-row-block-size", `${geometry.blockSize || headerRect.height}px`);
-    row.style?.setProperty?.("--tweaker-project-native-row-inline-size", `${geometry.inlineSize || headerRect.width}px`);
-    row.style?.setProperty?.("--tweaker-project-native-row-offset", `${offset}px`);
+    const rect = pass.rect(row);
+    const previousOffset = Number.parseFloat(row.style?.getPropertyValue?.("--tweaker-project-native-row-offset")) || 0;
+    const offset = rect && rect.width > 0 ? previousOffset + headerRect.left - rect.left : 0;
+    pass.style(row, "--tweaker-project-native-row-block-size", `${geometry.blockSize || headerRect.height}px`);
+    pass.style(row, "--tweaker-project-native-row-inline-size", `${geometry.inlineSize || headerRect.width}px`);
+    pass.style(row, "--tweaker-project-native-row-offset", `${offset}px`);
   }
   const lists = [...(group.querySelectorAll?.('[role="list"]') || [])];
-  for (const list of lists) list.setAttribute?.("data-tweaker-project-spacing-list", "true");
+  for (const list of lists) pass.attribute(list, "data-tweaker-project-spacing-list", "true");
   if (!lists.length) {
-    for (const row of rows) row.setAttribute?.("data-tweaker-project-fallback-spacing", "true");
+    for (const row of rows) pass.attribute(row, "data-tweaker-project-fallback-spacing", "true");
   }
+  if (ownPass) pass.commit();
 }
 
 function applyUniformNativeRowSpacing() {
+  const pass = createProjectLayoutPass();
+  let insetChanged = false;
   const groups = [...(document.querySelectorAll?.("[data-tweaker-project-color-group]") || [])]
-    .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    .sort((a, b) => pass.rect(a).top - pass.rect(b).top);
   for (const group of groups) {
     const header = group.querySelector?.("[data-tweaker-project-color-row]");
-    applyProjectGroupEndInset(group, header);
+    const before = group.style?.getPropertyValue?.("--tweaker-project-row-end-inset") || "";
+    const inset = applyProjectGroupEndInset(group, header, pass);
+    insetChanged ||= before !== (inset > 0 ? `${inset}px` : "");
   }
-  const geometry = measureNativeProjectRowGeometry(groups);
+  const geometry = measureNativeProjectRowGeometry(groups, pass);
   const gapValue = geometry.gap === null ? "var(--spacing-px, 1px)" : `${geometry.gap}px`;
-  document.documentElement?.style?.setProperty?.("--tweaker-project-native-row-gap", gapValue);
+  pass.style(document.documentElement, "--tweaker-project-native-row-gap", gapValue);
   for (const group of groups) {
     const header = group.querySelector?.("[data-tweaker-project-color-row]");
-    applyProjectTaskGeometry(group, header, geometry);
+    applyProjectTaskGeometry(group, header, geometry, pass);
   }
+  pass.commit();
+  return insetChanged;
+}
+
+// Host notifications include our own attribute writes. Compare only native
+// sidebar state, including node identity, before doing any layout work.
+function createProjectSidebarUpdater(api, getState) {
+  let disposed = false;
+  let frame = null;
+  let force = false;
+  let layoutOnly = false;
+  let previous = null;
+  let nextId = 0;
+  const ids = new WeakMap();
+  const identity = (node) => {
+    if (!ids.has(node)) ids.set(node, ++nextId);
+    return ids.get(node);
+  };
+  const snapshot = () => {
+    const rows = new Set((api.react?.host?.query?.("projects") || []).map((match) => match.element).filter(Boolean));
+    for (const row of document.querySelectorAll?.('[data-app-action-sidebar-project-id], [data-app-action-sidebar-thread-pinned="true"], [data-tweaker-project-color-row]') || []) rows.add(row);
+    const parts = [document.documentElement?.className || "", document.documentElement?.style?.fontSize || "", rows.size];
+    for (const row of rows) {
+      parts.push(identity(row), identity(row.parentElement || row), row.childElementCount || 0,
+        row.getAttribute?.("data-app-action-sidebar-project-id") || "",
+        row.getAttribute?.("data-workspace-path") || "",
+        row.getAttribute?.("aria-expanded") || "",
+        row.getAttribute?.("aria-selected") || "",
+        row.getAttribute?.("data-state") || "",
+        String(projectLabelForRow(row) || "").slice(0, 160));
+    }
+    return parts.join("\u001f");
+  };
+  const schedule = (changed = false, geometry = false) => {
+    if (disposed) return;
+    force ||= changed;
+    layoutOnly ||= geometry;
+    if (frame !== null) return;
+    frame = requestAnimationFrame(() => {
+      frame = null;
+      if (disposed) return;
+      const current = snapshot();
+      const appearance = force || current !== previous;
+      const measure = appearance || layoutOnly;
+      force = layoutOnly = false;
+      if (appearance) applyNativeProjectColors(api, getState(), { layout: false });
+      const insetChanged = measure && applyUniformNativeRowSpacing();
+      previous = current;
+      resize.sync();
+      if (insetChanged) schedule(false, true);
+    });
+  };
+  const resize = installProjectSidebarResizeObserver(() => schedule(false, true));
+  const onResize = () => schedule(false, true);
+  window.addEventListener?.("resize", onResize);
+  window.visualViewport?.addEventListener?.("resize", onResize);
+  document.fonts?.addEventListener?.("loadingdone", onResize);
+  return {
+    schedule,
+    dispose() {
+      disposed = true;
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = null;
+      resize.dispose();
+      window.removeEventListener?.("resize", onResize);
+      window.visualViewport?.removeEventListener?.("resize", onResize);
+      document.fonts?.removeEventListener?.("loadingdone", onResize);
+    },
+  };
 }
 
 function installProjectSidebarResizeObserver(onResize) {
@@ -4053,8 +4263,15 @@ function installProjectSidebarResizeObserver(onResize) {
     scheduledWithAnimationFrame = false;
     if (!disposed) onResize();
   };
-  const observer = new ResizeObserver(() => {
-    if (disposed || scheduled !== null) return;
+  const sizes = new WeakMap();
+  const observer = new ResizeObserver((entries) => {
+    const changed = !entries || entries.map((entry) => {
+      const size = `${entry.contentRect?.width}:${entry.contentRect?.height}`;
+      if (sizes.get(entry.target) === size) return false;
+      sizes.set(entry.target, size);
+      return true;
+    }).some(Boolean);
+    if (!changed || disposed || scheduled !== null) return;
     if (typeof requestAnimationFrame === "function") {
       scheduledWithAnimationFrame = true;
       scheduled = requestAnimationFrame(run);
@@ -4069,6 +4286,8 @@ function installProjectSidebarResizeObserver(onResize) {
       for (const group of document.querySelectorAll?.("[data-tweaker-project-color-group]") || []) {
         const navigation = projectNavigationForNode(group);
         if (navigation) next.add(navigation);
+        const header = group.querySelector?.("[data-tweaker-project-color-row]");
+        if (header) next.add(header);
       }
       for (const navigation of observed) {
         if (!next.has(navigation)) observer.unobserve?.(navigation);
@@ -4139,6 +4358,7 @@ function closestProjectContainer(row) {
   let cursor = row;
   let listItem = null;
   while (cursor) {
+    if (cursor.hasAttribute?.("data-app-action-sidebar-project-row")) return cursor;
     if (cursor.classList?.contains?.("group/cwd")) return cursor;
     if (!listItem && cursor.getAttribute?.("role") === "listitem") listItem = cursor;
     if (cursor.tagName === "NAV" || cursor.tagName === "ASIDE" || cursor.getAttribute?.("role") === "navigation") return listItem;
@@ -4241,7 +4461,7 @@ function hasNativeSelectionAttribute(element) {
 }
 
 function projectLabelForRow(row) {
-  return (row?.getAttribute?.("data-project-name") || row?.getAttribute?.("aria-label") || row?.getAttribute?.("title") || row?.textContent || "").replace(/\s+/g, " ").trim();
+  return (row?.getAttribute?.("data-app-action-sidebar-project-label") || row?.getAttribute?.("data-project-name") || row?.getAttribute?.("aria-label") || row?.getAttribute?.("title") || row?.textContent || "").replace(/\s+/g, " ").trim();
 }
 
 function projectColorForeground(color) {
@@ -4361,7 +4581,10 @@ module.exports = {
   measureNativeProjectRowEndInset,
   applyProjectGroupEndInset,
   applyProjectTaskGeometry,
+  createProjectLayoutPass,
+  applyUniformNativeRowSpacing,
   installProjectSidebarResizeObserver,
+  createProjectSidebarUpdater,
   nativeProjectMatches,
   projectColorForeground,
   clearNativeProjectColors,
@@ -4590,24 +4813,10 @@ function renderState(openNativeProjectEditDialog, api, root, response, reload, v
   actions.append(button("Add group", () => addNode(api, state, "group", reload, revision)), button("Add project", () => addNode(api, state, "project", reload, revision)));
   heading.append(actions);
   root.append(heading);
-  const overview = element("div", "mt-4 grid grid-cols-1 gap-2");
-  for (const project of state.nodes.filter((node) => node.type === "project")) {
-    const card = button("", () => view.selectProject?.(project.id));
-    card.className = "border-token-border hover:bg-token-foreground/5 flex w-full items-center gap-3 rounded-lg border p-3 text-left cursor-interaction";
-    const swatch = element("span", "size-3 shrink-0 rounded-full");
-    swatch.style.backgroundColor = project.color;
-    const copy = element("span", "flex min-w-0 flex-1 flex-col gap-1");
-    copy.append(element("span", "truncate text-sm font-medium text-token-text-primary", project.name));
-    copy.append(element("span", "truncate text-sm text-token-text-secondary", project.projectPath || "Needs folder repair — open to repair"));
-    card.append(swatch, copy, element("span", "text-token-text-secondary", "›"));
-    overview.append(card);
-  }
-  if (!overview.childElementCount) overview.append(element("div", "text-sm text-token-text-secondary", "No projects yet."));
-  root.append(overview, settingsSectionTitle("Available connections", "Local adapters that can be assigned to projects."), connectionCard(response.connections));
   const tree = element("div", "border-token-border mt-4 rounded-lg border");
-  renderChildren(api, tree, state, null, response.connections, reload, 0, revision);
+  renderChildren(api, tree, state, null, response.connections, reload, 0, revision, { selectProject: view.selectProject, openNativeProjectEditDialog });
   if (!state.nodes.length) tree.append(element("div", "p-3 text-sm text-token-text-secondary", "No projects yet."));
-  root.append(tree);
+  root.append(tree, settingsSectionTitle("Available connections", "Local adapters that can be assigned to projects."), connectionCard(response.connections));
 }
 
 function settingsSectionTitle(title, description) {
@@ -4791,7 +5000,7 @@ function connectionCard(connections) {
   return card;
 }
 
-function renderChildren(api, root, state, parentId, connections, reload, depth, revision) {
+function renderChildren(api, root, state, parentId, connections, reload, depth, revision, navigation = {}) {
   const siblings = state.nodes.filter((item) => item.parentId === parentId);
   for (const [siblingIndex, node] of siblings.entries()) {
     const row = element("div", "flex items-center gap-3 p-3");
@@ -4801,8 +5010,12 @@ function renderChildren(api, root, state, parentId, connections, reload, depth, 
     icon.setAttribute("role", "img");
     icon.setAttribute("aria-label", node.icon.kind === "emoji" ? "Project icon" : `Iconify ${node.icon.value}`);
     if (node.icon.kind === "iconify") { icon.classList.add("iconify"); icon.dataset.icon = node.icon.value; }
-    row.append(icon, element("span", "min-w-0 flex-1 truncate text-sm text-token-text-primary", node.name));
-    row.append(button("Edit", () => editNode(api, state, node, reload, revision)));
+    const name = node.type === "project" ? button(node.name, () => navigation.selectProject?.(node.id)) : element("span", "", node.name);
+    name.className = "min-w-0 flex-1 truncate text-left text-sm text-token-text-primary";
+    row.append(icon, name);
+    row.append(button("Edit", () => node.type === "project"
+      ? navigation.openNativeProjectEditDialog?.(node)
+      : editNode(api, state, node, reload, revision)));
     const up = button("↑", () => moveNode(api, state, siblings, siblingIndex, -1, reload, revision));
     up.title = `Move ${node.name} up`;
     up.disabled = siblingIndex === 0;
@@ -4829,7 +5042,7 @@ function renderChildren(api, root, state, parentId, connections, reload, depth, 
       }
     }
     root.append(row);
-    if (node.type === "group") renderChildren(api, root, state, node.id, connections, reload, depth + 1, revision);
+    if (node.type === "group") renderChildren(api, root, state, node.id, connections, reload, depth + 1, revision, navigation);
   }
 }
 
@@ -5030,6 +5243,35 @@ function projectForEditDialog(api, state, dialog) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+function exactNamedProject(projects, name) {
+  if (typeof name !== "string" || !name.trim()) return null;
+  const matches = projects.filter((node) => projectNativeNames(node).includes(name.trim()));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function projectForNativeSave(api, state, form, nativeId, fallback) {
+  if (typeof nativeId !== "string" || !nativeId || !state?.nodes) return null;
+  const projects = state.nodes.filter((node) => node.type === "project");
+  const exact = projects.filter((node) => node.id === nativeId || node.nativeProjectIds?.includes(nativeId));
+  if (exact.length) return exact.length === 1 ? exact[0] : null;
+  // Legacy appearance records can have a different ID. Only the native
+  // form's own identity and original source folders can bridge that gap.
+  // Display names and edited input values cannot establish this binding.
+  let fiber = api.react?.getFiber?.(form) || null;
+  for (let depth = 0; fiber && depth < 30; depth += 1, fiber = fiber.return) {
+    const props = fiber.memoizedProps;
+    if (!isRecord(props) || props.projectId !== nativeId || !Array.isArray(props.initialSources)) continue;
+    const paths = props.initialSources.filter((source) => typeof source === "string" && source.length > 0);
+    const matches = projects.filter((node) => paths.some((path) => node.projectPath === path || node.nativeProjectPaths?.includes(path)));
+    return matches.length === 1 ? matches[0] : null;
+  }
+  // Isolated renderers may not expose React fibers. The exact native form
+  // can still own an appearance draft selected by a unique initial name.
+  // Keep that saved ID and recheck uniqueness, never use edited field values.
+  const named = exactNamedProject(projects, fallback?.initialName);
+  return named?.id === fallback?.id ? named : null;
+}
+
 function editProjectDialogCandidates(doc = document) {
   const candidates = new Set(doc.querySelectorAll?.('[role="dialog"], [data-radix-dialog-content], [data-state="open"]') || []);
   for (const heading of doc.querySelectorAll?.("h1, h2, h3, [role=\"heading\"]") || []) {
@@ -5044,33 +5286,81 @@ function editProjectDialogCandidates(doc = document) {
     }
   }
   const matching = [...candidates].filter((dialog) => {
-    const text = String(dialog.textContent || "").replace(/\s+/g, " ").trim();
+    const heading = [...(dialog.querySelectorAll?.('h1, h2, h3, [role="heading"]') || [])]
+      .some((node) => /^Edit project$/i.test(String(node.textContent || "").replace(/\s+/g, " ").trim()));
     const buttons = [...(dialog.querySelectorAll?.("button") || [])];
-    return /^Edit project\b/i.test(text) && buttons.some((node) => /^Save$/i.test(String(node.textContent || "").trim()));
+    return heading && buttons.some((node) => /^Save$/i.test(String(node.textContent || "").trim()));
   });
   return matching.filter((dialog) => !matching.some((other) => other !== dialog && other.contains?.(dialog)));
 }
 
 function dialogCloseButton(dialog) {
   const buttons = [...(dialog.querySelectorAll?.("button") || [])];
-  return buttons.find((node) => /^close$/i.test(String(node.getAttribute?.("aria-label") || node.getAttribute?.("title") || "").trim()))
+  return buttons.find((node) => /^close(?: dialog)?$/i.test(String(node.getAttribute?.("aria-label") || node.getAttribute?.("title") || "").trim()))
     || buttons.find((node) => !String(node.textContent || "").trim() && node.querySelector?.("svg")) || null;
 }
 
 function installEditProjectDialogControls(api, getState, saveAppearance, openSettingsProject) {
   if (typeof document === "undefined") return () => {};
-  const inject = () => {
-    for (const dialog of editProjectDialogCandidates(document)) {
+  let pending = null;
+  let disposed = false;
+  const dialogListeners = new Map();
+  const retryDrafts = new Map();
+  const inject = (candidates = editProjectDialogCandidates(document)) => {
+    if (disposed) return;
+    for (const [dialog, remove] of dialogListeners) {
+      if (dialog.isConnected !== false) continue;
+      remove();
+      dialogListeners.delete(dialog);
+    }
+    for (const dialog of candidates) {
       const project = projectForEditDialog(api, getState?.(), dialog);
       if (project && !dialog.querySelector?.("[data-tweaker-project-dialog-appearance]")) {
+        const nameInputs = [...(dialog.querySelectorAll?.("input") || [])]
+          .filter((input) => !input.type || input.type === "text");
+        const initialName = nameInputs.length === 1 ? nameInputs[0].value : null;
+        const initialOwner = exactNamedProject((getState?.()?.nodes || []).filter((node) => node.type === "project"), initialName);
+        const fallback = initialOwner?.id === project.id ? { id: project.id, initialName } : null;
         const section = element("section", "border-token-border bg-token-main-surface-primary mx-5 mb-4 flex flex-col rounded-lg border p-3");
         section.dataset.tweakerProjectDialogAppearance = "true";
-        section.append(projectAppearanceEditor(project, async (choice) => {
-          await saveAppearance?.(project.id, choice);
-          section.remove?.();
-          inject();
+        // The native dialog owns Save/Cancel. Keep appearance edits private to
+        // this dialog until Save, just like the native project fields.
+        const retryDraft = retryDrafts.get(project.id);
+        let changes = { ...(retryDraft || {}) };
+        let draft = { ...project, ...changes };
+        let saved = false;
+        const draw = () => section.replaceChildren(projectAppearanceEditor(draft, (choice) => {
+          changes = { ...changes, ...choice };
+          draft = { ...draft, ...choice };
+          draw();
         }));
+        draw();
         const save = [...(dialog.querySelectorAll?.("button") || [])].find((node) => /^Save$/i.test(String(node.textContent || "").trim()));
+        const form = dialog.matches?.("form") ? dialog : dialog.querySelector?.("form") || dialog.closest?.("form");
+        const onSave = (event) => {
+          if (disposed || saved || !Object.keys(changes).length || event.target !== form) return;
+          const nativeId = event.detail?.projectId;
+          const currentProject = projectForNativeSave(api, getState?.(), form, nativeId, fallback);
+          if (!currentProject || currentProject.id !== project.id) {
+            api.log?.warn?.("Project appearance save rejected: project identity unavailable or changed");
+            window.alert?.("Could not identify this project for its appearance change. Open Edit again to retry.");
+            return;
+          }
+          saved = true;
+          const submitted = { ...changes };
+          retryDrafts.set(project.id, submitted);
+          Promise.resolve(saveAppearance?.(currentProject.id, submitted)).then((result) => {
+            if (result !== false && retryDrafts.get(project.id) === submitted) retryDrafts.delete(project.id);
+          }).catch((error) => {
+            api.log?.warn?.("Project appearance save failed", String(error?.message || "unavailable"));
+            window.alert?.("Could not save project appearance. Open Edit again to retry your choices.");
+          });
+        };
+        form?.addEventListener?.("tweaker:project-save-succeeded", onSave);
+        dialogListeners.set(dialog, () => {
+          form?.removeEventListener?.("tweaker:project-save-succeeded", onSave);
+          if (!saved && retryDraft && retryDrafts.get(project.id) === retryDraft) retryDrafts.delete(project.id);
+        });
         const footer = save?.parentElement;
         if (footer?.parentElement) footer.parentElement.insertBefore(section, footer);
         else dialog.append(section);
@@ -5097,13 +5387,32 @@ function installEditProjectDialogControls(api, getState, saveAppearance, openSet
       }
     }
   };
-  const observer = new MutationObserver(inject);
+  const schedule = (records) => {
+    if (disposed || pending !== null) return;
+    const hasEditHeading = (node) => [node, ...(node.querySelectorAll?.('h1, h2, h3, [role="heading"]') || [])]
+      .some((heading) => heading.matches?.('h1, h2, h3, [role="heading"]')
+        && /^Edit project$/i.test(String(heading.textContent || "").replace(/\s+/g, " ").trim()));
+    const addedDialog = !Array.isArray(records) || records.some((record) => [...(record.addedNodes || [])].some((node) =>
+      node.nodeType === 1 && (node.matches?.('[role="dialog"], [data-radix-dialog-content], [data-state="open"]')
+        || node.querySelector?.('[role="dialog"], [data-radix-dialog-content], [data-state="open"]')
+        || hasEditHeading(node))));
+    if (!addedDialog) return;
+    pending = (window.requestAnimationFrame || ((callback) => window.setTimeout(callback, 16)))(() => {
+      pending = null;
+      inject();
+    });
+  };
+  const observer = new MutationObserver(schedule);
   observer.observe(document.body, { childList: true, subtree: true });
-  window.addEventListener("tweaker:projects-state-ready", inject);
+  window.addEventListener("tweaker:projects-state-ready", schedule);
   inject();
   return () => {
+    disposed = true;
     observer.disconnect();
-    window.removeEventListener("tweaker:projects-state-ready", inject);
+    for (const remove of dialogListeners.values()) remove();
+    dialogListeners.clear();
+    if (pending !== null) (window.cancelAnimationFrame || window.clearTimeout)?.(pending);
+    window.removeEventListener("tweaker:projects-state-ready", schedule);
     document.querySelectorAll?.("[data-tweaker-project-dialog-appearance], [data-tweaker-project-settings-button]").forEach((node) => node.remove?.());
   };
 }
@@ -5133,8 +5442,433 @@ module.exports = {
   branchInventoryDisclosure,
   editProjectDialogCandidates,
   dialogCloseButton,
+  projectForNativeSave,
   installEditProjectDialogControls,
 };
+
+},
+  "/lib/thread-summary-profiles.js": function (module, exports, require) {
+"use strict";
+
+const OWNER = "co.tweakers.thread-summary-profiles";
+const STYLE_ID = "tweaker-thread-summary-profiles-style";
+const MOUNT_ATTR = "data-co-tweakers-thread-summary-profiles";
+const GENERATION_ATTR = "data-profiles-generation";
+const states = new WeakMap();
+
+const helpers = {
+  normalizeProfilesProjection,
+  renderProfilesState,
+  profileSignature,
+  resolveProjectContext,
+  resolveProjectIdentity,
+  findSummaryPanels,
+  normalizeRow,
+  applyProjection,
+  scan,
+  getState: (instance) => states.get(instance),
+};
+
+module.exports = {
+  start(api, options = {}) {
+    if (api?.process === "main" || typeof document === "undefined") return;
+    const state = {
+      api,
+      disposed: false,
+      observer: null,
+      pending: null,
+      pendingKind: null,
+      mounts: new Set(),
+      mountState: new WeakMap(),
+      nextGeneration: 0,
+      listeners: [],
+      style: installStyle(),
+      page: null,
+      pageRenders: new Set(),
+    };
+    states.set(this, state);
+    const refresh = () => {
+      for (const mount of state.mounts) {
+        const record = state.mountState.get(mount);
+        if (record) record.invalidated = true;
+      }
+      for (const page of state.pageRenders) page.refresh?.();
+      schedule(state);
+    };
+    let lastHostElements = null;
+    let lastIdentityKeys = null;
+    const disposeHost = api.react?.host?.observe?.(["thread-context", "projects"], (snapshots) => {
+      const elements = (snapshots || []).flatMap((snapshot) => snapshot.matches || []).map((match) => match.element);
+      const identityKeys = JSON.stringify(findSummaryPanels(document).map((panel) => privateIdentityKey(resolveProjectIdentity(api, panel))));
+      if (lastIdentityKeys === identityKeys && lastHostElements?.length === elements.length && elements.every((element, index) => element === lastHostElements[index])) return;
+      lastIdentityKeys = identityKeys;
+      lastHostElements = elements;
+      refresh();
+    });
+    state.observer = disposeHost ? { disconnect: disposeHost } : null;
+    if (typeof window !== "undefined") {
+      for (const type of ["popstate", "hashchange", "tweaker:projects-revision"]) {
+        window.addEventListener?.(type, refresh);
+        state.listeners.push(() => window.removeEventListener?.(type, refresh));
+      }
+    }
+    state.page = options.integrated ? null : api.settings?.registerPage?.({
+      id: "thread-summary-profiles",
+      title: "Thread Summary Profiles",
+      description: "Read-only, sanitized connection profiles for the active thread project.",
+      iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="icon-sm inline-block shrink-0 align-middle" aria-hidden="true"><path d="M4 3.5h12v13H4z" stroke="currentColor" stroke-width="1.5"/><path d="M7 7h6M7 10h6M7 13h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+      render(root) { return renderProfilesPage(state, root); },
+    });
+    schedule(state);
+  },
+
+  stop() {
+    const state = states.get(this);
+    if (!state) return;
+    state.disposed = true;
+    if (state.pending != null) {
+      cancelFrame(state.pending, state.pendingKind);
+      state.pending = null;
+      state.pendingKind = null;
+    }
+    state.observer?.disconnect();
+    state.observer = null;
+    for (const page of Array.from(state.pageRenders)) page.cleanup?.();
+    state.pageRenders.clear();
+    for (const mount of Array.from(state.mounts)) mount.remove?.();
+    state.mounts.clear();
+    for (const dispose of state.listeners.splice(0)) dispose();
+    state.page?.unregister?.();
+    state.style?.remove?.();
+    states.delete(this);
+  },
+
+  _test: helpers,
+  __test: helpers,
+};
+
+function normalizeProfilesProjection(response) {
+  const revision = typeof response?.revision === "string"
+    ? (response.revision ? response.revision.slice(0, 120) : "unknown")
+    : (Number.isFinite(response?.revision) ? response.revision : "unknown");
+  const project = isRecord(response?.project) ? response.project : {};
+  const projectId = safeIdentifier(project.id || response?.projectId || "unknown-project");
+  const rows = [];
+  if (Array.isArray(response?.profiles)) {
+    for (const profile of response.profiles) {
+      const row = normalizeRow(profile);
+      if (row) rows.push(row);
+    }
+  } else if (isRecord(project.connections)) {
+    for (const [id, connection] of Object.entries(project.connections)) {
+      const row = normalizeConnection(id, connection);
+      if (row) rows.push(row);
+    }
+  }
+  return { revision, projectId, rows: rows.slice(0, 7) };
+}
+
+function renderProfilesPage(state, root) {
+  const page = {
+    disposed: false,
+    generation: 0,
+    identity: null,
+    identityKey: "",
+    root,
+  };
+  state.pageRenders.add(page);
+  const draw = async () => {
+    if (page.disposed || state.disposed) return;
+    const identity = resolveProjectIdentity(state.api, null);
+    const identityKey = privateIdentityKey(identity);
+    const generation = ++state.nextGeneration;
+    page.generation = generation;
+    page.identity = identity;
+    page.identityKey = identityKey;
+    root.replaceChildren();
+    const hostContext = state.api?.react?.host?.getActiveProject?.() || null;
+    const status = document.createElement("div");
+    status.className = "rounded-lg border border-token-border p-3 text-sm text-token-text-secondary";
+    const placements = state.api?.react?.host?.snapshot?.("thread-context")?.count || 0;
+    const friendlyName = safeFriendlyName(hostContext?.name);
+    status.textContent = identity
+      ? `${friendlyName ? `Active project: ${friendlyName}. ` : "An active project context is available. "}Context surfaces: ${placements}.`
+      : `No validated active project context detected. Context surfaces: ${placements}.`;
+    root.appendChild(status);
+    if (!identity) {
+      const empty = document.createElement("div");
+      root.appendChild(empty);
+      paint(empty, renderProfilesState({ state: "empty" }));
+      return;
+    }
+    const view = document.createElement("div");
+    root.appendChild(view);
+    paint(view, renderProfilesState({ state: "loading" }));
+    try {
+      const response = await state.api.ipc.invoke("profiles.read", { action: "profiles.read", version: 1, project: requestProject(identity) });
+      if (!isCurrentPageLoad(state, page, generation, identityKey)) return;
+      if (!response?.ok) return paint(view, renderProfilesState({ state: "error", error: response?.error?.message || "Projects unavailable" }));
+      const projection = normalizeProfilesProjection(response);
+      paint(view, renderProfilesState(projection.rows.length ? { state: "ready", rows: projection.rows } : { state: "empty" }));
+    } catch (error) {
+      if (isCurrentPageLoad(state, page, generation, identityKey)) {
+        paint(view, renderProfilesState({ state: "error", error: error?.message || "Profiles unavailable" }));
+      }
+    }
+  };
+  page.refresh = () => { if (!page.disposed) void draw(); };
+  page.cleanup = () => {
+    if (page.disposed) return;
+    page.disposed = true;
+    page.generation = ++state.nextGeneration;
+    page.identity = null;
+    page.identityKey = "";
+    state.pageRenders.delete(page);
+    root.replaceChildren();
+  };
+  void draw();
+  return page.cleanup;
+}
+
+function normalizeRow(profile) {
+  if (!isRecord(profile)) return null;
+  const rawId = firstNonEmptyString(profile.type, profile.id);
+  if (!rawId) return null;
+  const id = safeIdentifier(rawId);
+  if (id === "unknown-project" && rawId.trim().toLowerCase() !== "unknown-project") return null;
+  if (!/^[a-z0-9][a-z0-9-]{0,79}$/i.test(id)) return null;
+  // The Projects provider owns the friendly account label. This renderer only
+  // displays the safe, bounded projection and never looks up raw references.
+  const label = safeDisplay(profile.label || titleCase(id), titleCase(id));
+  const value = safeDisplay(profile.value || profile.detail || "Configured", "Configured");
+  const status = ["configured", "unconfigured", "error"].includes(profile.status) ? profile.status : "configured";
+  return { id, label, status, value };
+}
+
+function normalizeConnection(id, connection) {
+  if (!/^[a-z0-9][a-z0-9-]{0,79}$/i.test(id)) return null;
+  if (!isRecord(connection)) return { id, label: titleCase(id), status: "configured", value: "Configured" };
+  const candidate = connection.account || connection.profile || connection.label || connection.value;
+  return { id, label: titleCase(id), status: "configured", value: titleCase(safeDisplay(candidate, "Configured")) };
+}
+
+function renderProfilesState(state) {
+  const current = state?.state || "loading";
+  if (current === "loading") return { state: current, text: "Loading profiles…", hidden: false, rows: [] };
+  if (current === "empty") return { state: current, text: "No profiles configured for this project.", hidden: false, rows: [] };
+  // IPC errors may include private account or filesystem details. Keep the
+  // visible failure state truthful without rendering arbitrary provider text.
+  if (current === "error") return { state: current, text: "Profiles unavailable.", hidden: false, rows: [] };
+  const rows = Array.isArray(state?.rows) ? state.rows : [];
+  return {
+    state: "ready",
+    text: rows.length ? rows.map((row) => `${row.label}: ${row.value}`).join("\n") : "No profiles configured for this project.",
+    hidden: false,
+    rows,
+  };
+}
+
+function profileSignature(projection) {
+  return JSON.stringify({
+    revision: String(projection?.revision || ""),
+    projectId: String(projection?.projectId || ""),
+    rows: (Array.isArray(projection?.rows) ? projection.rows : []).map((row) => ({
+      id: row?.id, label: row?.label, status: row?.status, value: row?.value,
+    })),
+  });
+}
+
+function scan(state) {
+  if (state.disposed) return;
+  const panels = findSummaryPanels(document);
+  for (const panel of panels) {
+    let mount = panel.querySelector?.(`[${MOUNT_ATTR}]`);
+    if (!mount) {
+      mount = document.createElement("section");
+      mount.setAttribute(MOUNT_ATTR, OWNER);
+      mount.className = "tweaker-thread-summary-profiles flex flex-col gap-2 pt-3";
+      panel.appendChild(mount);
+      state.mounts.add(mount);
+    }
+    const identity = resolveProjectIdentity(state.api, panel);
+    let record = state.mountState.get(mount);
+    const nextKey = privateIdentityKey(identity);
+    if (!record || record.identityKey !== nextKey || record.invalidated) {
+      const identityChanged = !record || record.identityKey !== nextKey;
+      record = record || { generation: 0, identityKey: null, identity: null, profileSignature: null, invalidated: false };
+      record.identityKey = nextKey;
+      record.identity = identity; // private per-mount memory; never serialized into the DOM.
+      record.invalidated = false;
+      if (identityChanged) record.profileSignature = null;
+      record.generation = ++state.nextGeneration;
+      state.mountState.set(mount, record);
+      mount.setAttribute(GENERATION_ATTR, String(record.generation));
+      if (!identity) {
+        paint(mount, renderProfilesState({ state: "empty" }));
+        continue;
+      }
+      if (!record.profileSignature) paint(mount, renderProfilesState({ state: "loading" }));
+      void loadProfiles(state, mount, record, record.generation);
+    }
+  }
+  for (const mount of Array.from(state.mounts)) {
+    if (!mount.isConnected) {
+      mount.remove?.();
+      state.mounts.delete(mount);
+    }
+  }
+}
+
+async function loadProfiles(state, mount, record, generation) {
+  const invoke = state.api?.ipc?.invoke;
+  if (typeof invoke !== "function" || state.disposed || !record.identity) {
+    if (isCurrentLoad(state, mount, record, generation)) paint(mount, renderProfilesState({ state: "empty" }));
+    return;
+  }
+  try {
+    const response = await invoke.call(state.api.ipc, "profiles.read", { action: "profiles.read", version: 1, project: requestProject(record.identity) });
+    if (!isCurrentLoad(state, mount, record, generation)) return;
+    if (!response?.ok) {
+      paint(mount, renderProfilesState({ state: "error", error: response?.error?.message || "Projects unavailable" }));
+      return;
+    }
+    applyProjection(record, mount, normalizeProfilesProjection(response));
+  } catch (error) {
+    if (isCurrentLoad(state, mount, record, generation)) {
+      paint(mount, renderProfilesState({ state: "error", error: error?.message || "Profiles unavailable" }));
+    }
+  }
+}
+
+function applyProjection(record, mount, projection) {
+  const nextSignature = profileSignature(projection);
+  if (record.profileSignature === nextSignature) return false;
+  record.profileSignature = nextSignature;
+  paint(mount, renderProfilesState(projection.rows.length ? { state: "ready", rows: projection.rows } : { state: "empty" }));
+  return true;
+}
+
+function isCurrentLoad(state, mount, record, generation) {
+  return !state.disposed
+    && mount?.isConnected !== false
+    && state.mountState.get(mount) === record
+    && record.generation === generation;
+}
+
+function isCurrentPageLoad(state, page, generation, identityKey) {
+  if (state.disposed || page.disposed || page.generation !== generation || page.identityKey !== identityKey) return false;
+  return privateIdentityKey(resolveProjectIdentity(state.api, null)) === identityKey;
+}
+
+// A host context is usable only when it supplies an ID or workspace path. A
+// name alone is presentation data, not project identity, so it falls back to
+// the panel's nearest project context instead of issuing a broad stale read.
+function resolveProjectIdentity(api, panel) {
+  const hostIdentity = validateProjectContext(api?.react?.host?.getActiveProject?.());
+  const panelIdentity = validateProjectContext(resolveProjectContext(panel));
+  const project = hostIdentity || panelIdentity;
+  if (!project) return null;
+  return { ...project, route: privateRoute() };
+}
+
+function validateProjectContext(context) {
+  const id = normalizeProjectId(context?.id || context?.projectId);
+  const workspacePath = normalizeWorkspacePath(context?.workspacePath);
+  return id || workspacePath ? { id, workspacePath } : null;
+}
+
+function resolveProjectContext(panel) {
+  const host = panel?.closest?.("[data-project-id], [data-workspace-path]")
+    || (panel?.getAttribute?.("data-project-id") || panel?.getAttribute?.("data-workspace-path") ? panel : null);
+  return {
+    projectId: host?.getAttribute?.("data-project-id") || "",
+    workspacePath: host?.getAttribute?.("data-workspace-path") || "",
+  };
+}
+
+function requestProject(identity) {
+  return { id: identity.id || undefined, workspacePath: identity.workspacePath || undefined };
+}
+
+function privateIdentityKey(identity) {
+  return identity ? JSON.stringify([identity.id, identity.workspacePath, identity.route]) : "";
+}
+
+function privateRoute() {
+  if (typeof location === "undefined") return "";
+  const route = `${location.pathname || ""}${location.search || ""}${location.hash || ""}`;
+  return route.length <= 2048 && !/[\0\r\n]/.test(route) ? route : "";
+}
+
+function paint(mount, view) {
+  mount.textContent = "";
+  const heading = document.createElement("div");
+  heading.className = "text-sm font-medium text-token-text-secondary";
+  heading.textContent = "Profiles";
+  mount.appendChild(heading);
+  if (view.state === "ready") {
+    for (const row of view.rows || []) {
+      const item = document.createElement("div");
+      item.className = "flex items-center justify-between gap-3 text-sm";
+      const label = document.createElement("span"); label.className = "text-token-text-primary"; label.textContent = row.label;
+      const value = document.createElement("span"); value.className = "text-token-text-secondary"; value.textContent = row.value;
+      item.append(label, value); mount.appendChild(item);
+    }
+  } else {
+    const message = document.createElement("div");
+    message.className = "text-sm text-token-text-secondary";
+    message.textContent = view.text;
+    mount.appendChild(message);
+  }
+}
+
+function findSummaryPanels(root) {
+  const matched = Array.from(root?.querySelectorAll?.("[data-thread-summary], [data-summary-panel]") || []).filter((panel) => {
+    if (panel.hasAttribute?.(MOUNT_ATTR)) return false;
+    const text = String(panel.textContent || "");
+    const markers = ["Environment", "Sources", "Progress", "Subagents"].filter((marker) => text.includes(marker));
+    return markers.length >= 2;
+  });
+  return matched.filter((panel) => !matched.some((other) => other !== panel && panel.contains?.(other)));
+}
+
+function installStyle() {
+  const style = document.getElementById?.(STYLE_ID) || document.createElement("style");
+  style.id = STYLE_ID;
+  style.textContent = `[${MOUNT_ATTR}="${OWNER}"] { contain: layout style; }`;
+  if (!style.isConnected) (document.head || document.documentElement).appendChild(style);
+  return style;
+}
+
+function schedule(state) {
+  if (state.disposed || state.pending != null) return;
+  const useRaf = typeof window !== "undefined" && typeof window.requestAnimationFrame === "function";
+  state.pendingKind = useRaf ? "raf" : "timeout";
+  const callback = () => { state.pending = null; state.pendingKind = null; scan(state); };
+  state.pending = useRaf ? window.requestAnimationFrame(callback) : (typeof setTimeout === "function" ? setTimeout(callback, 16) : null);
+}
+
+function cancelFrame(id, kind) {
+  if (kind === "raf") { if (typeof window !== "undefined") window.cancelAnimationFrame?.(id); return; }
+  if (kind === "timeout") { if (typeof clearTimeout === "function") clearTimeout(id); return; }
+  if (typeof window !== "undefined") window.cancelAnimationFrame?.(id);
+  if (typeof clearTimeout === "function") clearTimeout(id);
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) if (typeof value === "string" && value.trim()) return value;
+  return null;
+}
+function normalizeProjectId(value) { return typeof value === "string" && value.trim().length <= 120 && !/[\\/\0\r\n]/.test(value) ? value.trim() : ""; }
+function normalizeWorkspacePath(value) { return typeof value === "string" && value.trim().length <= 4096 && !/[\0\r\n]/.test(value) ? value.trim() : ""; }
+function safeIdentifier(value) { return typeof value === "string" && value.length <= 120 && !/[\\/\0\r\n]/.test(value) ? value : "unknown-project"; }
+function safeDisplay(value, fallback) {
+  if (typeof value !== "string" || !value.trim() || value.length > 160 || /(?:token|secret|password|bearer|workspace|private|authorization|[\\/]Users[\\/])/i.test(value)) return fallback;
+  return value.trim();
+}
+function safeFriendlyName(value) { const safe = safeDisplay(value, ""); return safe || null; }
+function titleCase(value) { return String(value).split(/[-_\s]+/).filter(Boolean).map((part) => part[0].toUpperCase() + part.slice(1)).join(" "); }
+function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
 
 },
   "/lib/entry.js": function (module, exports, require) {
@@ -5151,6 +5885,7 @@ const service = require("./service");
 const nativeProjectMenu = require("./native-project-menu");
 const sidebar = require("./sidebar");
 const settings = require("./settings");
+const threadSummaryProfiles = require("./thread-summary-profiles");
 
 const IPC = "projects";
 const SERVICE_KEY = "__tweakersProjectsServiceV1";
@@ -5159,6 +5894,7 @@ const NATIVE_MENU_BRIDGE_KEY = "__tweakersProjectsNativeMenuBridgeV1";
 const settingsPresenter = settings.createSettingsPresenter({
   openNativeProjectEditDialog: sidebar.openNativeProjectEditDialog,
 });
+const activePages = new WeakMap();
 
 function startMain(api) {
   const projectService = service.createProjectService(api);
@@ -5177,6 +5913,19 @@ function startMain(api) {
 }
 
 function startRenderer(api) {
+  let disposed = false;
+  const profilesInstance = {};
+  const profilesApi = { ...api, ipc: { ...api.ipc,
+    invoke(channel, ...args) { return api.ipc.invoke(channel === "profiles.read" ? IPC : channel, ...args); },
+  } };
+  let profilesEnabled = false;
+  const setProfilesEnabled = (enabled) => {
+    if (disposed || enabled === profilesEnabled) return;
+    profilesEnabled = enabled;
+    if (enabled) threadSummaryProfiles.start.call(profilesInstance, profilesApi, { integrated: true });
+    else threadSummaryProfiles.stop.call(profilesInstance);
+  };
+  setProfilesEnabled(api.storage?.get?.("threadSummaryProfiles", false) === true);
   let latestState = null;
   let latestRevision = null;
   let latestNativeProjects = [];
@@ -5184,14 +5933,10 @@ function startRenderer(api) {
   let aliasRefreshRequest = 0;
   let revisionRefreshRequest = 0;
   let selectedSettingsProjectId = null;
-  let resizeObserver = null;
-  const apply = () => {
-    sidebar.applyNativeProjectColors(api, latestState);
-    resizeObserver?.sync();
-  };
-  resizeObserver = sidebar.installProjectSidebarResizeObserver(apply);
+  const updater = sidebar.createProjectSidebarUpdater(api, () => latestState);
+  const apply = () => updater.schedule(true);
   const acceptResponse = (response) => {
-    if (!response?.ok) return false;
+    if (disposed || !response?.ok) return false;
     if (Array.isArray(response.nativeProjects)) latestNativeProjects = response.nativeProjects;
     latestState = state.bindNativeProjectIdentities(response.state, latestNativeProjects);
     latestRevision = response.revision;
@@ -5199,7 +5944,11 @@ function startRenderer(api) {
     return true;
   };
   const saveAppearance = async (projectId, choice) => {
-    if (!latestState || !projectId) return;
+    if (!latestState || !projectId) return false;
+    if (!latestState.nodes.some((node) => node.type === "project" && node.id === projectId)) {
+      window.alert("Could not save project appearance because this project changed. Open Edit again to retry.");
+      return false;
+    }
     const taskOrderingChange = Object.prototype.hasOwnProperty.call(choice || {}, "taskSort")
       || Object.prototype.hasOwnProperty.call(choice || {}, "pinnedTaskIds");
     const changeLabel = taskOrderingChange ? "project task order" : "project color";
@@ -5217,18 +5966,20 @@ function startRenderer(api) {
           const current = await api.ipc.invoke(IPC, { action: "get" });
           if (acceptResponse(current)) apply();
           window.alert(`Could not save the ${changeLabel} because this project changed. Try again.`);
-          return;
+          return false;
         }
         window.alert(`Could not save the ${changeLabel}.`);
-        return;
+        return false;
       }
       latestState = state.bindNativeProjectIdentities(response.state, latestNativeProjects);
       latestRevision = response.revision;
       apply();
       window.dispatchEvent(new CustomEvent("tweaker:projects-color-change", { detail: { projectId } }));
+      return true;
     } catch (error) {
       api.log?.warn?.(`${changeLabel} save failed`, String(error));
       window.alert(`Could not save the ${changeLabel}.`);
+      return false;
     }
   };
   const removeRevision = api.ipc.on?.("revision", (payload) => {
@@ -5246,19 +5997,35 @@ function startRenderer(api) {
     description: "Organize the projects shown in your ChatGPT sidebar.",
     iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="icon-sm inline-block shrink-0 align-middle" aria-hidden="true"><path d="M2.5 5.5h6l1.5 2h7.5v7.5a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V5.5Z" stroke="currentColor" stroke-width="1.5"/></svg>',
     render(root) {
-      return settingsPresenter.renderProjectsPage(api, root, (nextState, revision, nativeProjects) => {
+      const profilesSetting = document.createElement("label");
+      profilesSetting.className = "flex items-center justify-between gap-4 rounded-lg border border-token-border p-3 text-sm text-token-text-primary";
+      const copy = document.createElement("span");
+      copy.textContent = "Thread Summary Profiles";
+      const toggle = document.createElement("input");
+      toggle.type = "checkbox";
+      toggle.setAttribute("role", "switch");
+      toggle.checked = profilesEnabled;
+      toggle.addEventListener("change", () => {
+        api.storage?.set?.("threadSummaryProfiles", toggle.checked);
+        setProfilesEnabled(toggle.checked);
+      });
+      profilesSetting.append(copy, toggle);
+      const content = document.createElement("div");
+      root.replaceChildren(profilesSetting, content);
+      const disposePage = settingsPresenter.renderProjectsPage(api, content, (nextState, revision, nativeProjects) => {
         if (Array.isArray(nativeProjects)) latestNativeProjects = nativeProjects;
         latestState = state.bindNativeProjectIdentities(nextState, latestNativeProjects);
         latestRevision = revision;
         apply();
       }, () => selectedSettingsProjectId, (projectId) => { selectedSettingsProjectId = projectId; });
+      return () => { disposePage?.(); root.replaceChildren(); };
     },
   });
   api.ipc.invoke(IPC, { action: "get" }).then((response) => {
     if (acceptResponse(response)) apply();
   }).catch(() => {});
   const removeHostObserver = api.react?.host?.observe?.(["projects"], () => {
-    apply();
+    updater.schedule();
     const fingerprint = sidebar.nativeProjectSurfaceFingerprint(api);
     if (fingerprint === latestSurfaceFingerprint) return;
     latestSurfaceFingerprint = fingerprint;
@@ -5282,11 +6049,13 @@ function startRenderer(api) {
   );
   return {
     unregister() {
+      disposed = true;
+      threadSummaryProfiles.stop.call(profilesInstance);
       aliasRefreshRequest += 1;
       revisionRefreshRequest += 1;
       removeRevision?.();
       removeHostObserver?.();
-      resizeObserver?.dispose();
+      updater.dispose();
       removeColorControls?.();
       removeTaskControls?.();
       removeEditProjectControls?.();
@@ -5299,8 +6068,10 @@ function startRenderer(api) {
 const tweak = {
   start(api) {
     if (api.process === "main") return startMain(api);
+    activePages.get(this)?.unregister?.();
     const page = startRenderer(api);
     this._page = page;
+    activePages.set(this, page);
     return page;
   },
   stop() {
@@ -5317,6 +6088,7 @@ const tweak = {
     }
     this._page?.unregister?.();
     this._page = null;
+    activePages.delete(this);
   },
   _test: {
     ...common,

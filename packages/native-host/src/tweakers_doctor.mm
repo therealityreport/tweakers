@@ -19,7 +19,12 @@ static NSArray<NSString *> *DoctorActionIds(void) {
   return @[@"reconnect", @"scan", @"repair", @"retry", @"update", @"decide", @"observe", @"preview_before", @"preview_after"];
 }
 static NSArray<NSString *> *PrimaryDoctorActionIds(void) {
-  return @[@"reconnect", @"scan", @"repair", @"retry", @"update", @"preview_before", @"preview_after"];
+  return @[@"update", @"scan", @"reconnect", @"repair", @"retry"];
+}
+
+static NSString *ManagerActionTitle(NSString *identifier) {
+  return @{@"update": @"Update Tweakers", @"scan": @"Check for Updates",
+    @"retry": @"Open Tweakers", @"repair": @"Repair Account Storage"}[identifier];
 }
 
 static BOOL IsStringArray(id value) {
@@ -301,10 +306,11 @@ static NSString *UpdateStateLabel(NSDictionary *update) {
   if ([update[@"phase"] isEqual:@"promotion_failed"] || [update[@"phase"] isEqual:@"stale"]) return @"Needs attention";
   if ([update[@"phase"] isEqual:@"updating"]) return @"Installing update";
   if ([update[@"phase"] isEqual:@"installed"]) return @"Update installed";
+  if ([update[@"phase"] isEqual:@"current"]) return @"Up to date";
   if ([update[@"state"] isEqual:@"compatible"] && [update[@"phase"] isEqual:@"candidate_verified"] && [compatibility[@"status"] isEqual:@"passed"]) return @"Ready to install";
   NSString *state = StringValue(update[@"state"], @"not_checked");
   NSString *phase = StringValue(update[@"phase"], @"");
-  NSDictionary *phases = @{@"preparing": @"Preparing candidate", @"resuming": @"Checking compatibility", @"comparing": @"Checking compatibility", @"applying_patches": @"Applying compatibility patches", @"checking": @"Checking compatibility", @"repairing": @"Repairing compatibility", @"candidate_verified": @"Ready to install", @"needs_attention": @"Needs attention"};
+  NSDictionary *phases = @{@"preparing": @"Preparing candidate", @"resuming": @"Checking compatibility", @"comparing": @"Checking compatibility", @"applying_patches": @"Applying compatibility patches", @"checking": @"Checking compatibility", @"repairing": @"Repairing compatibility", @"candidate_verified": @"Needs attention", @"revalidation_required": @"Needs attention", @"needs_attention": @"Needs attention"};
   if (phases[phase]) return phases[phase];
   if ([state isEqual:@"review_required"] && [phase isEqual:@"review_complete"]) {
     return @"Review finished—compatibility unresolved";
@@ -444,6 +450,7 @@ static NSString *ShortInstallBlockerSummary(NSArray<NSString *> *blockers) {
   if (blockers.count == 0) return @"Installation is unavailable until its required checks pass.";
   NSString *first = blockers.firstObject;
   if ([first isEqual:@"This candidate is already installed."]) return @"The verified update is installed.";
+  if ([first hasPrefix:@"Tweakers already uses the newest stable upstream build."]) return @"No update to install.";
   NSString *count = [NSString stringWithFormat:@"%lu installation blocker%@ %@.", (unsigned long)blockers.count, blockers.count == 1 ? @"" : @"s", blockers.count == 1 ? @"remains" : @"remain"];
   if ([first containsString:@"ChatGPT for Chrome"] && [first containsString:@"tectonic"]) {
     return [NSString stringWithFormat:@"%@ Chrome and LaTeX helpers changed. Their compatibility checks are incomplete.", count];
@@ -474,15 +481,19 @@ static BOOL IsManagerRuntimeDoctorExecutablePath(NSString *path, BOOL allowLegac
   NSString *relative = [standardized substringFromIndex:prefix.length + 1];
   NSArray<NSString *> *components = relative.pathComponents;
   if (components.count < 3 || !IsHexGeneration(components[0]) || ![components[1] isEqual:@"native"]) return NO;
-  NSArray<NSString *> *expected = @[@"Tweakers Doctor.app", @"Contents", @"MacOS", @"Tweakers Doctor"];
-  if (components.count == 2 + expected.count
-      && [[components subarrayWithRange:NSMakeRange(2, expected.count)] isEqual:expected]) return YES;
+  // Current name first; sealed generations published before the rename keep the old bundle name.
+  for (NSArray<NSString *> *expected in @[@[@"Tweakers Manager.app", @"Contents", @"MacOS", @"Tweakers Manager"],
+                                          @[@"Tweakers Doctor.app", @"Contents", @"MacOS", @"Tweakers Doctor"]]) {
+    if (components.count == 2 + expected.count
+        && [[components subarrayWithRange:NSMakeRange(2, expected.count)] isEqual:expected]) return YES;
+  }
   return allowLegacyRawHelper && components.count == 3 && [components[2] isEqual:@"Tweakers Doctor"];
 }
 
 static BOOL IsBundledDoctorExecutablePath(NSString *path) {
-  NSString *suffix = @"/Contents/Resources/tweakers/native/Tweakers Doctor.app/Contents/MacOS/Tweakers Doctor";
   NSString *standardized = path.stringByStandardizingPath;
+  NSString *suffix = @"/Contents/Resources/tweakers/native/Tweakers Manager.app/Contents/MacOS/Tweakers Manager";
+  if (![standardized hasSuffix:suffix]) suffix = @"/Contents/Resources/tweakers/native/Tweakers Doctor.app/Contents/MacOS/Tweakers Doctor";
   if (![standardized hasSuffix:suffix]) return NO;
   NSString *outerApp = [standardized substringToIndex:standardized.length - suffix.length];
   return [outerApp.pathExtension isEqual:@"app"] && outerApp.lastPathComponent.length > 4;
@@ -764,28 +775,28 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
   NSString *healthStatus = HealthStateLabel(StringValue(healthReport[@"state"], @"unknown"));
   NSString *updateStatus = UpdateStateLabel(update);
   NSString *healthSymbol = [healthStatus isEqual:@"Healthy"] ? @"checkmark.circle" : [healthStatus isEqual:@"Blocked"] ? @"xmark.octagon" : @"exclamationmark.circle";
-  NSString *updateSymbol = [updateStatus isEqual:@"Compatible"] ? @"checkmark.circle" : [updateStatus isEqual:@"Checking"] ? @"clock" : @"exclamationmark.circle";
+  NSString *updateSymbol = [@[@"Compatible", @"Up to date", @"Update installed"] containsObject:updateStatus] ? @"checkmark.circle" : [updateStatus isEqual:@"Checking"] ? @"clock" : @"exclamationmark.circle";
   NSString *broker = StringValue(healthReport[@"broker"], @"unknown");
   NSString *brokerLine = [broker isEqual:@"not_running"] ? @"Accounts broker: fresh readiness is unavailable." : [NSString stringWithFormat:@"Accounts broker: %@.", broker];
   NSView *health = [host statusCardWithTitle:@"Current installation" status:healthStatus symbol:healthSymbol lines:@[
     [NSString stringWithFormat:@"Installed Tweakers: %@", VersionAndBuild(target, @"version", @"build")], brokerLine]];
   NSView *readiness = [host statusCardWithTitle:@"Update readiness" status:updateStatus symbol:updateSymbol lines:@[progress.length ? progress : @"No update work is running."]];
   NSString *nextText = nil;
-  NSString *destination = @"doctor";
   if (host.reportStale) nextText = @"The Manager is unavailable. Retry the status check before taking any action; the saved findings remain readable.";
+  else if ([ReportAction(report, @"update")[@"enabled"] isEqual:@YES]) nextText = @"The checked update is ready. Choose Update Tweakers above to install it.";
   else if (![healthReport[@"state"] isEqual:@"healthy"]) {
-    nextText = [retry[@"enabled"] isEqual:@YES] ? @"Retry Tweakers is available in Doctor." : @"Open Doctor to review blockers. Retry Tweakers is currently unavailable.";
+    nextText = [retry[@"enabled"] isEqual:@YES] ? @"Open Tweakers is available in Doctor." : @"Open Doctor to review blockers. Open Tweakers is currently unavailable.";
+  } else if ([update[@"phase"] isEqual:@"current"]) {
+    nextText = @"No update is needed. You are using the newest available build.";
   } else if ([decide[@"enabled"] isEqual:@YES] && [update[@"state"] isEqual:@"review_required"]) {
     nextText = @"Review update changes in Updates before installation.";
-    destination = @"updates";
   } else if ([scan[@"enabled"] isEqual:@YES]) {
-    nextText = @"Check for updates is available in Updates.";
-    destination = @"updates";
+    nextText = @"Choose Check for Updates above to find and verify a new version.";
   } else nextText = @"No action is available in the current report. Open Doctor to review blockers.";
   NSView *next = [host sectionWithTitle:@"Next step" lines:@[nextText]];
   [host addNavigation:@"Open Doctor" destination:@"doctor" toCard:health];
   [host addNavigation:@"Open Updates" destination:@"updates" toCard:readiness];
-  [host addNavigation:[destination isEqual:@"doctor"] ? @"Open Doctor" : @"Open Updates" destination:destination toCard:next];
+
   return @[health, readiness, next];
 }
 @end
@@ -812,12 +823,12 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
     review[@"questions"][@"completed"] ?: @"?", review[@"questions"][@"total"] ?: @"?",
     review[@"entries"] ?: @"?", review[@"limitations"] ?: @"?"]];
   if (!compatibilityWorkflow && pause) [summary addObject:[NSString stringWithFormat:@"Review paused. Next: %@.", PauseActionLabel(pause[@"action"])]];
-  if (install && ![install[@"enabled"] isEqual:@YES] && ![update[@"state"] isEqual:@"checking"]) [summary addObject:ShortInstallBlockerSummary(blockers)];
+  if (install && ![install[@"enabled"] isEqual:@YES] && ![update[@"state"] isEqual:@"checking"] && ![update[@"phase"] isEqual:@"current"]) [summary addObject:ShortInstallBlockerSummary(blockers)];
   NSView *status = [host statusCardWithTitle:@"Update status" status:statusText
-    symbol:([statusText isEqual:@"Compatible"] || [statusText isEqual:@"Ready to install"] || [statusText isEqual:@"Update installed"]) ? @"checkmark.circle" : IsCompatibilityWorkflowInProgress(update) ? @"clock" : @"exclamationmark.circle"
+    symbol:([statusText isEqual:@"Compatible"] || [statusText isEqual:@"Ready to install"] || [statusText isEqual:@"Update installed"] || [statusText isEqual:@"Up to date"]) ? @"checkmark.circle" : IsCompatibilityWorkflowInProgress(update) ? @"clock" : @"exclamationmark.circle"
     lines:summary];
   NSView *installed = [host sectionWithTitle:@"Your app" lines:presentation[@"target"]];
-  NSView *changelog = host.reportStale ? [host sectionWithTitle:@"Last saved update" lines:@[@"Live progress is unavailable. Reload status to find out whether the update check is still running."]] : [host changelogSection:adoption fallbackLines:presentation[@"changelog"]];
+  NSView *changelog = host.reportStale ? [host sectionWithTitle:@"Last saved update" lines:@[@"Live progress is unavailable. Refresh Status to find out whether the update check is still running."]] : [host changelogSection:adoption fallbackLines:presentation[@"changelog"]];
   if (compatibilityWorkflow) return @[status, [host sectionWithTitle:@"Compatibility" lines:CompatibilityLines(compatibility, update)], installed, changelog];
   return @[status, installed, changelog];
 }
@@ -987,15 +998,15 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
   }
   NSDictionary *headings = @{
     @"overview": @[@"Overview", @"Your installation, update readiness, and the next useful step."],
-    @"updates": @[@"Updates", @"Verify candidate compatibility and install only when its checks pass."],
+    @"updates": @[@"Updates", @"Check for a new version, then update when it is ready."],
     @"doctor": @[@"Doctor", @"Prioritized findings and recovery for your installed app."],
   };
   NSArray<NSString *> *heading = headings[section];
   self.sectionHeading.stringValue = heading[0];
   self.sectionSubtitle.stringValue = heading[1];
-  self.updateActionRow.hidden = ![section isEqual:@"updates"];
+  self.updateActionRow.hidden = [section isEqual:@"doctor"];
   self.doctorActionRow.hidden = ![section isEqual:@"doctor"];
-  self.actionStack.hidden = [section isEqual:@"overview"];
+  self.actionStack.hidden = NO;
   self.evidenceDisclosure.hidden = ![section isEqual:@"updates"] || [self adoption] == nil;
   self.adoptionBox.hidden = ![section isEqual:@"updates"] || [self adoption] == nil || self.evidenceDisclosure.state != NSControlStateValueOn;
   if (self.report) [self presentSectionReport:self.report];
@@ -1254,12 +1265,18 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
   self.actionStack.alignment = NSLayoutAttributeLeading;
   self.actionStack.spacing = 8;
   for (NSString *action in PrimaryDoctorActionIds()) {
-    NSButton *button = [NSButton buttonWithTitle:[action capitalizedString] target:self action:@selector(performDoctorAction:)];
+    NSButton *button = [NSButton buttonWithTitle:ManagerActionTitle(action) ?: [action capitalizedString] target:self action:@selector(performDoctorAction:)];
     button.identifier = action;
+    if ([action isEqual:@"update"]) {
+      button.bezelStyle = NSBezelStyleRounded;
+      button.bezelColor = NSColor.controlAccentColor;
+      button.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    }
     button.enabled = NO;
     [self.actionStack addArrangedSubview:button];
   }
-  NSButton *refresh = [NSButton buttonWithTitle:@"Reload status" target:self action:@selector(refresh:)];
+  NSButton *refresh = [NSButton buttonWithTitle:@"Refresh Status" target:self action:@selector(refresh:)];
+  refresh.toolTip = @"Refresh the displayed status without starting another update check.";
   self.sidebarToggle = [NSButton buttonWithTitle:@"" target:self action:@selector(toggleSidebar:)];
   self.sidebarToggle.image = [NSImage imageWithSystemSymbolName:@"sidebar.left" accessibilityDescription:@"Toggle sidebar"];
   self.sidebarToggle.toolTip = @"Hide Sidebar";
@@ -1274,8 +1291,8 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
   [layout addArrangedSubview:header];
   [layout addArrangedSubview:self.activityLabel];
   [layout addArrangedSubview:self.freshnessLabel];
-  [layout addArrangedSubview:self.reportStack];
   [layout addArrangedSubview:self.actionStack];
+  [layout addArrangedSubview:self.reportStack];
   [layout addArrangedSubview:self.evidenceDisclosure];
   [layout addArrangedSubview:self.adoptionBox];
   [layout addArrangedSubview:self.technicalDisclosure];
@@ -1665,8 +1682,8 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
   self.statusRefreshTimer = nil;
   self.activityLabel.stringValue = message;
   self.freshnessLabel.hidden = NO;
-  self.freshnessLabel.stringValue = self.report ? [NSString stringWithFormat:@"Live status is unavailable. Last successful report: %@. Actions are disabled. Choose Reload status, or Copy Report for the saved evidence.", StringValue(self.report[@"generatedAt"], @"unknown")] : @"No verified report is available. Choose Reload status to reconnect.";
-  for (NSView *view in self.footerActions.arrangedSubviews) if ([view isKindOfClass:[NSButton class]] && view != self.reportCopyButton && view != self.sidebarToggle) ((NSButton *)view).title = @"Reload status";
+  self.freshnessLabel.stringValue = self.report ? [NSString stringWithFormat:@"Live status is unavailable. Last successful report: %@. Actions are disabled. Choose Refresh Status, or Copy Report for the saved evidence.", StringValue(self.report[@"generatedAt"], @"unknown")] : @"No verified report is available. Choose Refresh Status to reconnect.";
+  for (NSView *view in self.footerActions.arrangedSubviews) if ([view isKindOfClass:[NSButton class]] && view != self.reportCopyButton && view != self.sidebarToggle) ((NSButton *)view).title = @"Refresh Status";
   if (self.report) [self updateReportPresentation:self.report];
   [self updateButtons];
 }
@@ -1741,7 +1758,7 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
       NSPoint preservedTechnicalScrollOrigin = self.technicalReportScroll.contentView.bounds.origin;
       self.preserveStatusPresentation = NO;
       self.reportStale = NO;
-      for (NSView *view in self.footerActions.arrangedSubviews) if ([view isKindOfClass:[NSButton class]] && view != self.reportCopyButton && view != self.sidebarToggle) ((NSButton *)view).title = @"Reload status";
+      for (NSView *view in self.footerActions.arrangedSubviews) if ([view isKindOfClass:[NSButton class]] && view != self.reportCopyButton && view != self.sidebarToggle) ((NSButton *)view).title = @"Refresh Status";
       self.report = value;
       [self updateReportPresentation:value];
       [self sizeScrollableContent];
@@ -1768,15 +1785,27 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
     NSButton *button = (NSButton *)view;
     if (![PrimaryDoctorActionIds() containsObject:button.identifier]) continue;
     NSDictionary *action = actionsById[button.identifier];
-    if ([action[@"label"] isKindOfClass:[NSString class]]) button.title = action[@"label"];
+    NSString *title = ManagerActionTitle(button.identifier);
+    if (title) button.title = title;
+    else if ([action[@"label"] isKindOfClass:[NSString class]]) button.title = action[@"label"];
+    BOOL isUpdate = [button.identifier isEqual:@"update"];
+    BOOL isScan = [button.identifier isEqual:@"scan"];
+    if (isUpdate && [self.report[@"update"][@"phase"] isEqual:@"updating"]) button.title = @"Updating Tweakers…";
+    if (isScan && [self.report[@"update"][@"state"] isEqual:@"checking"] && ![self.report[@"update"][@"phase"] isEqual:@"updating"]) button.title = @"Checking for Updates…";
     NSView *actionLine = button.superview;
-    actionLine.hidden = self.report != nil && action == nil;
+    actionLine.hidden = self.report != nil && action == nil && !isUpdate && !isScan;
     button.enabled = !self.busy && !self.reportStale && [action[@"enabled"] isEqual:@YES];
     NSArray *blockers = [action[@"blockers"] isKindOfClass:[NSArray class]] ? action[@"blockers"] : @[];
     button.toolTip = blockers.count > 0 ? [@"Help:\n" stringByAppendingString:[blockers componentsJoinedByString:@"\n"]] : nil;
     NSTextField *inlineBlockers = self.actionBlockerLabels[button.identifier];
-    inlineBlockers.hidden = actionLine.hidden || self.reportStale || [action[@"enabled"] isEqual:@YES];
-    inlineBlockers.stringValue = self.reportStale ? @"Unavailable: reconnect to the verified manager before taking an action." : [button.identifier isEqual:@"update"] && action && ![action[@"enabled"] isEqual:@YES] ? ShortInstallBlockerSummary(blockers) : blockers.count > 0 ? [blockers componentsJoinedByString:@"\n"] : action ? @"This action is currently unavailable." : @"Waiting for a verified report.";
+    inlineBlockers.hidden = actionLine.hidden || (!isUpdate && !isScan && !self.reportStale && [action[@"enabled"] isEqual:@YES]);
+    inlineBlockers.stringValue = self.reportStale ? @"Status unavailable. Choose Refresh Status to reconnect."
+      : isUpdate && [self.report[@"update"][@"phase"] isEqual:@"updating"] ? @"Installing the checked version. Tweakers will reopen when the update is complete."
+      : isUpdate && [self.report[@"update"][@"state"] isEqual:@"checking"] ? @"Checking the new version before updating becomes available."
+      : isUpdate ? ([action[@"enabled"] isEqual:@YES] ? @"Install the checked version. Tweakers will reopen when the update is complete." : [@"Update unavailable. " stringByAppendingString:ShortInstallBlockerSummary(blockers)])
+      : isScan && [action[@"enabled"] isEqual:@YES] ? @"Find and check a new version. This does not install it."
+      : blockers.count > 0 ? [blockers componentsJoinedByString:@"\n"] : @"Waiting for current status.";
+    if (isUpdate || isScan) button.toolTip = inlineBlockers.stringValue;
   }
   self.reportCopyButton.enabled = self.renderedReportText.length > 0;
   [self updateAdoptionButtons];
@@ -2050,7 +2079,9 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
   NSStackView *content = card.contentView.subviews.firstObject;
   NSImageView *icon = [[NSImageView alloc] initWithFrame:NSZeroRect];
   icon.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:status];
-  icon.contentTintColor = [status isEqual:@"Healthy"] || [status isEqual:@"Compatible"] ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+  // Good outcomes are green; only states that need a look are orange.
+  icon.contentTintColor = [@[@"Healthy", @"Compatible", @"Up to date", @"Update installed"] containsObject:status]
+    ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
   [icon.widthAnchor constraintEqualToConstant:16].active = YES;
   [icon.heightAnchor constraintEqualToConstant:16].active = YES;
   NSTextField *label = [NSTextField labelWithString:status];
@@ -2191,7 +2222,7 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
   ];
   NSArray<NSString *> *healthLines = @[
     HealthStateLabel(StringValue(health[@"state"], @"unknown")),
-    [StringValue(health[@"broker"], @"unknown") isEqual:@"not_running"] ? ([ReportAction(report, @"retry")[@"enabled"] isEqual:@YES] ? @"The app connection is not running. Retry Tweakers is available." : @"The app connection is not running. Retry Tweakers is blocked; review the reported findings first.") : @"App health and update approval are checked separately.",
+    [StringValue(health[@"broker"], @"unknown") isEqual:@"not_running"] ? ([ReportAction(report, @"retry")[@"enabled"] isEqual:@YES] ? @"The app connection is not running. Open Tweakers is available." : @"The app connection is not running. Open Tweakers is blocked; review the reported findings first.") : @"App health and update approval are checked separately.",
   ];
   NSMutableArray<NSString *> *updateLines = [NSMutableArray arrayWithArray:@[
     UpdateStateLabel(update),
@@ -2245,6 +2276,8 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
     [changelogLines addObject:@"Optional changelog and preservation choices remain available in Evidence review. Compatibility determines whether this candidate can install."];
   } else if (running) {
     [changelogLines addObject:@"Review preparation is running. Behavioral changes will appear when the current review finishes."];
+  } else if ([update[@"phase"] isEqual:@"current"] && ![log isKindOfClass:[NSDictionary class]]) {
+    [changelogLines addObject:@"You're on the newest build. When a new version is found, its changes will be listed here."];
   } else if (![log isKindOfClass:[NSDictionary class]]) {
     [changelogLines addObject:UnpublishedChangelogMessage(update)];
   } else {
@@ -2255,7 +2288,7 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
     if (unresolved.count) [changelogLines addObject:[NSString stringWithFormat:@"%lu supported changelog entr%@ ready. %lu technical area%@ still pending; select an item in Evidence review for its reason and next action.", (unsigned long)ChangelogEntries(adoption).count, ChangelogEntries(adoption).count == 1 ? @"y is" : @"ies are", (unsigned long)unresolved.count, unresolved.count == 1 ? @" is" : @"s are"]];
     if (changelogLines.count == 0) [changelogLines addObject:[adoption[@"state"] isEqual:@"review_required"] ? @"No behavioral entries are ready because the review still needs behavioral explanations. Open evidence review, resolve its listed gaps, then continue." : @"No validated behavioral changes were reported."];
   }
-  if (!compatibilityWorkflow) [changelogLines addObject:@"Optional explanations do not establish compatibility. The update status above shows the required verification result."];
+  if (!compatibilityWorkflow && ![update[@"phase"] isEqual:@"current"]) [changelogLines addObject:@"Optional explanations do not establish compatibility. The update status above shows the required verification result."];
   for (NSDictionary *action in report[@"actions"]) {
     if ([action[@"id"] isEqual:@"update"] && ![action[@"enabled"] boolValue]) {
       NSArray *reasons = [action[@"blockers"] isKindOfClass:[NSArray class]] ? action[@"blockers"] : @[];
@@ -2278,7 +2311,7 @@ static NSArray<NSString *> *DecisionGroupsForEntry(NSDictionary *adoption, NSStr
     if (replacement) [self.window makeFirstResponder:replacement];
   }
   self.freshnessLabel.hidden = !self.reportStale;
-  self.freshnessLabel.stringValue = self.reportStale ? [NSString stringWithFormat:@"Live status is unavailable. Last successful report: %@. Actions are disabled. Choose Reload status, or Copy Report for the saved evidence.", StringValue(self.report[@"generatedAt"], @"unknown")] : @"";
+  self.freshnessLabel.stringValue = self.reportStale ? [NSString stringWithFormat:@"Live status is unavailable. Last successful report: %@. Actions are disabled. Choose Refresh Status, or Copy Report for the saved evidence.", StringValue(self.report[@"generatedAt"], @"unknown")] : @"";
   [self sizeScrollableContent];
 }
 

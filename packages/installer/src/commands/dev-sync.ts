@@ -28,6 +28,8 @@ import { readValidManifest } from "./dev-tweak.js";
 import { registerDevelopmentCheckout } from "./refresh-local.js";
 import { stageBundledTweaks } from "./install.js";
 import { LEGACY_DEV_SNAPSHOT_FILE } from "../legacy-compat.js";
+import { canonicalTweakersManagerRoot } from "../manager-descriptor.js";
+import { fingerprintVariantGeneration, type VariantGenerationFingerprint } from "../variant-generation.js";
 
 export interface DevSyncResult {
   linked: string[];
@@ -40,12 +42,27 @@ interface DevSyncOpts {
   off?: boolean;
   quiet?: boolean;
   watch?: boolean;
+  commit?: boolean;
 }
 
 export interface DevSyncCycleOptions {
   sourceRoot: string;
   liveTweaks: string;
   build?: (sourceRoot: string) => void | Promise<void>;
+}
+
+export interface TweakRefreshPromotionInput {
+  managerRoot: string;
+  sourceTweaks: string;
+  expectedTweaksFingerprint: VariantGenerationFingerprint;
+}
+
+export interface TweakRefreshPromotionResult { id: string; target: string; rollback: string }
+
+export interface CommitDevelopmentTweaksOptions {
+  sourceRoot: string;
+  build?: (sourceRoot: string) => void | Promise<void>;
+  promote?: (input: TweakRefreshPromotionInput) => Promise<TweakRefreshPromotionResult>;
 }
 
 type SnapshotPathKind = "missing" | "file" | "directory" | "symlink";
@@ -82,6 +99,7 @@ export interface DevSnapshotReceipt {
   surfaces: DevSnapshotSurface[];
   priorTreeRoot: string;
   archivedLegacySnapshots: string[];
+  ownershipRecovery?: { sourceRoot: string; sourceHash: string };
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -120,6 +138,28 @@ export async function devSync(opts: DevSyncOpts = {}): Promise<void> {
 
   clearLegacyDevMode(paths.configFile, paths.tweaks);
 
+  // The independent Tweakers app reads `variants/tweakers/tweaks`, and its
+  // loader refuses to start when that tree differs from the committed
+  // generation receipt. Hot snapshots can never satisfy that gate, so an
+  // installed independent generation only accepts a committed promotion.
+  const committedTweaks = committedIndependentTweaksRoot(paths.root);
+  if (opts.commit) {
+    if (opts.watch) throw new Error("tweaker dev-sync --commit cannot be combined with --watch.");
+    if (!committedTweaks) {
+      throw new Error("tweaker dev-sync --commit requires an installed independent Tweakers generation (no committed receipt was found).");
+    }
+    const result = await commitDevelopmentTweaks({ sourceRoot });
+    registerDevelopmentCheckout(paths.configFile, sourceRoot);
+    if (!opts.quiet) {
+      console.log(kleur.green().bold("✓ Development tweaks committed as a new Tweakers generation."));
+      console.log(`  Source: ${kleur.cyan(devTweaksRoot)}`);
+      console.log(`  Generation: ${kleur.cyan(result.id)}`);
+      console.log(kleur.dim(`  Rollback copy: ${result.rollback}`));
+    }
+    return;
+  }
+  if (committedTweaks) throw new Error(hotPublishRefusal(committedTweaks));
+
   await runDevSyncCycle({ sourceRoot, liveTweaks: paths.tweaks });
   registerDevelopmentCheckout(paths.configFile, sourceRoot);
 
@@ -130,6 +170,51 @@ export async function devSync(opts: DevSyncOpts = {}): Promise<void> {
   }
 
   if (opts.watch) await watchDevelopmentSource(sourceRoot, paths.tweaks, opts.quiet === true);
+}
+
+/** The committed generation receipt that fingerprints `liveTweaks`, when it is a gated tree. */
+export function committedGenerationReceiptPath(liveTweaks: string): string | null {
+  const receipt = join(dirname(resolve(liveTweaks)), "transactions", "variant-promotion", "active.json");
+  return existsSync(receipt) ? receipt : null;
+}
+
+/** The installed independent app's tweak tree when a committed generation owns it. */
+export function committedIndependentTweaksRoot(managerRoot: string): string | null {
+  const liveTweaks = join(managerRoot, "variants", "tweakers", "tweaks");
+  return committedGenerationReceiptPath(liveTweaks) ? liveTweaks : null;
+}
+
+function hotPublishRefusal(liveTweaks: string): string {
+  return [
+    `Refusing to hot-publish into ${liveTweaks}: it belongs to a committed independent Tweakers generation.`,
+    "Changed files there make the next Tweakers launch fail startup verification (\"generation fingerprint mismatch: tweaks\").",
+    "Quit Tweakers and run `tweaker dev-sync --commit` to promote the validated build as a new committed generation.",
+  ].join("\n");
+}
+
+/** Hot snapshots are only valid for trees that no committed generation fingerprints. */
+export function assertHotPublishAllowed(liveTweaks: string): void {
+  if (committedGenerationReceiptPath(liveTweaks)) throw new Error(hotPublishRefusal(liveTweaks));
+}
+
+/**
+ * Validate and build the checkout, then promote the built bundled tweaks as a
+ * committed independent generation. The app must be closed; the promotion
+ * keeps the verified app and runtime and retains a rollback copy.
+ */
+export async function commitDevelopmentTweaks(options: CommitDevelopmentTweaksOptions): Promise<TweakRefreshPromotionResult & { builtTweaks: string }> {
+  validateDevelopmentManifests(options.sourceRoot);
+  if (options.build) await options.build(options.sourceRoot);
+  else runDevelopmentBuild(options.sourceRoot);
+  const builtTweaks = builtTweaksRoot(options.sourceRoot);
+  if (!existsSync(builtTweaks)) throw new Error(`Built tweaks directory not found: ${builtTweaks}`);
+  const expectedTweaksFingerprint = fingerprintVariantGeneration(builtTweaks);
+  const promote = options.promote ?? (async (input: TweakRefreshPromotionInput) => {
+    const { promoteVerifiedTweakRefresh } = await import("./create-variant.js");
+    return promoteVerifiedTweakRefresh(input);
+  });
+  const result = await promote({ managerRoot: canonicalTweakersManagerRoot(), sourceTweaks: builtTweaks, expectedTweaksFingerprint });
+  return { ...result, builtTweaks };
 }
 
 export function resolveDevSyncSourceRoot(configFile: string, invokedSourceRoot: string): string {
@@ -152,19 +237,25 @@ export function resolveDevSyncSourceRoot(configFile: string, invokedSourceRoot: 
 }
 
 export async function runDevSyncCycle(options: DevSyncCycleOptions): Promise<void> {
-  const sourceTweaks = join(options.sourceRoot, "tweaks");
+  assertHotPublishAllowed(options.liveTweaks);
+  validateDevelopmentManifests(options.sourceRoot);
+  if (options.build) await options.build(options.sourceRoot);
+  else runDevelopmentBuild(options.sourceRoot);
+  prepareDevSnapshot(builtTweaksRoot(options.sourceRoot), options.liveTweaks);
+  touchDevReloadMarker(options.liveTweaks);
+}
+
+function validateDevelopmentManifests(sourceRoot: string): void {
+  const sourceTweaks = join(sourceRoot, "tweaks");
   for (const folder of listDirectories(sourceTweaks)) {
     const manifest = join(sourceTweaks, folder, "manifest.json");
     if (!existsSync(manifest)) continue;
     readValidManifest(manifest);
   }
-  if (options.build) await options.build(options.sourceRoot);
-  else runDevelopmentBuild(options.sourceRoot);
-  prepareDevSnapshot(
-    join(options.sourceRoot, "packages", "installer", "assets", "runtime", "tweaks"),
-    options.liveTweaks,
-  );
-  touchDevReloadMarker(options.liveTweaks);
+}
+
+function builtTweaksRoot(sourceRoot: string): string {
+  return join(sourceRoot, "packages", "installer", "assets", "runtime", "tweaks");
 }
 
 export function clearLegacyDevMode(configFile: string, liveTweaks: string): void {
@@ -188,7 +279,8 @@ function runDevelopmentBuild(sourceRoot: string): void {
  * Publish an already-built complete tweak tree as a rollback-safe pending
  * snapshot. This seam intentionally performs no build or source checkout work.
  */
-export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): DevSnapshotReceipt {
+export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string, recovery?: { verifiedBundledRoot: string }): DevSnapshotReceipt {
+  assertHotPublishAllowed(liveTweaks);
   if (!existsSync(builtTweaks)) throw new Error(`Built tweaks directory not found: ${builtTweaks}`);
   mkdirSync(liveTweaks, { recursive: true });
   const manifestPath = join(liveTweaks, ".tweaker-dev-snapshot.json");
@@ -201,7 +293,9 @@ export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): Dev
     if (!existsSync(path)) return false;
     return path !== manifestPath || existing === null;
   });
-  const priorFolders = existing?.folders ?? readLegacySnapshotFolders(...legacySources);
+  const recovered = recovery ? verifyBundledSnapshotOwnership(recovery.verifiedBundledRoot, liveTweaks) : null;
+  if (recovered && (existing || legacySources.length)) throw new Error("Ownership recovery requires an absent snapshot receipt.");
+  const priorFolders = existing?.folders ?? recovered?.folders ?? readLegacySnapshotFolders(...legacySources);
   const transactionId = pending?.transactionId ?? randomUUID();
   const transactionRoot = join(liveTweaks, ".tweaker-dev-history", transactionId);
   const nextRoot = join(transactionRoot, "next");
@@ -242,6 +336,9 @@ export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): Dev
   const promoted: string[] = [];
   writeFileSync(publishLock, String(Date.now()), "utf8");
   try {
+    if (recovery && JSON.stringify(verifyBundledSnapshotOwnership(recovery.verifiedBundledRoot, liveTweaks)) !== JSON.stringify(recovered)) {
+      throw new Error("Bundled ownership evidence changed before publication.");
+    }
     for (const folder of affected) {
       const destination = join(liveTweaks, folder);
       if (existsSync(destination) || symlinkTargetIsPresent(destination)) {
@@ -274,6 +371,7 @@ export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): Dev
       surfaces,
       priorTreeRoot: previousRoot,
       archivedLegacySnapshots,
+      ...(recovered ? { ownershipRecovery: { sourceRoot: recovery!.verifiedBundledRoot, sourceHash: recovered.sourceHash } } : {}),
     };
     writeJsonAtomic(manifestPath, receipt);
     rmSync(legacyManifestPath, { force: true });
@@ -397,6 +495,33 @@ function assertDevSnapshotCas(receipt: DevSnapshotReceipt, liveTweaks: string): 
   }
 }
 
+/** Explicit recovery from a separately verified bundled generation; never infer ownership from IDs alone. */
+export function verifyBundledSnapshotOwnership(sourceRoot: string, liveRoot: string): { folders: string[]; sourceHash: string } {
+  if (resolve(sourceRoot) === resolve(liveRoot)) throw new Error("Ownership evidence must be independent of the live tree.");
+  const digest = (root: string): string => {
+    const hash = createHash("sha256");
+    const visit = (path: string, relative: string): void => {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()) || stat.uid !== process.getuid?.() || (stat.mode & 0o022)) {
+        throw new Error(`Unsafe ownership evidence: ${path}`);
+      }
+      hash.update(relative).update("\0").update(stat.isDirectory() ? "directory\0" : "file\0");
+      if (stat.isDirectory()) for (const name of readdirSync(path).sort()) visit(join(path, name), `${relative}/${name}`);
+      else hash.update(readFileSync(path));
+    };
+    visit(root, "");
+    return hash.digest("hex");
+  };
+  const bundled = inspectBuiltTweakTree(sourceRoot);
+  const folders = listDirectories(liveRoot).filter((folder) => !folder.startsWith("."));
+  for (const folder of folders) {
+    if (!bundled.some((proof) => proof.folder === folder) || digest(join(sourceRoot, folder)) !== digest(join(liveRoot, folder))) {
+      throw new Error(`Installed tweak does not match verified bundle: ${folder}`);
+    }
+  }
+  return { folders: folders.sort(), sourceHash: digest(sourceRoot) };
+}
+
 function inspectBuiltTweakTree(root: string): DevSnapshotFolderProof[] {
   return listDirectories(root).map((folder) => {
     if (!isSafeFolder(folder)) throw new Error(`Unsafe built tweak folder: ${folder}`);
@@ -504,38 +629,61 @@ function symlinkTargetIsPresent(path: string): boolean {
 }
 
 async function watchDevelopmentSource(sourceRoot: string, liveTweaks: string, quiet: boolean): Promise<void> {
-  let timer: NodeJS.Timeout | undefined;
-  let running = false;
-  let rerun = false;
-  const run = async (): Promise<void> => {
-    if (running) { rerun = true; return; }
-    running = true;
+  const scheduler = createDevWatchScheduler(async () => {
     try {
       await runDevSyncCycle({ sourceRoot, liveTweaks });
       if (!quiet) console.log(kleur.green("✓ Development changes published."));
     } catch (error) {
       console.error(kleur.yellow(`Development changes rejected; live runtime preserved: ${errorMessage(error)}`));
-    } finally {
-      running = false;
-      if (rerun) { rerun = false; void run(); }
     }
-  };
+  });
   const watcher = watchFs(sourceRoot, { recursive: true }, (_event, filename) => {
-    const path = filename?.toString() ?? "";
-    if (shouldIgnoreDevWatchPath(path)) return;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => void run(), 250);
+    scheduler.onEvent(filename?.toString() ?? "");
   });
   if (!quiet) console.log(kleur.cyan("Watching the development checkout. Press Ctrl+C to stop."));
   await new Promise<void>((resolve) => {
-    const stop = (): void => { watcher.close(); resolve(); };
+    const stop = (): void => { scheduler.close(); watcher.close(); resolve(); };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
 }
 
+/** The event callback is exposed so generated/source events can be tested without a live watcher. */
+export function createDevWatchScheduler(runCycle: () => void | Promise<void>, debounceMs = 250): {
+  onEvent: (path: string) => void;
+  close: () => void;
+} {
+  let timer: NodeJS.Timeout | undefined;
+  let running = false;
+  let rerun = false;
+  let closed = false;
+  const run = async (): Promise<void> => {
+    if (closed) return;
+    if (running) { rerun = true; return; }
+    running = true;
+    try { await runCycle(); }
+    finally {
+      running = false;
+      if (rerun && !closed) { rerun = false; void run(); }
+    }
+  };
+  return {
+    onEvent(path) {
+      if (closed || shouldIgnoreDevWatchPath(path)) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { timer = undefined; void run(); }, debounceMs);
+    },
+    close() {
+      closed = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
+}
+
 export function shouldIgnoreDevWatchPath(path: string): boolean {
-  return /(^|\/)(?:\.git|node_modules|dist|packages\/installer\/assets\/runtime)(\/|$)/.test(path);
+  const normalized = path.replaceAll("\\", "/");
+  return /(^|\/)(?:\.git|node_modules|dist)(\/|$)/.test(normalized) ||
+    /(^|\/)packages\/installer\/(?:assets\/(?:runtime|managed-runtime)(\/|$)|\.assets\.publish-[^/]+(\/|$))/.test(normalized);
 }
 
 function errorMessage(error: unknown): string {

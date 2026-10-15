@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse, tokenizer } from "acorn";
+import { canonicalTweakersManagerRoot, tweakersManagerDescriptorPaths, verifyRetainedTweakersManagerGeneration } from "./manager-descriptor.js";
 import { resolveSealedManagerManagedRuntimeAssets, resolveSealedManagerRuntimeAssets, verifySealedManagerManagedRuntimeAssets, verifySealedManagerRuntimeAssets } from "./manager-runtime-assets.js";
 
 export interface DoctorImplementationScopes {
@@ -17,7 +18,7 @@ const digest = (value: unknown): string => `sha256:${createHash("sha256").update
 const tokens = (source: string): unknown => Array.from(tokenizer(source, { ecmaVersion: "latest", sourceType: "module" })).map(t => [t.type.label, (t as unknown as {value?: unknown}).value ?? null]);
 
 /** Hash the reachable declarations, import wiring and module initialization, not a UI bundle. */
-export function doctorCodeScopeFingerprint(root: string, entries: Array<[string, string[]]>): string {
+export function doctorCodeScopeFingerprint(root: string, entries: Array<[string, string[]]>, legacyDynamicImports = false): string {
   const modules = new Map<string, { source: string; nodes: Map<string, any>; imports: Map<string, [string, string]>; exports: Map<string, string>; initial: any[] }>();
   const selected = new Map<string, unknown>();
   const wildcardExports = new Map<string, string[]>();
@@ -90,6 +91,24 @@ export function doctorCodeScopeFingerprint(root: string, entries: Array<[string,
   const walk = (name: string, node: any): void => {
     if (!node || typeof node !== "object") return;
     const data = load(name);
+    // A static destructuring import consumes only its named exports. Treating
+    // it as a namespace import pulls promotion and Manager UI back into the
+    // candidate builder through artifact-retirement's two read-only helpers.
+    if (!legacyDynamicImports && node.type === "VariableDeclarator" && node.id?.type === "ObjectPattern"
+      && node.init?.type === "AwaitExpression" && node.init.argument?.type === "ImportExpression"
+      && typeof node.init.argument.source.value === "string") {
+      const path = node.init.argument.source.value;
+      for (const property of node.id.properties) {
+        if (property.type !== "Property" || property.computed || property.value?.type !== "Identifier"
+          || !["Identifier", "Literal"].includes(property.key?.type)) throw new Error(`Unsupported scoped dynamic import binding in ${name}`);
+        const symbol = property.key.type === "Identifier" ? property.key.name : property.key.value;
+        if (typeof symbol !== "string") throw new Error(`Invalid scoped dynamic import member in ${name}`);
+        dependency(name, path, symbol);
+      }
+      // dependency() also binds the target's initialization and transitive
+      // imports. The containing declaration already binds aliases and syntax.
+      return;
+    }
     if (node.type === "Identifier") {
       if (data.imports.has(node.name)) {
         const imported = data.imports.get(node.name)!;
@@ -104,12 +123,15 @@ export function doctorCodeScopeFingerprint(root: string, entries: Array<[string,
         const runtimeLoaders: Record<string, string[]> = {
           "commands/install": ["evidence.path", "runtimeModulePath"],
           "commands/create-variant": ['join(sourceRuntimeRoot,"account-router","shared-native-mode.js")'],
+          "shared-native-backend-transition": ['join(runtimeRoot,"account-router","shared-native-mode.js")', "adapterPath"],
+          "accepted-runtime-repair": ["path", 'join(runtimeRoot,"desktop-update-startup.js")',
+            'join(resolve(retained.moduleRoot,"../../.."),"packages","installer","assets","runtime","accepted-runtime-repair-bootstrap.js")'],
           "doctor-validation": ["adapterPath"],
           "protected-update-quarantine": ["bootstrapPath"],
           "protected-acceptance-coordinator": ["bootstrapPath"],
           "doctor-review": ['join(packagedRuntimeAssetsRoot(),"account-router","broker-socket.js")'],
           "doctor-independent": ['join(packagedRuntimeAssetsRoot(),"account-router","doctor-storage.js")', 'join(packagedRuntimeAssetsRoot(),"account-router","doctor-auth.js")'],
-          "manager-action-adapter": ['join(assets.root,"packages","installer","assets","runtime","account-router","transfer-recovery.js")'],
+          "manager-action-adapter": ['join(assets.root,"packages","installer","assets","runtime","account-router","transfer-recovery.js")', 'join(assets.root,"packages","installer","assets","runtime","account-router","broker-socket.js")'],
         };
         if (!runtimeLoaders[name]?.includes(argument)) throw new Error(`Unbound dynamic scoped loader: ${name}: ${argument}`);
         selected.set(`${name}:runtime-loader:${argument}`, "functional-runtime-payload-and-candidate-receipt");
@@ -136,7 +158,16 @@ export function doctorCodeScopeFingerprint(root: string, entries: Array<[string,
     if (requested === "*") { for (const symbol of data.exports.keys()) visit(name, symbol, true); for (const path of wildcardExports.get(name) ?? []) dependency(name, path, "*"); return; }
     const symbol = exported ? data.exports.get(requested) : requested;
     if (!symbol) {
-      const matches = (wildcardExports.get(name) ?? []).filter(path => load(relative(root, resolve(root, dirname(name), path)).replace(/\.js$/, "")).exports.has(requested));
+      const wildcards = wildcardExports.get(name) ?? [];
+      // A compatibility re-export can point at an installed package. It is
+      // resolved and hashed by dependency(), not as a path beneath src/.
+      if (wildcards.length === 1 && !wildcards[0]!.startsWith(".")) {
+        selected.set(`${name}:export:${requested}`, wildcards[0]);
+        dependency(name, wildcards[0]!, requested);
+        return;
+      }
+      const matches = wildcards.filter(path => path.startsWith(".")
+        && load(relative(root, resolve(root, dirname(name), path)).replace(/\.js$/, "")).exports.has(requested));
       if (matches.length !== 1) throw new Error(`Scoped export missing or ambiguous: ${name}:${requested}`);
       selected.set(`${name}:export:${requested}`, matches[0]); dependency(name, matches[0]!, requested); return;
     }
@@ -170,7 +201,7 @@ export function doctorCandidatePayloadFingerprint(root: string): string {
   const rows: unknown[] = [];
   const walk = (path: string): void => {
     const name = relative(root, path);
-    if (name === "runtime-fingerprint.json" || name === "native/Tweakers Doctor.app") return;
+    if (name === "runtime-fingerprint.json" || name === "native/Tweakers Manager.app" || name === "native/Tweakers Doctor.app") return;
     const stat = lstatSync(path);
     if (stat.isSymbolicLink()) { rows.push([name, "link", readlinkSync(path)]); return; }
     // Sealed publication removes write bits. Preserve behavior-relevant execute
@@ -181,15 +212,41 @@ export function doctorCandidatePayloadFingerprint(root: string): string {
   };
   walk(root); return digest(rows);
 }
+/** Verify equivalence to a sealed historical implementation, not unique builder
+ * provenance. Neither the old private input record nor signed receipt is edited. */
+export function findDoctorConstructionScopeEquivalence(previous: DoctorImplementationScopes | undefined, current: DoctorImplementationScopes): { generationId: string; sealSha256: string; previousConstruction: string; construction: string; payload: string } | null {
+  if (previous?.version !== 1 || previous.payload !== current.payload || previous.construction === current.construction) return null;
+  const paths = tweakersManagerDescriptorPaths(canonicalTweakersManagerRoot());
+  if (!existsSync(paths.generationsRoot)) return null;
+  const generations = readdirSync(paths.generationsRoot).filter(id => /^[a-f0-9]{64}$/.test(id))
+    .sort((a, b) => lstatSync(join(paths.generationsRoot, b)).mtimeMs - lstatSync(join(paths.generationsRoot, a)).mtimeMs);
+  for (const id of generations) {
+    try {
+      const historical = verifyRetainedTweakersManagerGeneration(id);
+      const payload = doctorCandidatePayloadFingerprint(historical.runtimeRoot);
+      if (payload !== current.payload) continue;
+      const entries: Array<[string, string[]]> = [["commands/create-variant", ["createTweakersVariantCandidateOnly"]]];
+      const legacy = digest({version: 1, payload, code: doctorCodeScopeFingerprint(historical.moduleRoot, entries, true)});
+      if (legacy !== previous.construction) continue;
+      const construction = digest({version: 1, payload, code: doctorCodeScopeFingerprint(historical.moduleRoot, entries)});
+      if (construction !== current.construction) continue;
+      return {generationId: id, sealSha256: historical.sealSha256, previousConstruction: legacy, construction, payload};
+    } catch { /* Unverified historical generations cannot authorize reuse. */ }
+  }
+  return null;
+}
+
 export function doctorImplementationScopes(moduleRoot?: string, runtimeRoot?: string): DoctorImplementationScopes {
   const managed = resolveSealedManagerManagedRuntimeAssets();
   const own = dirname(fileURLToPath(import.meta.url));
   const root = moduleRoot ?? (managed ? join(managed.root, "packages", "installer", "dist") : own);
   const runtime = runtimeRoot ?? resolveSealedManagerRuntimeAssets()?.root ?? join(root, "..", "assets", "runtime");
   const payload = doctorCandidatePayloadFingerprint(runtime);
-  const construction = digest({ version: 1, payload, code: doctorCodeScopeFingerprint(root, [["commands/create-variant", ["createTweakersVariantCandidateOnly"]]]) });
+  const construction = digest({ version: 1, payload, code: doctorCodeScopeFingerprint(root, [["commands/create-variant", ["createTweakersVariantCandidateOnly"]],
+    ["shared-native-backend-transition", ["sealAcceptedSharedNativeBackendTransition", "assertAcceptedSharedNativeBackendTransitionClosure"]]]) });
   const verification = digest({ version: 1, construction, code: doctorCodeScopeFingerprint(root, [["doctor-validation", ["collectDoctorValidation"]], ["doctor-compatibility", ["DOCTOR_CORE_CHECKS", "makeDoctorCompatibility", "assertDoctorCompatibility"]]]) });
-  const promotion = digest({ code: doctorCodeScopeFingerprint(root, [["commands/create-variant", ["createTweakersVariant"]], ["doctor-approval", ["consumeDoctorCandidateApproval"]], ["manager-action-adapter", ["createSealedTweakersManagerActionAdapter"]]]), payload });
+  const promotion = digest({ code: doctorCodeScopeFingerprint(root, [["commands/create-variant", ["createTweakersVariant", "resumeDeferredAcceptedBackendTransition", "replayAcceptedBackendTransition", "assertAcceptedBackendTransitionResumeAdmission", "stageIndependentTweakersRuntimeReadyExpectation", "readRuntimeReadyPromotionReceiptSha256", "commitPromotedVariantJournal"]], ["doctor-approval", ["consumeDoctorCandidateApproval"]],
+    ["shared-native-backend-transition", ["AcceptedBackendTransitionJournal"]], ["manager-action-adapter", ["createSealedTweakersManagerActionAdapter"]]]), payload });
   return { version: 1, construction, verification, promotion, payload };
 }
 export function sameDoctorCandidateImplementation(a: DoctorImplementationScopes | undefined, b: DoctorImplementationScopes): boolean {

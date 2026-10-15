@@ -1,8 +1,22 @@
 import type { DoctorImplementationScopes } from "./doctor-implementation.js";
+import type { AcceptedSharedNativeBackendTransitionRequest } from "./shared-native-backend-transition.js";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { DoctorReportV1, DoctorFindingV1 } from "@therealityreport/tweakers-sdk";
+
+export interface DoctorSuppliedNativeSourcePolicyV1 {
+  version: 1; nativeIdentity: string; nativeVersion: string; nativeBuild: string; sourceAppFingerprint: string;
+}
+export function isDoctorSuppliedNativeSourcePolicyV1(value: unknown): value is DoctorSuppliedNativeSourcePolicyV1 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Record<string, unknown>;
+  return Object.keys(policy).sort().join() === "nativeBuild,nativeIdentity,nativeVersion,sourceAppFingerprint,version"
+    && policy.version === 1 && typeof policy.nativeIdentity === "string" && /^sha256:[a-f0-9]{64}$/.test(policy.nativeIdentity)
+    && typeof policy.nativeVersion === "string" && policy.nativeVersion.length > 0 && policy.nativeVersion.length <= 256 && policy.nativeVersion.trim() === policy.nativeVersion
+    && typeof policy.nativeBuild === "string" && /^[0-9]+$/.test(policy.nativeBuild)
+    && typeof policy.sourceAppFingerprint === "string" && /^[a-f0-9]{64}$/.test(policy.sourceAppFingerprint);
+}
 
 export interface DoctorUpdateJobV1 {
   schemaVersion: 1;
@@ -11,6 +25,7 @@ export interface DoctorUpdateJobV1 {
   trigger?: "manual" | "available_update";
   availableUpdateBuild?: string;
   sourceOrigin?: "native" | "download";
+  suppliedNativeSourcePolicy?: DoctorSuppliedNativeSourcePolicyV1;
   id: string;
   pid: number;
   startedAt: string;
@@ -31,6 +46,7 @@ export interface DoctorUpdateJobV1 {
   supersededBy?: string;
   predecessorId?: string;
   resumeOnly?: boolean;
+  acceptedBackendTransition?: AcceptedSharedNativeBackendTransitionRequest;
   lastCompletedResult?: DoctorReportV1["update"];
   result: DoctorReportV1["update"];
   findings: DoctorFindingV1[];
@@ -74,6 +90,8 @@ export function readDoctorUpdateJob(root: string): DoctorUpdateJobV1 | null {
     || (value.workflowVersion === 2 && !value.trigger)
     || (value.availableUpdateBuild !== undefined && !/^[0-9]+$/.test(value.availableUpdateBuild))
     || (value.sourceOrigin !== undefined && !["native", "download"].includes(value.sourceOrigin))
+    || (value.suppliedNativeSourcePolicy !== undefined && (!isDoctorSuppliedNativeSourcePolicyV1(value.suppliedNativeSourcePolicy)
+      || value.suppliedNativeSourcePolicy.nativeIdentity !== value.nativeIdentity || value.sourceOrigin !== "native"))
     || value.schemaVersion !== 1 || !/^[a-f0-9-]{36}$/.test(value.id) || !Number.isSafeInteger(value.pid)
     || typeof value.nativeIdentity !== "string" || typeof value.installedIdentity !== "string" || typeof value.runtimeFingerprint !== "string"
     || !value.result || !["checking", "compatible", "fixes_required", "review_required"].includes(value.result.state)

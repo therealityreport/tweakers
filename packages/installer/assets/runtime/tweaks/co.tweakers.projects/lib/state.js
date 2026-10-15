@@ -191,20 +191,51 @@ function atomicWrite(fs, dir, target, bytes) {
   }
 }
 
+const nativeProjectCache = new Map();
+const MAX_NATIVE_STATE_BYTES = 64 * 1024 * 1024;
+
 function readNativeLocalProjects(env = process.env) {
   const fs = require("node:fs");
   const path = require("node:path");
+  let file;
   try {
     const codexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()
       ? env.CODEX_HOME.trim()
       : path.join(env.HOME || "", ".codex");
     if (!path.isAbsolute(codexHome)) return [];
-    const file = path.join(codexHome, ".codex-global-state.json");
+    file = path.join(codexHome, ".codex-global-state.json");
     const stat = fs.lstatSync(file);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8 * 1024 * 1024) return [];
-    return normalizeNativeLocalProjects(JSON.parse(fs.readFileSync(file, "utf8")));
+    if (!stat.isFile() || stat.isSymbolicLink()) return [];
+    const cached = nativeProjectCache.get(file);
+    if (stat.size > MAX_NATIVE_STATE_BYTES) {
+      if (!cached?.warned) console.warn(`Projects: native state exceeds ${MAX_NATIVE_STATE_BYTES} bytes; retaining last good projection`);
+      nativeProjectCache.set(file, { ...cached, projects: cached?.projects || [], warned: true });
+      return cached?.projects || [];
+    }
+    const revision = `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    if (cached?.revision === revision || cached?.pendingRevision === revision || cached?.failedRevision === revision) return cached.projects;
+    const accept = (contents) => normalizeNativeLocalProjects(JSON.parse(contents));
+    // Seed once at startup. Later changes are parsed off the request path so
+    // a large native registry does not block each Projects get/observation.
+    if (!cached) {
+      const projects = accept(fs.readFileSync(file, "utf8"));
+      nativeProjectCache.set(file, { revision, projects });
+      return projects;
+    }
+    cached.pendingRevision = revision;
+    void fs.promises.readFile(file, "utf8").then((contents) => {
+      const current = fs.lstatSync(file);
+      if (`${current.dev}:${current.ino}:${current.mtimeMs}:${current.size}` !== revision) return;
+      cached.projects = accept(contents);
+      cached.revision = revision;
+      cached.failedRevision = null;
+    }).catch((error) => {
+      cached.failedRevision = revision;
+      console.warn(`Projects: native state refresh failed (${error?.code || "invalid-data"}); retaining last good projection`);
+    }).finally(() => { if (cached.pendingRevision === revision) cached.pendingRevision = null; });
+    return cached.projects;
   } catch {
-    return [];
+    return nativeProjectCache.get(file)?.projects || [];
   }
 }
 
@@ -447,24 +478,41 @@ function mergeLegacyAssignments(projectState, legacy) {
 function bindNativeProjectIdentities(state, nativeProjects) {
   if (!state?.nodes) return state;
   const runtimeState = clone(state);
+  const native = (Array.isArray(nativeProjects) ? nativeProjects : []).filter(isRecord);
+  const currentNativeIds = new Set(native.map((project) => project.id));
+  const nonProjectIds = new Set(runtimeState.nodes.filter((node) => node.type !== "project").map((node) => node.id));
+  const nativeIdsByPath = new Map();
+  for (const project of native) {
+    for (const rootPath of [...(Array.isArray(project.rootPaths) ? project.rootPaths : []), ...(Array.isArray(project.rootPathAliases) ? project.rootPathAliases : [])]) {
+      const owners = nativeIdsByPath.get(rootPath) || new Set();
+      owners.add(project.id);
+      nativeIdsByPath.set(rootPath, owners);
+    }
+  }
   const projectsByPath = new Map();
   for (const node of runtimeState.nodes) {
     delete node.nativeProjectIds;
     delete node.nativeProjectNames;
     delete node.nativeProjectPaths;
-    if (node.type !== "project" || !node.projectPath) continue;
+    // A current native-ID owner cannot acquire another native ID merely
+    // because both projects use the same root. Path matching is legacy-only.
+    if (node.type !== "project" || !node.projectPath || currentNativeIds.has(node.id)) continue;
     const matches = projectsByPath.get(node.projectPath) || [];
     matches.push(node);
     projectsByPath.set(node.projectPath, matches);
   }
-  for (const nativeProject of Array.isArray(nativeProjects) ? nativeProjects : []) {
-    const matches = new Set();
+  for (const nativeProject of native) {
+    if (nonProjectIds.has(nativeProject.id)) continue;
+    const matches = new Set(runtimeState.nodes.filter((node) => node.type === "project" && node.id === nativeProject.id));
     const identityPaths = [
       ...(Array.isArray(nativeProject?.rootPaths) ? nativeProject.rootPaths : []),
       ...(Array.isArray(nativeProject?.rootPathAliases) ? nativeProject.rootPathAliases : []),
     ];
-    for (const rootPath of identityPaths) {
-      for (const project of projectsByPath.get(rootPath) || []) matches.add(project);
+    if (matches.size === 0) {
+      for (const rootPath of identityPaths) {
+        if (nativeIdsByPath.get(rootPath)?.size !== 1) continue;
+        for (const project of projectsByPath.get(rootPath) || []) matches.add(project);
+      }
     }
     if (matches.size !== 1) continue;
     const [project] = matches;
@@ -476,6 +524,37 @@ function bindNativeProjectIdentities(state, nativeProjects) {
     ])];
   }
   return runtimeState;
+}
+
+/** Discover additions without changing saved appearances, order, or disk state.
+ * New nodes use the native ID, so equal labels and registry reorder cannot
+ * change their identity. Unbound legacy names remain ambiguous until repaired. */
+function reconcileNativeProjectDiscovery(state, nativeProjects) {
+  const next = normalizeState(state);
+  const native = Array.isArray(nativeProjects) ? nativeProjects : [];
+  const currentNativeIds = new Set(native.filter(isRecord).map((project) => project.id));
+  const bound = bindNativeProjectIdentities(next, native);
+  const represented = new Set(bound.nodes.filter((node) => node.type === "project")
+    .flatMap((node) => [node.id, ...(node.nativeProjectIds || [])]));
+  const ids = new Set(next.nodes.map((node) => node.id));
+  for (const candidate of native) {
+    if (!isRecord(candidate) || represented.has(candidate.id) || ids.has(candidate.id)
+      || next.nodes.length >= MAX_NODES) continue;
+    if (next.nodes.some((node) => node.type === "project" && !node.projectPath && !currentNativeIds.has(node.id)
+      && projectNativeNames(node).includes(candidate.name))) continue;
+    try {
+      const id = safeId(candidate.id);
+      const seeded = seedProjectsFromNativeRegistry([candidate]).nodes[0];
+      if (!seeded) continue;
+      const node = normalizeState({ schemaVersion: 1, nodes: [{ ...seeded, id }] }).nodes[0];
+      next.nodes.push(node);
+      ids.add(id);
+      represented.add(id);
+    } catch {
+      // An invalid native entry must not discard the last usable projection.
+    }
+  }
+  return next;
 }
 
 function projectNativeNames(project) {
@@ -630,6 +709,7 @@ module.exports = {
   updateChromeProfileAssignment,
   mergeLegacyAssignments,
   bindNativeProjectIdentities,
+  reconcileNativeProjectDiscovery,
   projectNativeNames,
   projectForNativeIdentity,
   seedProjectsFromNativeSurface,

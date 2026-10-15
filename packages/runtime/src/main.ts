@@ -1,3 +1,17 @@
+import { acquireStoreTweak, assertStoreTweakCleanForAutoUpdate } from "./store-acquisition";
+import { installStoreTransaction, reconcileStoreTransactions, StoreTransactionError } from "./store-transaction";
+import { createTweakLifecycleBarrier } from "./tweak-lifecycle-barrier";
+import { topicMigrationOwner } from "./tweak-topic-migration";
+import { BackendMods } from "./backend-mods";
+import { attachBackendMods } from "./backend-mod-transport";
+import { attestNativeDesktopConfigV1 } from "./account-router/native-desktop-config";
+import type { DesktopAppToolsContextV1 } from "./account-router/desktop-app-tools";
+import { createStartupPolicyAuthorization, createStartupPolicyHandshake } from "./account-router/startup-policy";
+import { sharedNativePluginPreparationTimeoutV1 } from "./account-router/shared-native-mode";
+import { nativeServicesDescriptor } from "./native-services-descriptor";
+import { readNativeStorageHomeV1 } from "./account-router/native-storage";
+import { TweakResources, guardTweakApi } from "./tweak-resources";
+import { acquireProcessLock, readLockOwner } from "@therealityreport/tweakers-sdk/dist/process-lock.js";
 /**
  * Main-process bootstrap. Loaded by the asar loader before Codex's own
  * main process code runs. We hook `BrowserWindow` so every window Codex
@@ -7,13 +21,14 @@
  * We are in CJS land here (matches Electron's main process and Codex's own
  * code). The renderer-side runtime is bundled separately into preload.js.
  */
-import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, protocol, screen, session, shell, systemPreferences, webContents, type MessageBoxOptions, type OpenDialogOptions } from "electron";
-import { cpSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { app, BrowserView, BrowserWindow, clipboard, dialog, ipcMain, Menu, protocol, screen, session, shell, systemPreferences, webContents, type MessageBoxOptions, type OpenDialogOptions } from "electron";
+import { closeSync, cpSync, createWriteStream, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import * as originalFs from "original-fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomInt, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { Transform, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { extract as extractTar, list as listTar } from "tar";
@@ -25,8 +40,9 @@ import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } fr
 import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
 import { applyHealthProbeDialogSuppression } from "./health-probe-dialog";
 import { installIndependentStartupRecovery } from "./independent-startup-recovery";
-import { readTweakersDoctor, runTweakersDoctorAction, openTweakersDoctor, openTweakersManager } from "./tweakers-manager-client";
-import { isTweakersManagerSection, type DoctorActionRequestV1 } from "@therealityreport/tweakers-sdk";
+import { assertAcceptedRuntimeRepairChallengeCurrent } from "./accepted-runtime-repair-bootstrap";
+import { readTweakersDoctor, runTweakersDoctorAction, openTweakersDoctorAsync, openTweakersManagerAsync } from "./tweakers-manager-client";
+import { acceptedRuntimeRepairReadinessFields, assertAcceptedRuntimeRepairReadinessVersionContract, isTweakersManagerSection, type AcceptedRuntimeRepairReadyBindingV1, type DoctorActionRequestV1 } from "@therealityreport/tweakers-sdk";
 import { hashRawAsarHeader } from "./promotion-asar";
 import {
   fingerprintPromotionCodexConfigPath,
@@ -38,10 +54,12 @@ import {
   resolveMcpRuntimePaths,
   type McpSyncTrigger,
 } from "./mcp-reconciliation";
-import { getAndPublishWatcherHealth, getWatcherHealth, readRuntimeFingerprintEvidence } from "./watcher-health";
+import { getAndPublishWatcherHealthAsync, readRuntimeFingerprintEvidence, readRuntimeFingerprintEvidenceAsync } from "./watcher-health";
+import { resolveAcceptanceConfig, runRuntimeDiagnosticDiskOperation } from "./acceptance-config";
 import {
   isMainProcessTweakScope,
   bindMainTweakStop,
+  DEFAULT_TWEAK_STARTUP_TIMEOUT_MS,
   normalizeTweakStartupTimeoutMs,
   runWithStartupTimeout,
   reloadTweaks,
@@ -50,6 +68,7 @@ import {
   lifecycleRecordKey,
   recoverInterruptedTweaks,
   loadTweaksInitially,
+  enqueueTweakLifecycle,
   type TweakLifecycleJournal,
   type TweakLifecycleRecord,
   type TweakLifecycleStatus,
@@ -76,8 +95,6 @@ import type {
   NativePanelCreateOptions,
   NativeViewAttachOptions,
   TweakPermission,
-  CodexHotkeyRegistration,
-  FrontmostWindowCapture,
   CodexPermissionStatus,
 } from "@therealityreport/tweakers-sdk";
 import {
@@ -85,7 +102,6 @@ import {
   normalizeGitHubRepo,
   normalizeStoreRegistry,
   shuffleStoreEntries,
-  storeArchiveUrl,
   type TweakStorePublishSubmission,
   type TweakStoreEntry,
   type TweakStoreRegistry,
@@ -114,6 +130,7 @@ import {
 } from "./desktop-update-startup";
 import {
   AccountsBrokerSocketClientV1,
+  probeAccountsBrokerControlStatus,
   readAccountsBrokerSecret,
   resolveAccountsBrokerRootResolution,
 } from "./account-router/broker-socket";
@@ -172,6 +189,7 @@ import {
   applyManagedCodexCliLaneAtBootstrap,
   createCodexCliManager,
   mutateCodexFeature,
+  resolveBundledCodexBinary,
   type ArchiveEntry,
   type CodexCliManagerDependencies,
 } from "./codex-cli-manager";
@@ -202,10 +220,10 @@ import {
   type CodexDesktopUpdateTarget,
 } from "./codex-desktop-update-service";
 import {
-  readTweakersManagerOfficialSourceRegistration,
-  readTweakersManagerStatus,
-  startTweakersManagerOfficialSourceRegistration,
-  startTweakersManagerAction,
+  readTweakersManagerOfficialSourceRegistrationAsync,
+  readTweakersManagerStatusAsync,
+  startTweakersManagerOfficialSourceRegistrationAsync,
+  startTweakersManagerActionAsync,
   type TweakersManagerStatus,
 } from "./tweakers-manager-client";
 import {
@@ -238,7 +256,6 @@ const LEGACY_MANUAL_UPDATE_ENV = ["CODEX", "PLUSPLUS", "MANUAL_UPDATE"].join("_"
 const LEGACY_STORE_INDEX_ENV = ["CODEX", "PLUSPLUS", "STORE_INDEX_URL"].join("_");
 const LEGACY_REMOTE_DEBUG_ENV = [["CODEX", "PP"].join(""), "REMOTE_DEBUG"].join("_");
 const LEGACY_REMOTE_DEBUG_PORT_ENV = [["CODEX", "PP"].join(""), "REMOTE_DEBUG_PORT"].join("_");
-const LEGACY_STORE_METADATA = [".codex", "pp-store.json"].join("");
 const LEGACY_DATA_DIR = ["codex", "plusplus"].join("-");
 const LEGACY_WINDOW_SERVICES_KEY = ["__codex", "pp_window_services__"].join("");
 const userRoot = process.env.TWEAKERS_USER_ROOT
@@ -260,6 +277,10 @@ const derivedVariant = !desktopUpdateStartupEnabled(process.env, {
   appPath: runningAppRoot,
   bundleIdentifier: runningAppRoot ? readBundleIdentifier(runningAppRoot) : null,
 });
+// Native Codex owns the canonical signed Computer Use helper. A derived app
+// must never replace it with its re-signed bundled copy during native startup.
+if (derivedVariant) process.env.CODEX_ELECTRON_SKIP_COMPUTER_USE_CANONICAL_REFRESH = "1";
+
 // This is deliberately ahead of app-server interception and every tweak
 // lifecycle. A derived process that cannot prove its committed generation
 // never gets a chance to create a local broker, child, or renderer surface.
@@ -267,7 +288,48 @@ const derivedVariant = !desktopUpdateStartupEnabled(process.env, {
 // The active-generation receipt must hash the physical archive and bundle, so
 // pass the adapter that bypasses Electron's ASAR virtualization. This is kept
 // local to the receipt verifier; process.noAsar is intentionally never set.
-assertTweakersVariantBootstrap({ fileSystem: originalFs as unknown as TweakersVariantFilesystem });
+const acceptedRuntimeRepairBootstrap = assertTweakersVariantBootstrap({ fileSystem: originalFs as unknown as TweakersVariantFilesystem });
+if (derivedVariant) {
+  // A user-wide identity covers every Tweakers profile and candidate path.
+  // It is distinct from native Codex and also applies to health probes.
+  const desktopLockPath = join(userInfo().homedir, "Library", "Application Support", "Tweakers", "desktop-instance.lock");
+  const identityPath = `${desktopLockPath}.identity.json`;
+  const processStart = (pid: number): string | null => {
+    const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {encoding:"utf8",timeout:2000});
+    return result.status === 0 && result.stdout.trim() ? result.stdout.trim() : null;
+  };
+  let contended = false;
+  try {
+    const desktopLease = acquireProcessLock(desktopLockPath, {onContended: () => {
+      contended = true; return new Error("Tweakers desktop identity is occupied");
+    }});
+    try {
+      const startedAt = processStart(process.pid);
+      if (!startedAt || !runningAppRoot) throw new Error("Cannot establish Tweakers desktop process identity");
+      const temporary = `${identityPath}.${process.pid}.tmp`;
+      writeFileSync(temporary, JSON.stringify({pid:process.pid,startedAt,appPath:realpathSync(runningAppRoot)}), {mode:0o600,flag:"wx"});
+      renameSync(temporary, identityPath);
+    } catch (error) { desktopLease.release(); throw error; }
+    app.once("will-quit", () => desktopLease.release());
+    process.once("exit", () => desktopLease.release());
+  } catch (error) {
+    const owner = readLockOwner(desktopLockPath);
+    let verifiedOwner = false;
+    try {
+      const identity = JSON.parse(readFileSync(identityPath,"utf8"));
+      const command = owner ? spawnSync("/bin/ps",["-p",String(owner),"-o","comm="],{encoding:"utf8",timeout:2000}) : null;
+      verifiedOwner = contended && !!owner && identity.pid === owner && identity.startedAt === processStart(owner)
+        && typeof identity.appPath === "string" && command?.status === 0 && command.stdout.trim().startsWith(`${identity.appPath}/Contents/MacOS/`);
+    } catch { /* An unidentified owner must never receive activation. */ }
+    if (!verifiedOwner) throw new Error(`Tweakers desktop lock could not be verified: ${error instanceof Error ? error.message : "unknown failure"}`);
+    if (!healthCheckOnly && owner) {
+      // Address the exact existing process, never a same-name native app.
+      spawn("/usr/bin/osascript", ["-e", `tell application "System Events" to set frontmost of first process whose unix id is ${owner} to true`], { stdio: "ignore" }).unref();
+    }
+    app.exit(healthCheckOnly ? 1 : 0);
+    throw new Error("A Tweakers desktop is already running; concurrent launch refused");
+  }
+}
 const accountsBrokerRootResolution = resolveAccountsBrokerRootResolution({ userRoot, derivedVariant });
 const accountsBrokerRoot = accountsBrokerRootResolution.root;
 // This boolean is the only invalid-root fact passed to the app-server parent;
@@ -282,6 +344,12 @@ const accountsAuthorityMode = resolveAccountsAuthorityMode({
 });
 Object.defineProperty(globalThis, "__tweakersAccountsDesktopProjectsEnabledV1", {
   value: () => derivedVariant && accountsAuthorityMode === "global-v3",
+  configurable: false,
+  writable: false,
+});
+Object.defineProperty(globalThis, "__tweakersAccountsStorageHomeV1", {
+  value: () => derivedVariant && accountsAuthorityMode === "global-v3" && accountsBrokerRoot
+    ? readNativeStorageHomeV1(accountsBrokerRoot) : null,
   configurable: false,
   writable: false,
 });
@@ -367,12 +435,56 @@ const HEALTH_RECEIPT_WATCHDOG_MS = 30_000;
 // This keeps the locally signed desktop shell outside the native browser
 // peer-authorizer's three-process ancestry window while preserving all of the
 // native host's existing signature and identifier checks.
+const backendMods = new BackendMods();
+let startupPolicyActive = false;
+function nativeStartupPreparationTimeoutMs(fallbackMs: number): number {
+  return accountsBrokerRoot && accountsBrokerSecret
+    ? sharedNativePluginPreparationTimeoutV1(accountsBrokerRoot, accountsBrokerSecret, fallbackMs)
+    : fallbackMs;
+}
+if (derivedVariant && !healthCheckOnly) {
+  Object.defineProperty(globalThis, "__tweakersStartupPolicyV1", { value: {
+    preparationTimeoutMs: () => nativeStartupPreparationTimeoutMs(30_000),
+    async run<T>(read: () => Promise<T>): Promise<T> {
+      if (startupPolicyActive) throw new Error("Startup policy read is already active");
+      startupPolicyActive = true;
+      try { return await read(); } finally { startupPolicyActive = false; }
+    },
+    diagnostic(value: { phase: unknown; reason: unknown; attempt: unknown; retrying: unknown }) {
+      const phases = ["home-creation", "preparation", "policy-read", "policy-validation", "node-permissions"];
+      const reasons = ["auth", "config", "unavailable", "timeout", "transport", "rpc", "process", "protocol", ...phases];
+      log("warn", "native startup policy blocked", {
+        phase: phases.includes(String(value.phase)) ? value.phase : "unknown",
+        reason: reasons.includes(String(value.reason)) ? value.reason : "unknown",
+        attempt: Number.isSafeInteger(value.attempt) ? value.attempt : null,
+        retrying: value.retrying === true,
+      });
+    },
+  }, configurable: false, writable: false });
+}
+const nativeDesktopToolContexts = new Set<DesktopAppToolsContextV1>();
+Object.defineProperty(globalThis, "__tweakersAttestNativeDesktopConfigV1", { configurable: false, writable: false,
+  value: (config: unknown) => {
+    if (!derivedVariant || accountsAuthorityMode !== "global-v3") return config;
+    if (!accountsBrokerSecret || nativeDesktopToolContexts.size !== 1) throw new Error("Native desktop tool context unavailable");
+    return attestNativeDesktopConfigV1(accountsBrokerSecret, [...nativeDesktopToolContexts][0]!, config);
+  },
+});
 const codexAppServerParent = installCodexAppServerParent({
+  onDesktopAppToolsContext: (child, context) => {
+    nativeDesktopToolContexts.add(context);
+    child.once("exit", () => nativeDesktopToolContexts.delete(context));
+    child.once("error", () => nativeDesktopToolContexts.delete(context));
+  },
+  onAppServerSpawn: child => attachBackendMods(child, backendMods),
   onAuthenticationRecovery: derivedVariant && !healthCheckOnly ? () => {
-    const openRecoveryManager = () => openTweakersManager("doctor");
+    const openRecoveryManager = () => { void openTweakersManagerAsync("doctor").catch(error => log("warn", "Could not open recovery Manager", {error:String(error)})); };
     if (app.isReady()) openRecoveryManager(); else app.once("ready", openRecoveryManager);
   } : undefined,
   secondaryVariant: derivedVariant,
+  startupPolicyHandshake: () => startupPolicyActive && accountsBrokerSecret
+    ? createStartupPolicyHandshake(accountsBrokerSecret, createStartupPolicyAuthorization(accountsBrokerSessionNonce, Date.now(),
+      nativeStartupPreparationTimeoutMs(30_000))) : null,
   secondaryVariantSharedSqliteHome: derivedVariant
     ? process.env.CODEX_SQLITE_HOME
     : undefined,
@@ -780,7 +892,12 @@ const PROMOTION_HEALTH_PRELOAD_PATH = resolve(runtimeDir, "promotion-health-prel
 const TWEAKS_DIR = join(userRoot, "tweaks");
 const LOG_DIR = join(userRoot, "log");
 const LOG_FILE = join(LOG_DIR, "main.log");
-const CONFIG_FILE = join(userRoot, "config.json");
+const acceptanceConfig = resolveAcceptanceConfig({ userRoot, derivedVariant, healthCheckOnly: healthCheckOnly || process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1",
+  // Drift still fails closed, but as a deliberate stop: a tweak reload or
+  // journal write inside an event handler must not end as uncaughtException.
+  onDrift: (error) => { log("error", "acceptance configuration drifted; stopping acceptance launch", { message: error.message }); app.exit(1); } });
+const CONFIG_FILE = acceptanceConfig?.path ?? join(userRoot, "config.json");
+app.once("will-quit", () => acceptanceConfig?.close());
 const MCP_RUNTIME_PATHS = resolveMcpRuntimePaths({
   userRoot,
   homeDirectory: homedir(),
@@ -833,7 +950,9 @@ let independentTweakersBrokerProbeInFlight = false;
 if (derivedVariant) {
   // A receipt belongs to one process and one manager operation. Never let a
   // newly launched process inherit proof from a prior promotion.
-  try { rmSync(RUNTIME_READY_FILE, { force: true }); } catch {}
+  runRuntimeDiagnosticDiskOperation(acceptanceConfig, () => {
+    try { rmSync(RUNTIME_READY_FILE, { force: true }); } catch {}
+  });
 }
 const healthOriginalMain = healthCheckOnly
   && process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
@@ -875,17 +994,51 @@ if (healthCheckOnly && process.platform === "darwin") {
   try { app.setActivationPolicy("prohibited"); } catch {}
   try { app.dock?.hide(); } catch {}
 }
-// [3d] requestSingleInstanceLock as defense-in-depth against duplicate launches.
-//
-// CAVEAT: this does NOT catch installer-side launches — the installer opens the
-// app via `open`/LaunchServices, which can spawn or route independently of this
-// process lock; the real duplicate-Dock-icon fix is the installer's single
-// deterministic launch path (task 3a). And because this is injected code, our
-// evaluation order relative to OpenAI's own entrypoint (and any single-instance
-// handling it may already do) is NOT guaranteed. Treat this as belt-and-
-// suspenders, not the primary fix. Skipped for the health-check probe, which is
-// intentionally a short-lived second instance that must run and then exit.
-if (!healthCheckOnly) {
+// The derived app keeps the upstream internal name (renaming it would move
+// Chromium's Keychain-backed storage and sign the user out), so the app menu
+// says "About/Hide/Quit ChatGPT". Relabel only those app-menu items.
+if (derivedVariant && !healthCheckOnly && process.platform === "darwin") {
+  const nativeSetApplicationMenu = Menu.setApplicationMenu.bind(Menu);
+  const relabel = (menu: Electron.Menu | null): void => {
+    const appMenu = menu?.items?.[0]?.submenu;
+    if (!appMenu) return;
+    const upstream = app.getName();
+    if (!upstream || upstream === "Tweakers") return;
+    for (const item of appMenu.items) {
+      if (typeof item.label === "string" && item.label.endsWith(` ${upstream}`)
+        && /^(About|Hide|Quit|Uninstall) /.test(item.label)) {
+        try { item.label = `${item.label.slice(0, -upstream.length)}Tweakers`; } catch { /* read-only on some builds */ }
+      }
+    }
+    try { if (menu?.items?.[0] && menu.items[0].label === upstream) menu.items[0].label = "Tweakers"; } catch { /* cosmetic */ }
+  };
+  Menu.setApplicationMenu = (menu: Electron.Menu | null): void => {
+    relabel(menu);
+    nativeSetApplicationMenu(menu);
+  };
+}
+// Upstream asks "Quit <app>?" on every quit whenever any scheduled task is
+// enabled, even with nothing running. Tweakers' scheduled tasks are its own and
+// the native app keeps running, so answer that one scheduled-tasks-only prompt
+// with Quit. Active or starting chats still get the confirmation.
+if (derivedVariant && !healthCheckOnly) {
+  const nativeShowMessageBoxSync = dialog.showMessageBoxSync.bind(dialog);
+  const scheduledOnlyQuitPrompt = (options: MessageBoxOptions): boolean => {
+    const name = app.getName();
+    return options?.title === `Quit ${name}?` && options.message === `Quit ${name}?`
+      && Array.isArray(options.buttons) && options.buttons[0] === "Quit" && options.buttons[1] === "Cancel"
+      && options.detail === `Scheduled tasks won't run while ${name} is closed`;
+  };
+  (dialog as { showMessageBoxSync: (...args: unknown[]) => number }).showMessageBoxSync = (...args: unknown[]): number => {
+    const options = (args.length > 1 ? args[1] : args[0]) as MessageBoxOptions;
+    if (scheduledOnlyQuitPrompt(options)) {
+      log("info", "quit confirmation skipped: only scheduled tasks were enabled");
+      return 0;
+    }
+    return (nativeShowMessageBoxSync as (...a: unknown[]) => number)(...args);
+  };
+}
+if (!derivedVariant && !healthCheckOnly) {
   try {
     const gotSingleInstanceLock = app.requestSingleInstanceLock();
     if (!gotSingleInstanceLock) {
@@ -904,7 +1057,7 @@ if (!healthCheckOnly) {
     log("warn", "single-instance lock setup failed", { message: (error as Error).message });
   }
 }
-const TWEAKER_VERSION = "1.0.0";
+const TWEAKER_VERSION = "1.1.0";
 const TWEAKER_REPO = "therealityreport/tweakers";
 const TWEAK_STORE_INDEX_URL = process.env.TWEAKER_STORE_INDEX_URL
   ?? process.env[LEGACY_STORE_INDEX_ENV]
@@ -1034,7 +1187,7 @@ function independentManagerStatusDeferredForRuntimeReady(): boolean {
   return !runtimeReadyPublished && independentRuntimeReadyCommitPending();
 }
 
-function independentManagerStatusProjection(): IndependentManagerStatusProjection {
+async function independentManagerStatusProjection(): Promise<IndependentManagerStatusProjection> {
   if (!derivedVariant) {
     return {
       deploymentKind: "injected",
@@ -1053,7 +1206,7 @@ function independentManagerStatusProjection(): IndependentManagerStatusProjectio
     };
   }
   try {
-    const status = readTweakersManagerStatus();
+    const status = await readTweakersManagerStatusAsync();
     return {
       deploymentKind: "independent",
       manager: { available: true, reason: null, status: status.status, actions: status.actions },
@@ -1161,7 +1314,7 @@ interface TweakHealthSnapshot {
 
 function readState(): PersistedState {
   try {
-    const state = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as PersistedState;
+    const state = (acceptanceConfig ? acceptanceConfig.read() : JSON.parse(readFileSync(CONFIG_FILE, "utf8"))) as PersistedState;
     const record = state as PersistedState & Record<string, unknown>;
     const legacy = record[LEGACY_CONFIG_KEY];
     if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
@@ -1172,15 +1325,32 @@ function readState(): PersistedState {
     }
     delete record[LEGACY_CONFIG_KEY];
     return state;
-  } catch {
+  } catch (error) {
+    if (acceptanceConfig) throw error;
     return {};
   }
 }
 function writeState(s: PersistedState): void {
+  if (acceptanceConfig) {
+    acceptanceConfig.write(s as Record<string, unknown>);
+    return;
+  }
+  const temporary = join(dirname(CONFIG_FILE), `.config.${process.pid}.${randomUUID()}.tmp`);
   try {
-    writeFileSync(CONFIG_FILE, JSON.stringify(s, null, 2));
+    const descriptor = openSync(temporary, "wx", 0o600);
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(s, null, 2)}\n`);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporary, CONFIG_FILE);
+    const directory = openSync(dirname(CONFIG_FILE), "r");
+    try { fsyncSync(directory); } finally { closeSync(directory); }
   } catch (e) {
     log("warn", "writeState failed:", String((e as Error).message));
+  } finally {
+    try { unlinkSync(temporary); } catch { /* renamed or never created */ }
   }
 }
 
@@ -1213,7 +1383,9 @@ const codexCliBootstrap = applyManagedCodexCliLaneAtBootstrap({
 // The schema-v2 environment proof belongs only to the injected ChatGPT mode
 // transaction. Independent Tweakers has its own operation-bound runtime-ready
 // receipt and deliberately has no injected managed-runtime/current tree.
-if (!healthCheckOnly && !derivedVariant) writeEnvironmentRuntimeProof();
+if (!healthCheckOnly && !derivedVariant) {
+  void app.whenReady().then(() => setImmediate(writeEnvironmentRuntimeProof));
+}
 
 const CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases?per_page=100";
 const MAX_CODEX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
@@ -1397,6 +1569,23 @@ function setTweakEnabled(id: string, enabled: boolean): void {
   s.tweaks ??= {};
   s.tweaks[id] = { ...s.tweaks[id], enabled };
   writeState(s);
+  if (id === ACCOUNTS_TWEAK_ID) syncAccountsRoutingMarker();
+}
+
+// Mirrors ACCOUNTS_ROUTING_SUSPENDED_FILE in account-router/broker-host.ts.
+// Local projects/sessions are shared history and keep working either way;
+// only automatic switching between subscriptions follows the Accounts toggle.
+const ACCOUNTS_TWEAK_ID = "co.tweakers.account-switcher";
+const ACCOUNTS_ROUTING_SUSPENDED_MARKER = "accounts-routing-suspended.v1.json";
+function syncAccountsRoutingMarker(): void {
+  if (!derivedVariant || !accountsBrokerRoot) return;
+  const marker = join(accountsBrokerRoot, ACCOUNTS_ROUTING_SUSPENDED_MARKER);
+  try {
+    if (isTweakEnabled(ACCOUNTS_TWEAK_ID)) rmSync(marker, { force: true });
+    else if (!existsSync(marker)) writeFileSync(marker, `${JSON.stringify({ version: 1, suspendedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+  } catch (error) {
+    log("warn", "could not update Accounts routing marker", { message: String((error as Error)?.message ?? error) });
+  }
 }
 
 function tweakHealth(id: string): TweakHealthRecord | null {
@@ -1488,6 +1677,7 @@ const lifecycleAttemptId = randomUUID();
 let lifecycleJournal: TweakLifecycleJournal;
 
 function readTweakLifecycleJournal(): TweakLifecycleJournal {
+  return runRuntimeDiagnosticDiskOperation(acceptanceConfig, (): TweakLifecycleJournal => {
   try {
     const parsed = JSON.parse(readFileSync(TWEAK_LIFECYCLE_FILE, "utf8")) as Partial<TweakLifecycleJournal>;
     if (parsed.schemaVersion !== 1 || !parsed.records || typeof parsed.records !== "object") {
@@ -1503,14 +1693,17 @@ function readTweakLifecycleJournal(): TweakLifecycleJournal {
   } catch {
     return createTweakLifecycleJournal("uninitialized", process.pid);
   }
+  }) ?? createTweakLifecycleJournal("uninitialized", process.pid);
 }
 
 function writeTweakLifecycleJournal(): void {
+  runRuntimeDiagnosticDiskOperation(acceptanceConfig, () => {
   try {
     writeFileSync(TWEAK_LIFECYCLE_FILE, JSON.stringify(lifecycleJournal, null, 2));
   } catch (error) {
     log("warn", "failed to persist tweak lifecycle journal:", String(error));
   }
+  });
 }
 
 function beginTweakLifecycleAttempt(): void {
@@ -1636,6 +1829,7 @@ function readBundleIdentifier(appRoot: string): string | null {
 }
 
 function writeEnvironmentRuntimeProof(): void {
+  runRuntimeDiagnosticDiskOperation(acceptanceConfig, () => {
   try {
     const proofUserRoot = userRoot;
     if (!proofUserRoot) throw new Error("could not determine the Tweakers user root");
@@ -1707,10 +1901,12 @@ function writeEnvironmentRuntimeProof(): void {
     try { rmSync(ENVIRONMENT_RUNTIME_PROOF_FILE, { force: true }); } catch {}
     log("error", "environment runtime proof failed", { message: (error as Error).message });
   }
+  });
 }
 
 interface RuntimeReadyExpectation {
-  schemaVersion: 5;
+  schemaVersion: 5 | 6;
+  runtimeRepair?: AcceptedRuntimeRepairReadyBindingV1;
   kind: "tweakers-independent-runtime-ready-expectation";
   operationId: string;
   promotionId: string;
@@ -1786,12 +1982,14 @@ interface IndependentTweakersLiveHealthV1 {
 function isRuntimeReadyExpectation(value: unknown): value is RuntimeReadyExpectation {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
+  try { assertAcceptedRuntimeRepairReadinessVersionContract(record); } catch { return false; }
   const keys = [
     "schemaVersion", "kind", "operationId", "promotionId", "activePromotionReceiptSha256", "appRoot", "bundleId", "appAsarHeaderHash",
     "runtimeFingerprint", "appUserDataRoot", "codexHomeRoot", "accountsBrokerRoot", "brokerAuthorityExpectation", "appearanceExpectation", "expectedTweakIds", "createdAt",
+    ...(record.schemaVersion === 6 ? ["runtimeRepair"] : []),
   ];
   if (Object.keys(record).sort().join("\0") !== [...keys].sort().join("\0")) return false;
-  return record.schemaVersion === 5
+  return (record.schemaVersion === 5 || record.schemaVersion === 6)
     && record.kind === "tweakers-independent-runtime-ready-expectation"
     && typeof record.operationId === "string"
     && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(record.operationId)
@@ -1853,17 +2051,66 @@ function sameRuntimeReadyAppearanceBinding(
 }
 
 function readRuntimeReadyExpectation(): RuntimeReadyExpectation | null {
+  // Temporary enablement must never consume a production promotion challenge.
+  if (acceptanceConfig) { acceptanceConfig.read(); return null; }
   try {
     const stat = lstatSync(RUNTIME_READY_EXPECTATION_FILE);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("expectation is not a regular file");
     const parsed = JSON.parse(readFileSync(RUNTIME_READY_EXPECTATION_FILE, "utf8")) as unknown;
-    return isRuntimeReadyExpectation(parsed) ? parsed : null;
+    if (!isRuntimeReadyExpectation(parsed)) return null;
+    if (parsed.schemaVersion === 6) {
+      if (!acceptedRuntimeRepairBootstrap || acceptedRuntimeRepairBootstrap.phase !== "challenge:published"
+        || acceptedRuntimeRepairBootstrap.head.operationId !== parsed.operationId || acceptedRuntimeRepairBootstrap.head.promotionId !== parsed.promotionId
+        || !isDeepStrictEqual(acceptedRuntimeRepairBootstrap.runtimeRepair, parsed.runtimeRepair)) return null;
+      assertAcceptedRuntimeRepairChallengeCurrent(acceptedRuntimeRepairBootstrap);
+    } else if (acceptedRuntimeRepairBootstrap) return null;
+    return parsed;
   } catch (error) {
     if (existsSync(RUNTIME_READY_EXPECTATION_FILE)) {
       log("warn", "runtime-ready expectation is unavailable", { message: String((error as Error)?.message ?? error) });
     }
     return null;
   }
+}
+
+interface RendererLifecycleSession {
+  token: string;
+  sender: Electron.WebContents;
+  frame: Electron.WebFrameMain;
+  epoch: number;
+  ready: Set<string>;
+  delegations: Map<string, string>;
+}
+const rendererLifecycleSessions = new Map<number, RendererLifecycleSession>();
+let activeStoreParticipants: RendererLifecycleSession[] | null = null;
+const rendererLifecycleEpochs = new WeakMap<Electron.WebContents, { epoch: number }>();
+function rendererLifecycleEpoch(sender: Electron.WebContents): number {
+  let state = rendererLifecycleEpochs.get(sender);
+  if (!state) {
+    state = { epoch: 0 };
+    rendererLifecycleEpochs.set(sender, state);
+    const observed = state;
+    sender.on("did-start-navigation", (_event, _url, inPlace, main) => {
+      if (main && !inPlace) observed.epoch++;
+    });
+    sender.once("destroyed", () => rendererLifecycleSessions.delete(sender.id));
+  }
+  return state.epoch;
+}
+function currentRendererLifecycleSession(sender: Electron.WebContents, frame: Electron.WebFrameMain | null): RendererLifecycleSession | null {
+  const session = rendererLifecycleSessions.get(sender.id);
+  return session && !sender.isDestroyed() && frame === sender.mainFrame && session.frame === frame
+    && session.epoch === rendererLifecycleEpoch(sender) ? session : null;
+}
+function rendererTweakReady(id: string): boolean {
+  const primary = exactIndependentTweakersPrimaryWindow();
+  if (!primary || primary.isDestroyed()) return false;
+  const session = currentRendererLifecycleSession(primary.webContents, primary.webContents.mainFrame);
+  if (!session) return false;
+  if (session.ready.has(id)) return true;
+  const owner = session.delegations.get(id);
+  const candidates = tweakState.discovered.map(tweak => ({ ...tweak, enabled: isTweakEnabled(tweak.manifest.id) }));
+  return !!owner && topicMigrationOwner(id, candidates) === owner && session.ready.has(owner);
 }
 
 function runtimeReadyInitializedTweakIds(): string[] | null {
@@ -1877,7 +2124,8 @@ function runtimeReadyInitializedTweakIds(): string[] | null {
     const mainRecord = lifecycleJournal.records[lifecycleRecordKey("main", id)];
     const rendererRecord = lifecycleJournal.records[lifecycleRecordKey("renderer", id)];
     const mainReady = mainRecord?.attemptId === lifecycleAttemptId && mainRecord.status === "ready";
-    const rendererReady = rendererRecord?.attemptId === lifecycleAttemptId && rendererRecord.status === "ready";
+    const rendererReady = derivedVariant ? rendererTweakReady(id)
+      : rendererRecord?.attemptId === lifecycleAttemptId && rendererRecord.status === "ready";
     if ((tweak.manifest.scope === "main" && !mainReady)
       || (tweak.manifest.scope === "renderer" && !rendererReady)
       || (tweak.manifest.scope === "both" && (!mainReady || !rendererReady))) return null;
@@ -2121,7 +2369,7 @@ function exactLifecycleHealth(): Pick<IndependentTweakersLiveHealthV1, "initiali
     for (const processKind of requiredProcesses) {
       const record = lifecycleJournal.records[lifecycleRecordKey(processKind, tweak.manifest.id)];
       const status = record?.attemptId === lifecycleAttemptId ? record.status : undefined;
-      if (status === "ready") continue;
+      if (processKind === "renderer" && derivedVariant ? rendererTweakReady(tweak.manifest.id) : status === "ready") continue;
       initialized = false;
       if (status === "failed" || status === "quarantined") {
         lifecycleFailures.push({ tweakId: tweak.manifest.id, process: processKind, status });
@@ -2136,9 +2384,15 @@ function exactLifecycleHealth(): Pick<IndependentTweakersLiveHealthV1, "initiali
   return { initializedTweakIds, lifecycleFailures };
 }
 
+const appSignatureCache = new Map<string, { identity: string; digest: string }>();
 function independentTweakersAppSignatureSha256(appRoot: string): string | null {
   if (process.platform !== "darwin") return null;
   try {
+    const rootStat = statSync(appRoot);
+    const sealStat = statSync(join(appRoot, "Contents", "_CodeSignature", "CodeResources"));
+    const identity = `${rootStat.dev}:${rootStat.ino}:${rootStat.mtimeMs}:${sealStat.ino}:${sealStat.size}:${sealStat.mtimeMs}:${sealStat.ctimeMs}`;
+    const cached = appSignatureCache.get(appRoot);
+    if (cached?.identity === identity) return cached.digest;
     const result = spawnSync("/usr/bin/codesign", ["-dv", "--verbose=4", appRoot], {
       encoding: "utf8",
       timeout: 2_000,
@@ -2150,9 +2404,11 @@ function independentTweakersAppSignatureSha256(appRoot: string): string | null {
       .map((line) => line.trim())
       .filter((line) => /^(Identifier=|TeamIdentifier=|CDHash=|CodeDirectory|Signature=|Format=)/.test(line))
       .join("\n");
-    return evidence.length > 0
+    const digest = evidence.length > 0
       ? createHash("sha256").update(evidence, "utf8").digest("hex")
       : null;
+    if (digest) appSignatureCache.set(appRoot, { identity, digest });
+    return digest;
   } catch {
     return null;
   }
@@ -2184,11 +2440,13 @@ function isExactIndependentTweakersPrimaryMainFrame(
 
 function publishIndependentTweakersLiveHealth(health: IndependentTweakersLiveHealthV1): void {
   independentTweakersLiveHealth = health;
+  runRuntimeDiagnosticDiskOperation(acceptanceConfig, () => {
   try {
     publishIndependentTweakersRuntimeReadyReceipt(INDEPENDENT_TWEAKERS_LIVE_HEALTH_FILE, health);
   } catch (error) {
     log("warn", "independent live health was not published", { message: String((error as Error)?.message ?? error) });
   }
+  });
   const primary = exactIndependentTweakersPrimaryWindow();
   if (primary && !primary.webContents.isDestroyed()) {
     primary.webContents.mainFrame.send(
@@ -2213,7 +2471,7 @@ async function captureIndependentTweakersLiveHealth(normalizeAppearance = true):
   const brokerAuthority = currentRuntimeReadyBrokerAuthorityExpectation();
   const processStartToken = currentProcessStartToken();
   const appAsarHeaderHash = promotionAppHeaderHash();
-  const runtimeFingerprint = readRuntimeFingerprintEvidence(runtimeDir!)?.fingerprint;
+  const runtimeFingerprint = (await readRuntimeFingerprintEvidenceAsync(runtimeDir!))?.fingerprint;
   const appUserDataRoot = process.env.CODEX_ELECTRON_USER_DATA_PATH;
   const appSignatureSha256 = independentTweakersAppSignatureSha256(INDEPENDENT_TWEAKERS_APP_ROOT);
   if (!brokerAuthority || !processStartToken || !runtimeFingerprint || !appUserDataRoot || !appSignatureSha256 || !accountsBrokerRoot) return;
@@ -2308,12 +2566,15 @@ function requestRuntimeReadyBrokerConnection(window: Electron.BrowserWindow | nu
     return;
   }
   independentTweakersBrokerProbeInFlight = true;
-  void client.socket.invoke({
+  const probe = runtimeReadyPublished
+    ? probeAccountsBrokerControlStatus(accountsBrokerRoot, accountsBrokerSecret)
+    : client.socket.invoke({
     version: 1,
     requestId: `runtime-ready-${randomUUID()}`,
     command: "profile.read",
-  }).then((response) => {
-    markRuntimeReadyBrokerState(response.ok ? "connected" : "blocked");
+  }).then((response) => response.ok);
+  void probe.then((connected) => {
+    markRuntimeReadyBrokerState(connected ? "connected" : "blocked");
   }).catch(() => {
     markRuntimeReadyBrokerState("blocked");
   }).finally(() => {
@@ -2390,7 +2651,7 @@ function tryWriteRuntimeReadyReceipt(): void {
       return;
     }
     const receipt = {
-      schemaVersion: 5,
+      ...acceptedRuntimeRepairReadinessFields(expectation),
       kind: "tweakers-independent-runtime-ready",
       operationId: expectation.operationId,
       promotionId: expectation.promotionId,
@@ -2413,7 +2674,13 @@ function tryWriteRuntimeReadyReceipt(): void {
       initializedTweakIds,
       observedAt: new Date().toISOString(),
     } as const;
-    publishIndependentTweakersRuntimeReadyReceipt(RUNTIME_READY_FILE, receipt);
+    if (expectation.schemaVersion === 6) {
+      if (!acceptedRuntimeRepairBootstrap) throw new Error("Repair readiness has no authenticated initialization binding");
+      assertAcceptedRuntimeRepairChallengeCurrent(acceptedRuntimeRepairBootstrap);
+      const currentExpectation = readRuntimeReadyExpectation();
+      if (!isDeepStrictEqual(currentExpectation, expectation)) throw new Error("Repair readiness challenge changed before publication");
+    }
+    runRuntimeDiagnosticDiskOperation(acceptanceConfig, () => publishIndependentTweakersRuntimeReadyReceipt(RUNTIME_READY_FILE, receipt));
     stopRuntimeReadySettingsMountAttempts();
     runtimeReadyPublished = true;
     log("info", "runtime-ready receipt published", { operationId: expectation.operationId, tweakCount: initializedTweakIds.length });
@@ -2422,9 +2689,11 @@ function tryWriteRuntimeReadyReceipt(): void {
   }
 }
 
+let cachedProcessStartToken: string | null = null;
 function currentProcessStartToken(): string | null {
+  if (cachedProcessStartToken) return cachedProcessStartToken;
   if (process.platform !== "darwin") {
-    return `pid-${process.pid}-uptime-${Math.floor(process.uptime() * 1_000)}`;
+    return cachedProcessStartToken = `pid-${process.pid}-uptime-${Math.floor(process.uptime() * 1_000)}`;
   }
   try {
     const result = spawnSync("/bin/ps", ["-p", String(process.pid), "-o", "lstart="], {
@@ -2433,9 +2702,8 @@ function currentProcessStartToken(): string | null {
       maxBuffer: 8 * 1024,
     });
     const token = result.status === 0 ? String(result.stdout ?? "").trim() : "";
-    return token.length > 0 && token.length <= 128 && !/[\u0000-\u001f\u007f]/.test(token)
-      ? token
-      : null;
+    if (token.length > 0 && token.length <= 128 && !/[\u0000-\u001f\u007f]/.test(token)) cachedProcessStartToken = token;
+    return cachedProcessStartToken;
   } catch {
     return null;
   }
@@ -2587,14 +2855,28 @@ function requestRuntimeReadySettingsMount(): void {
   if (runtimeReadySettingsMounted || runtimeReadySettingsOpenController !== null) return;
   const expectation = readRuntimeReadyExpectation();
   if (!expectation) return;
+  const deadlineMs = nativeStartupPreparationTimeoutMs(0) + RUNTIME_READY_SETTINGS_OPEN_DEADLINE_MS;
+  // Electron accepts the menu callback before native ensureWindow is enabled.
+  // Keep retries eligible for the already-authorized startup deadline instead
+  // of exhausting a fixed three-minute attempt count during native preparation.
+  const maxAttempts = Math.max(RUNTIME_READY_SETTINGS_OPEN_MAX_ATTEMPTS,
+    Math.ceil(deadlineMs / RUNTIME_READY_SETTINGS_OPEN_INTERVAL_MS) + 1);
   if (runtimeReadySettingsOpenAttemptOperationId !== expectation.operationId) {
     runtimeReadySettingsOpenAttemptOperationId = expectation.operationId;
     runtimeReadySettingsOpenAttemptCount = 0;
     runtimeReadySettingsOpenTerminalOperationId = null;
   }
   if (runtimeReadySettingsOpenTerminalOperationId === expectation.operationId
-    || runtimeReadySettingsOpenAttemptCount >= RUNTIME_READY_SETTINGS_OPEN_MAX_ATTEMPTS) return;
+    || runtimeReadySettingsOpenAttemptCount >= maxAttempts) return;
 
+  let blockerOperationId = expectation.operationId;
+  let lastBlocker: string | null = null;
+  const reportBlocker = (reason: "not-ready" | "primary-missing" | "missing-menu" | "candidate-count" | "click-failed", count?: number): void => {
+    const key = `${reason}:${count ?? ""}`;
+    if (lastBlocker === key) return;
+    lastBlocker = key;
+    log("warn", "runtime-ready Settings mount blocked", { operationId: blockerOperationId, reason, ...(count !== undefined ? { count } : {}) });
+  };
   let controller: RuntimeReadySettingsMountRetryController;
   controller = createRuntimeReadySettingsMountRetryController({
     now: () => Date.now(),
@@ -2609,8 +2891,8 @@ function requestRuntimeReadySettingsMount(): void {
     cancel: (scheduled) => clearTimeout(scheduled as ReturnType<typeof setTimeout>),
     intervalMs: RUNTIME_READY_SETTINGS_OPEN_INTERVAL_MS,
     acknowledgementGraceMs: RUNTIME_READY_SETTINGS_OPEN_ACK_GRACE_MS,
-    deadlineMs: RUNTIME_READY_SETTINGS_OPEN_DEADLINE_MS,
-    maxAttempts: RUNTIME_READY_SETTINGS_OPEN_MAX_ATTEMPTS,
+    deadlineMs,
+    maxAttempts,
     initialOperationId: expectation.operationId,
     initialAttemptCount: runtimeReadySettingsOpenAttemptCount,
     readExpectation: () => {
@@ -2619,18 +2901,30 @@ function requestRuntimeReadySettingsMount(): void {
     },
     isMounted: () => runtimeReadySettingsMounted,
     isPublished: () => runtimeReadyPublished,
-    isReady: () => runtimeReadyInitializedTweakIds() !== null,
-    getExactPrimary: () => exactIndependentTweakersPrimaryWindow(),
-    open: (owner) => openNativeSettingsFromApplicationMenu(owner),
+    isReady: () => {
+      const ready = runtimeReadyInitializedTweakIds() !== null;
+      if (!ready) reportBlocker("not-ready");
+      return ready;
+    },
+    getExactPrimary: () => {
+      const owner = exactIndependentTweakersPrimaryWindow();
+      if (!owner) reportBlocker("primary-missing");
+      return owner;
+    },
+    open: (owner) => openNativeSettingsFromApplicationMenu(owner, reportBlocker),
     onAttemptStateChange: (operationId, attemptCount) => {
       if (runtimeReadySettingsOpenAttemptOperationId !== operationId) {
         runtimeReadySettingsOpenTerminalOperationId = null;
       }
+      if (blockerOperationId !== operationId) { blockerOperationId = operationId; lastBlocker = null; }
       runtimeReadySettingsOpenAttemptOperationId = operationId;
       runtimeReadySettingsOpenAttemptCount = attemptCount;
     },
     onRequest: (attemptCount, accepted) => {
-      if (accepted) log("info", "runtime-ready Settings mount requested", { attempt: attemptCount });
+      if (accepted) {
+        lastBlocker = null;
+        log("info", "runtime-ready Settings mount requested", { attempt: attemptCount });
+      }
     },
     onStopped: (reason, operationId) => {
       if (runtimeReadySettingsOpenController === controller) runtimeReadySettingsOpenController = null;
@@ -2677,22 +2971,22 @@ function configureCodexSparkleForProcess(): void {
     configureCodexSparkleBridge(createHealthProbeCodexSparkleBridgeOptions());
   } else if (derivedVariant) {
     configureCodexSparkleBridge({ ...createHealthProbeCodexSparkleBridgeOptions(),
-      requestManualCheck: () => { const report = readTweakersDoctor(); runTweakersDoctorAction({ schemaVersion: 1, action: "scan", fingerprint: report.fingerprint }); openTweakersManager("updates"); },
-      onUpdateAvailable: () => { try { const report = readTweakersDoctor(); runTweakersDoctorAction({ schemaVersion: 1, action: "scan", scanTrigger: "available_update", fingerprint: report.fingerprint }); } catch (error) { log("warn", "Doctor available-update signal could not be consumed", { error: String(error) }); } },
-      requestInstall: () => openTweakersManager("updates"),
+      requestManualCheck: async () => { await openTweakersManagerAsync("updates"); const report = await readTweakersDoctor(); await runTweakersDoctorAction({ schemaVersion: 1, action: "scan", fingerprint: report.fingerprint }); },
+      onUpdateAvailable: async () => { try { const report = await readTweakersDoctor(); await runTweakersDoctorAction({ schemaVersion: 1, action: "scan", scanTrigger: "available_update", fingerprint: report.fingerprint }); } catch (error) { log("warn", "Doctor available-update signal could not be consumed", { error: String(error) }); } },
+      requestInstall: () => { void openTweakersManagerAsync("updates").catch(error => log("warn", "Could not open update Manager", {error:String(error)})); },
       getInstallPrerequisite: () => ({ ok: false, reason: "Use Tweakers Manager to review and apply an independent update." }) });
     // Consume only an already persisted availability flag. No startup fetch or timer.
-    setImmediate(() => {
+    setImmediate(async () => {
       try {
         const cached = readState().tweaker?.codexAppcastCache;
         const installed = installedCodexDesktopVersion(inferMacAppRoot());
         if (cached && isCodexDesktopUpdateNewer(installed.installedMarketingVersion, installed.installedBuild, cached.marketingVersion, cached.build)) {
-          const report = readTweakersDoctor();
-          runTweakersDoctorAction({ schemaVersion: 1, action: "scan", scanTrigger: "available_update", availableUpdateBuild: cached.build, fingerprint: report.fingerprint });
+          const report = await readTweakersDoctor();
+          await runTweakersDoctorAction({ schemaVersion: 1, action: "scan", scanTrigger: "available_update", availableUpdateBuild: cached.build, fingerprint: report.fingerprint });
         }
       } catch (error) { log("warn", "Existing update availability flag could not be consumed", { error: String(error) }); }
     });
-    installIndependentStartupRecovery(dialog as unknown as Parameters<typeof installIndependentStartupRecovery>[0], () => openTweakersManager("doctor"));
+    installIndependentStartupRecovery(dialog as unknown as Parameters<typeof installIndependentStartupRecovery>[0], () => { void openTweakersManagerAsync("doctor").catch(error => log("warn", "Could not open startup recovery Manager", {error:String(error)})); });
   }
 }
 
@@ -2700,8 +2994,12 @@ configureCodexSparkleForProcess();
 if (healthCheckOnly || derivedVariant) installSparkleUpdateHook();
 
 interface LoadedMainTweak {
-  stop?: () => void;
+  stop?: () => void | Promise<void>;
+  resources: TweakResources;
+  startPending?: Promise<unknown>;
+  stopPending?: Promise<void>;
   storage: DiskStorage;
+  disposeIpc: () => void;
 }
 
 interface CodexWindowServices {
@@ -3963,6 +4261,7 @@ const originalMainPromotionProbe = healthOriginalMain
 
 app.whenReady().then(() => {
   log("info", "app ready fired");
+  syncAccountsRoutingMarker();
   if (derivedVariant && !healthCheckOnly) {
     // Doctor's two-minute freshness limit requires ongoing runtime evidence,
     // even when the user leaves the app idle. Each publication follows a live
@@ -4154,7 +4453,7 @@ app.on("will-quit", () => {
   if (independentTweakersLiveHealthTimer !== null) clearInterval(independentTweakersLiveHealthTimer);
   independentTweakersLiveHealthTimer = null;
   void mcpReconciler?.close();
-  stopAllMainTweaks();
+  void stopAllMainTweaks().catch(error => log("warn", "shutdown cleanup failed:", error));
   nativeBridge.disposeAll();
   disposeAllOwlViews();
   // Best-effort flush of any pending storage writes.
@@ -4166,9 +4465,9 @@ app.on("will-quit", () => {
   finishTweakLifecycleAttempt();
 });
 
-function openNativeSettingsFromApplicationMenu(owner?: BrowserWindow): boolean {
+function openNativeSettingsFromApplicationMenu(owner?: BrowserWindow, onRejected?: (reason: "missing-menu" | "candidate-count" | "click-failed", count?: number) => void): boolean {
   const applicationMenu = Menu.getApplicationMenu();
-  if (!applicationMenu) return false;
+  if (!applicationMenu) { onRejected?.("missing-menu"); return false; }
   const candidates: Electron.MenuItem[] = [];
   const visit = (items: readonly Electron.MenuItem[]): void => {
     for (const item of items) {
@@ -4189,14 +4488,13 @@ function openNativeSettingsFromApplicationMenu(owner?: BrowserWindow): boolean {
   };
   visit(applicationMenu.items);
   const unique = [...new Set(candidates)];
-  if (unique.length !== 1) return false;
+  if (unique.length !== 1) { onRejected?.("candidate-count", unique.length); return false; }
   try {
     Reflect.apply(unique[0].click!, unique[0], [unique[0], owner, undefined]);
     return true;
-  } catch (error) {
-    log("warn", "open settings application-menu action failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
+  } catch {
+    if (onRejected) onRejected("click-failed");
+    else log("warn", "open settings application-menu action failed", { reason: "click-failed" });
     return false;
   }
 }
@@ -4214,7 +4512,9 @@ ipcMain.handle("tweaker:list-tweaks", async () => {
   // until the one-use expectation disappears so a healthy startup cannot be
   // mistaken for promotion drift or make compensating rollback ambiguous.
   if (!independentRuntimeReadyCommitPending()) {
-    await Promise.all(tweakState.discovered.map((t) => ensureTweakUpdateCheck(t)));
+    for (const tweak of tweakState.discovered) void ensureTweakUpdateCheck(tweak).catch((error) => {
+      log("warn", `update check failed for ${tweak.manifest.id}:`, error);
+    });
   }
   const updateChecks = readState().tweakUpdateChecks ?? {};
   const catalog = readBundledTweakCatalog();
@@ -4254,10 +4554,40 @@ ipcMain.handle(SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL, async (event, payload: 
   if (!sender || sender !== event.sender) return sharedHistoryTargetUnavailable();
   return mapSharedHistoryNativeTarget(sender.id, payload);
 });
+ipcMain.handle("tweaker:renderer-lifecycle-begin", (event) => {
+  if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) return null;
+  if (!ownedCodexRenderer(event.sender.id)) return null;
+  if (activeStoreParticipants && !activeStoreParticipants.some(session => session.sender === event.sender
+    && session.frame === event.senderFrame && session.epoch === rendererLifecycleEpoch(event.sender))) return null;
+  const session: RendererLifecycleSession = {
+    token: randomUUID(), sender: event.sender, frame: event.senderFrame,
+    epoch: rendererLifecycleEpoch(event.sender), ready: new Set(), delegations: new Map(),
+  };
+  rendererLifecycleSessions.set(event.sender.id, session);
+  return session.token;
+});
+ipcMain.on("tweaker:renderer-topic-delegations", (event, payload: unknown) => {
+  if (derivedVariant && !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) return;
+  const session = currentRendererLifecycleSession(event.sender, event.senderFrame);
+  if (!session || !payload || typeof payload !== "object") return;
+  const value = payload as { token?: unknown; delegations?: unknown };
+  if (value.token !== session.token || !Array.isArray(value.delegations) || value.delegations.length > 3) return;
+  const candidates = tweakState.discovered.map(tweak => ({ ...tweak, enabled: isTweakEnabled(tweak.manifest.id) }));
+  const delegations = new Map<string, string>();
+  for (const item of value.delegations) {
+    if (!item || typeof item.id !== "string" || typeof item.owner !== "string"
+      || topicMigrationOwner(item.id, candidates) !== item.owner) return;
+    delegations.set(item.id, item.owner);
+  }
+  session.delegations = delegations;
+  tryWriteRuntimeReadyReceipt();
+});
 ipcMain.on("tweaker:tweak-lifecycle", (event, payload: unknown) => {
   if (derivedVariant && !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) return;
   if (!payload || typeof payload !== "object") return;
-  const value = payload as { id?: unknown; process?: unknown; status?: unknown; error?: unknown };
+  const value = payload as { id?: unknown; process?: unknown; status?: unknown; error?: unknown; token?: unknown };
+  const session = currentRendererLifecycleSession(event.sender, event.senderFrame);
+  if (!session || value.token !== session.token) return;
   if (typeof value.id !== "string" || !/^[a-zA-Z0-9._-]+$/.test(value.id)) return;
   if (value.process !== "renderer" || typeof value.status !== "string") return;
   const status = value.status as TweakLifecycleStatus;
@@ -4269,15 +4599,25 @@ ipcMain.on("tweaker:tweak-lifecycle", (event, payload: unknown) => {
     "disabled",
     "quarantined",
   ].includes(status)) return;
+  if (status === "ready") session.ready.add(value.id); else session.ready.delete(value.id);
   recordTweakLifecycle(value.id, "renderer", status, value.error);
   if (status === "ready") tryWriteRuntimeReadyReceipt();
+});
+ipcMain.handle("tweaker:settings-mount-context", (event) => {
+  if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) return null;
+  const expectation = readRuntimeReadyExpectation();
+  return expectation ? { operationId: expectation.operationId, promotionId: expectation.promotionId, epoch: rendererLifecycleEpoch(event.sender) } : null;
 });
 ipcMain.on("tweaker:settings-mounted", (event, payload: unknown) => {
   if (!derivedVariant || runtimeReadySettingsMounted) return;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)
-    || Object.keys(payload as Record<string, unknown>).join(",") !== "version"
-    || (payload as { version?: unknown }).version !== 1) return;
+    || Object.keys(payload as Record<string, unknown>).sort().join(",") !== "epoch,operationId,promotionId,version"
+    || (payload as { version?: unknown }).version !== 2) return;
   if (!isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) return;
+  const expectation = readRuntimeReadyExpectation();
+  const value = payload as { operationId: string; promotionId: string; epoch: number };
+  if (!expectation || value.operationId !== expectation.operationId || value.promotionId !== expectation.promotionId
+    || value.epoch !== rendererLifecycleEpoch(event.sender)) return;
   runtimeReadySettingsMounted = true;
   stopRuntimeReadySettingsMountAttempts();
   log("info", "runtime-ready Settings mount observed", { webContentsId: event.sender.id });
@@ -4322,7 +4662,7 @@ ipcMain.handle("tweaker:clear-tweak-health", (_e, id: string) => {
 });
 
 function bundledCodexBinary(): string {
-  return join(process.resourcesPath, "codex");
+  return resolveBundledCodexBinary(process.resourcesPath);
 }
 
 function selectedCodexLane(): CodexCliLane {
@@ -4354,7 +4694,7 @@ function installedCodexDesktopVersion(root: string | null): { installedMarketing
   });
 }
 
-function selectedCodexDesktopUpdateTarget(): CodexDesktopUpdateTarget {
+async function selectedCodexDesktopUpdateTarget(): Promise<CodexDesktopUpdateTarget> {
   if (derivedVariant) {
     if (independentManagerStatusDeferredForRuntimeReady()) {
       return {
@@ -4369,7 +4709,7 @@ function selectedCodexDesktopUpdateTarget(): CodexDesktopUpdateTarget {
       };
     }
     try {
-      const official = readTweakersManagerStatus().status.environment?.officialApp;
+      const official = (await readTweakersManagerStatusAsync()).status.environment?.officialApp;
       if (official?.state !== "valid" || !official.appPath || !official.bundleId) {
         throw new Error("The manager has no verified official ChatGPT app");
       }
@@ -4586,19 +4926,18 @@ function readJsonDocument(file: string): unknown {
   }
 }
 
-function terminalCodexFromLoginShell(): string | null {
+async function terminalCodexFromLoginShell(): Promise<string | null> {
   const shellPath = process.env.SHELL;
   if (!shellPath || !isAbsolute(shellPath)) return null;
   try {
     if (!existsSync(shellPath) || !statSync(shellPath).isFile()) return null;
-    const result = spawnSync(shellPath, ["-lic", "command -v codex"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5_000,
-      maxBuffer: 64 * 1024,
+    const output = await new Promise<string | null>((resolvePromise) => {
+      execFile(shellPath, ["-lic", "command -v codex"], {
+        encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024,
+      }, (error, stdout) => resolvePromise(error ? null : stdout));
     });
-    if (result.status !== 0) return null;
-    return terminalCodexPathFromShellOutput(result.stdout ?? "", (path) => {
+    if (output === null) return null;
+    return terminalCodexPathFromShellOutput(output, (path) => {
       try {
         return existsSync(path) && statSync(path).isFile();
       } catch {
@@ -4612,7 +4951,7 @@ function terminalCodexFromLoginShell(): string | null {
 
 async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSnapshot> {
   const selectedLane = selectedCodexLane();
-  const desktopTarget = selectedCodexDesktopUpdateTarget();
+  const desktopTarget = await selectedCodexDesktopUpdateTarget();
   const bundledPath = bundledCodexBinary();
   const betaPath = codexCliManager.getSelectedBinary();
   const activeCliPath = codexCliBootstrap.binary ?? bundledPath;
@@ -4620,7 +4959,7 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
     home: homedir(),
     pathValue: process.env.PATH,
     preferredPath: process.env.CODEX_TERMINAL_CLI_PATH,
-    loginShellPath: terminalCodexFromLoginShell(),
+    loginShellPath: await terminalCodexFromLoginShell(),
     excludedPaths: [bundledPath, betaPath].filter((value): value is string => !!value),
     isExecutable: (path) => {
       try {
@@ -4913,14 +5252,14 @@ ipcMain.handle("tweaker:reapply-tweakers", async (event, ...args: unknown[]) => 
     : "refresh.injected";
   let registrationRequired = false;
   if (independent) {
-    const manager = readTweakersManagerStatus();
+    const manager = await readTweakersManagerStatusAsync();
     const refresh = manager.actions.find((action) => action.actionId === "refresh.independent");
     if (!refresh?.available) {
       // Source registration is intentionally not a fourth generic status
       // action. Discover its fixed capability through the narrow manager
       // command, then either offer its dedicated confirmation or return one
       // exact safe terminal state before any prepare/execute attempt.
-      const registration = readTweakersManagerOfficialSourceRegistration();
+      const registration = await readTweakersManagerOfficialSourceRegistrationAsync();
       if (!registration.officialSourceRegistration.available) {
         return {
           started: false,
@@ -4955,7 +5294,7 @@ ipcMain.handle("tweaker:reapply-tweakers", async (event, ...args: unknown[]) => 
     : await dialog.showMessageBox(confirmationOptions);
   if (confirmation.response !== 0) return { started: false, cancelled: true };
   if (registrationRequired) {
-    const result = startTweakersManagerOfficialSourceRegistration();
+    const result = await startTweakersManagerOfficialSourceRegistrationAsync();
     return {
       ...result,
       registrationRequired: true,
@@ -4963,7 +5302,7 @@ ipcMain.handle("tweaker:reapply-tweakers", async (event, ...args: unknown[]) => 
       detail: "Official source sealing has started. When it completes, choose Rebuild Tweakers App again.",
     };
   }
-  return startTweakersManagerAction(managerAction);
+  return startTweakersManagerActionAsync(managerAction);
 });
 
 ipcMain.handle("tweaker:get-environment-status", async (_e, ...args: unknown[]) => {
@@ -4992,25 +5331,25 @@ ipcMain.handle("tweaker:doctor-status", (event, ...args: unknown[]) => {
   if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Doctor requires the independent app");
   return readTweakersDoctor();
 });
-ipcMain.handle("tweaker:doctor-open", (event, ...args: unknown[]) => {
+ipcMain.handle("tweaker:doctor-open", async (event, ...args: unknown[]) => {
   assertNoIpcArguments(args, "doctor-open");
   if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Doctor requires the independent app");
-  openTweakersDoctor();
+  await openTweakersDoctorAsync();
   return { opened: true };
 });
-ipcMain.handle("tweaker:manager-open", (event, section?: unknown, ...args: unknown[]) => {
+ipcMain.handle("tweaker:manager-open", async (event, section?: unknown, ...args: unknown[]) => {
   assertNoIpcArguments(args, "manager-open");
   if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Tweakers Manager requires the independent app");
   const selectedSection = section === undefined ? "overview" : section;
   if (!isTweakersManagerSection(selectedSection)) throw new Error("Invalid Tweakers Manager section");
-  openTweakersManager(selectedSection);
+  await openTweakersManagerAsync(selectedSection);
   return { opened: true, section: selectedSection };
 });
-ipcMain.handle("tweaker:doctor-action", (event, request: DoctorActionRequestV1, ...args: unknown[]) => {
+ipcMain.handle("tweaker:doctor-action", async (event, request: DoctorActionRequestV1, ...args: unknown[]) => {
   assertNoIpcArguments(args, "doctor-action");
   if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Doctor requires the independent app");
   // Interactive login can take minutes and must not block Electron's main loop.
-  if (request?.action === "reconnect") { openTweakersDoctor(); return readTweakersDoctor(); }
+  if (request?.action === "reconnect") { await openTweakersDoctorAsync(); return readTweakersDoctor(); }
   return runTweakersDoctorAction(request);
 });
 
@@ -5187,7 +5526,8 @@ ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "
   startLocalRefresh(requested)
 ));
 
-ipcMain.handle("tweaker:get-watcher-health", () => {
+ipcMain.handle("tweaker:get-watcher-health", async () => {
+  if (acceptanceConfig) acceptanceConfig.read();
   if (derivedVariant) {
     return {
       checkedAt: new Date().toISOString(),
@@ -5195,20 +5535,20 @@ ipcMain.handle("tweaker:get-watcher-health", () => {
       title: "Automatic maintenance unavailable",
       summary: DERIVED_VARIANT_ACTION_DISABLED_REASON,
       watcher: "Unavailable",
-      checks: [],
+      checks: acceptanceConfig ? [{ name: "Acceptance configuration", status: "warn", detail: `Temporary settings; production health is not published. ${acceptanceConfig.rejectedWrites} writes outside the three permitted enablement settings were rejected.` }] : [],
     };
   }
-  return getAndPublishWatcherHealth(userRoot!);
+  return getAndPublishWatcherHealthAsync(userRoot!, {}, {}, acceptanceConfig ? () => acceptanceConfig.read() : undefined);
 });
-ipcMain.handle("tweaker:get-runtime-fingerprint", (_e, ...args: unknown[]) => {
+ipcMain.handle("tweaker:get-runtime-fingerprint", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "get-runtime-fingerprint");
   const installedRuntimeFingerprint =
-    readRuntimeFingerprintEvidence(runtimeDir!)?.fingerprint ?? null;
+    (await readRuntimeFingerprintEvidenceAsync(runtimeDir!))?.fingerprint ?? null;
   const sourceRoot = readInstallerState()?.sourceRoot ?? fallbackSourceRoot();
   const sourceRuntimeFingerprint = sourceRoot
-    ? readRuntimeFingerprintEvidence(
+    ? (await readRuntimeFingerprintEvidenceAsync(
       join(sourceRoot, "packages", "installer", "assets", "runtime"),
-    )?.fingerprint ?? null
+    ))?.fingerprint ?? null
     : null;
   return {
     installedRuntimeFingerprint,
@@ -5272,8 +5612,7 @@ ipcMain.handle("tweaker:install-store-tweak", async (_e, id: string) => {
   }
   assertStoreEntryPlatformCompatible(entry);
   assertStoreEntryRuntimeCompatible(entry);
-  await installStoreTweak(entry);
-  await reloadTweaks("store-install", tweakLifecycleDeps);
+  await enqueueTweakLifecycle(() => installStoreTweak(entry));
   return { installed: entry.id };
 });
 
@@ -5338,7 +5677,7 @@ ipcMain.handle(
 ipcMain.on("tweaker:preload-log", (_e, level: "info" | "warn" | "error", msg: string) => {
   const lvl = level === "error" || level === "warn" ? level : "info";
   try {
-    appendCappedLog(join(LOG_DIR, "preload.log"), `[${new Date().toISOString()}] [${lvl}] ${msg}\n`);
+    appendCappedLog(join(LOG_DIR, "preload.log"), `[${new Date().toISOString()}] [${lvl}] ${msg}\n`, 10 * 1024 * 1024, 3);
   } catch {}
 });
 
@@ -5359,6 +5698,17 @@ ipcMain.handle("tweaker:tweak-fs", (_e, op: string, id: string, p: string, c?: s
     case "dataDir": return dir;
     default: throw new Error(`unknown op: ${op}`);
   }
+});
+
+ipcMain.handle("tweaker:native-services-descriptor", () => {
+  const assets = join(process.resourcesPath, "app.asar", "webview", "assets");
+  try {
+    const sources = new Map<string, string>();
+    for (const name of readdirSync(assets)) {
+      if (/^app-(?:initial|shared)-[a-f0-9]+\.js$/.test(name)) sources.set(name, readFileSync(join(assets, name), "utf8"));
+    }
+    return nativeServicesDescriptor(sources);
+  } catch { return null; }
 });
 
 ipcMain.handle("tweaker:user-paths", () => ({
@@ -5530,11 +5880,15 @@ try {
 
 // --- helpers ---
 
+let storeReconciliation: ReturnType<typeof reconcileStoreTransactions> | null = null;
 async function loadAllMainTweaks(): Promise<void> {
   if (healthCheckOnly) return;
   const startupPromises: Promise<void>[] = [];
   try {
-    tweakState.discovered = discoverTweaks(TWEAKS_DIR);
+    storeReconciliation ??= reconcileStoreTransactions(TWEAKS_DIR);
+    if (storeReconciliation.blockedAll) throw new Error("Store recovery is ambiguous; tweak discovery is held");
+    tweakState.discovered = discoverTweaks(TWEAKS_DIR, { runtimeVersion: TWEAKER_VERSION, onInvalid: (directory, reason) => log("warn", "Skipped invalid tweak", directory, reason) })
+      .filter(tweak => !storeReconciliation!.blockedIds.includes(tweak.manifest.id));
     log(
       "info",
       `discovered ${tweakState.discovered.length} tweak(s):`,
@@ -5566,35 +5920,52 @@ async function loadAllMainTweaks(): Promise<void> {
       continue;
     }
     recordTweakLifecycle(t.manifest.id, "main", "starting");
+    let startupIpc: ReturnType<typeof makeMainIpc> | null = null;
     try {
       const mod = require(t.entry);
       const tweak = mod.default ?? mod;
       if (typeof tweak?.start === "function") {
         const storage = createDiskStorage(userRoot!, t.manifest.id);
-        const startResult = tweak.start({
+        const ipc = makeMainIpc(t);
+        startupIpc = ipc;
+        const resources = new TweakResources();
+        const instance: LoadedMainTweak = {
+          stop: bindMainTweakStop(tweak), resources, storage, disposeIpc: ipc.dispose,
+        };
+        // Register before invoking user code: synchronous failures own resources too.
+        tweakState.loadedMain.set(t.manifest.id, instance);
+        resources.add(ipc.dispose);
+        const startResult = tweak.start(guardTweakApi({
+          lifecycle: { signal: resources.signal, add: resources.add.bind(resources) },
+          backend: {
+            register: async (options: import("@therealityreport/tweakers-sdk").BackendHookOptions) => {
+              assertTweakPermission(t, "backend-hooks");
+              const hook = await backendMods.register(t.manifest.id, t.dir, options);
+              if (resources.signal.aborted) { await hook.dispose(); throw new Error("Tweak activation has ended"); }
+              return { dispose: resources.add(hook.dispose) };
+            },
+            diagnostics: () => backendMods.diagnostics().filter(hook => hook.id.startsWith(`${t.manifest.id}:`)),
+          },
           manifest: t.manifest,
           process: "main",
           log: makeLogger(t.manifest.id),
           storage,
-          ipc: makeMainIpc(t),
+          ipc,
           fs: makeMainFs(t.manifest.id),
           codex: makeCodexApi(t),
-        });
-        tweakState.loadedMain.set(t.manifest.id, {
-          // Bind stop() to the tweak object so main-scope cleanup that relies on
-          // `this` works — mirrors the renderer host (preload/tweak-host.ts).
-          stop: bindMainTweakStop(tweak),
-          storage,
-        });
-        const startup = runWithStartupTimeout(() => startResult, lifecycleStartupTimeoutMs()).then((result) => {
+        }, resources));
+        instance.startPending = Promise.resolve(startResult);
+        const startup = runWithStartupTimeout(() => instance.startPending, lifecycleStartupTimeoutMs()).then(async (result) => {
           if (result.status === "timed_out") {
             recordTweakLifecycle(t.manifest.id, "main", "timed_out", `startup exceeded ${lifecycleStartupTimeoutMs()}ms`);
             log("error", `tweak ${t.manifest.id} startup timed out`);
+            await stopMainTweak(t.manifest.id, instance).catch(error => log("warn", `activation held for cleanup: ${t.manifest.id}`, error));
             return;
           }
           recordTweakLifecycle(t.manifest.id, "main", "ready");
           log("info", `started main tweak: ${t.manifest.id}`);
-        }).catch((error) => {
+        }).catch(async (error) => {
+          await stopMainTweak(t.manifest.id, instance).catch(error => log("warn", `activation held for cleanup: ${t.manifest.id}`, error));
           recordTweakLifecycle(t.manifest.id, "main", "failed", error);
           log("error", `tweak ${t.manifest.id} failed to start:`, error);
         });
@@ -5603,6 +5974,9 @@ async function loadAllMainTweaks(): Promise<void> {
         recordTweakLifecycle(t.manifest.id, "main", "failed", "tweak has no start() function");
       }
     } catch (e) {
+      startupIpc?.dispose();
+      const failed = tweakState.loadedMain.get(t.manifest.id);
+      if (failed) await stopMainTweak(t.manifest.id, failed).catch(error => log("warn", `activation held for cleanup: ${t.manifest.id}`, error));
       recordTweakLifecycle(t.manifest.id, "main", "failed", e);
       recordTweakHealth(t.manifest.id, "failed", e instanceof Error ? e.message : e);
       log("error", `tweak ${t.manifest.id} failed to start:`, e);
@@ -5613,20 +5987,24 @@ async function loadAllMainTweaks(): Promise<void> {
   tryWriteRuntimeReadyReceipt();
 }
 
-function stopAllMainTweaks(): void {
-  for (const [id, t] of tweakState.loadedMain) {
-    try {
-      t.stop?.();
-      t.storage.flush();
-      log("info", `stopped main tweak: ${id}`);
-    } catch (e) {
-      log("warn", `stop failed for ${id}:`, e);
-    } finally {
-      nativeBridge.disposeTweak(id);
-      disposeOwlViewsForTweak(id);
-    }
+async function stopMainTweak(id: string, t: LoadedMainTweak): Promise<void> {
+  t.resources.cancel();
+  t.stopPending ??= Promise.resolve().then(() => t.stop?.());
+  const result = await runWithStartupTimeout(() => Promise.all([t.stopPending, t.startPending?.catch(() => {})]), DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+  const cleanup = await runWithStartupTimeout(() => t.resources.close(), DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+  t.storage.flush();
+  t.disposeIpc();
+  nativeBridge.disposeTweak(id);
+  disposeOwlViewsForTweak(id);
+  if (result.status === "timed_out" || cleanup.status === "timed_out") {
+    recordTweakLifecycle(id, "main", "timed_out", "shutdown is still pending; reload held to prevent overlapping activations");
+    throw new Error(`Tweak ${id} shutdown is still pending`);
   }
-  tweakState.loadedMain.clear();
+  if (tweakState.loadedMain.get(id) === t) tweakState.loadedMain.delete(id);
+}
+
+async function stopAllMainTweaks(): Promise<void> {
+  await Promise.all([...tweakState.loadedMain].map(([id, tweak]) => stopMainTweak(id, tweak)));
 }
 
 function clearTweakModuleCache(): void {
@@ -5695,7 +6073,18 @@ async function ensureTweakerUpdateCheck(force = false): Promise<TweakerUpdateChe
   return check;
 }
 
-async function ensureTweakUpdateCheck(t: DiscoveredTweak): Promise<void> {
+const pendingTweakUpdateChecks = new Map<string, Promise<void>>();
+
+function ensureTweakUpdateCheck(t: DiscoveredTweak): Promise<void> {
+  const id = t.manifest.id;
+  const pending = pendingTweakUpdateChecks.get(id);
+  if (pending) return pending;
+  const check = checkTweakUpdate(t).finally(() => pendingTweakUpdateChecks.delete(id));
+  pendingTweakUpdateChecks.set(id, check);
+  return check;
+}
+
+async function checkTweakUpdate(t: DiscoveredTweak): Promise<void> {
   const id = t.manifest.id;
   const repo = t.manifest.githubRepo;
   const state = readState();
@@ -5723,9 +6112,11 @@ async function ensureTweakUpdateCheck(t: DiscoveredTweak): Promise<void> {
       : false,
     ...(next.error ? { error: next.error } : {}),
   };
-  state.tweakUpdateChecks ??= {};
-  state.tweakUpdateChecks[id] = check;
-  writeState(state);
+  if (independentRuntimeReadyCommitPending()) return;
+  const latestState = readState();
+  latestState.tweakUpdateChecks ??= {};
+  latestState.tweakUpdateChecks[id] = check;
+  writeState(latestState);
 }
 
 async function fetchLatestRelease(
@@ -5911,15 +6302,6 @@ function restrictRegistryToBundledCatalog(registry: TweakStoreRegistry): TweakSt
   };
 }
 
-interface StoreInstallMetadata {
-  repo?: string;
-  approvedCommitSha?: string;
-  source?: { kind: "bundled" | "remote"; path?: string };
-  installedAt: string;
-  storeIndexUrl: string;
-  files?: Record<string, string>;
-}
-
 interface StoreEntryPlatformCompatibility {
   current: NodeJS.Platform;
   supported: TweakStorePlatform[] | null;
@@ -5932,15 +6314,6 @@ interface StoreEntryRuntimeCompatibility {
   required: string | null;
   compatible: boolean;
   reason: string | null;
-}
-
-class StoreTweakModifiedError extends Error {
-  constructor(tweakName: string) {
-    super(
-      `${tweakName} has local source changes, so Tweakers can't auto-update it. Revert your local changes or reinstall the tweak manually.`,
-    );
-    this.name = "StoreTweakModifiedError";
-  }
 }
 
 function storeEntryPlatformCompatibility(entry: TweakStoreEntry): StoreEntryPlatformCompatibility {
@@ -6032,62 +6405,77 @@ async function fetchTweakStoreRegistry(): Promise<TweakStoreFetchResult> {
 }
 let warnedStoreRegistryFetch = false;
 
+async function storeRendererLifecycle(operationId: string, phase: "shutdown" | "activate", tweakId: string, participants: RendererLifecycleSession[]): Promise<void> {
+  const tokens = new Map(participants.map(session => [session, `${session.token}:${randomUUID()}`]));
+  const barrier = createTweakLifecycleBarrier({ operationId, phase, expectedInstanceTokens: [...tokens.values()], timeoutMs: 30_000 });
+  const onAck = (event: Electron.IpcMainEvent, payload: unknown) => {
+    const session = participants.find(item => item.sender === event.sender && item.frame === event.senderFrame
+      && !item.sender.isDestroyed() && item.epoch === rendererLifecycleEpoch(item.sender));
+    if (!session || !payload || typeof payload !== "object") return;
+    const value = payload as { instanceToken?: unknown };
+    if (value.instanceToken !== tokens.get(session)) return;
+    barrier.acknowledge(payload as Parameters<typeof barrier.acknowledge>[0]);
+  };
+  const removers: Array<() => void> = [];
+  ipcMain.on("tweaker:store-lifecycle-ack", onAck);
+  try {
+    for (const session of participants) {
+      const invalidate = () => barrier.invalidate(tokens.get(session)!, "Renderer document changed during store operation");
+      const navigate = (_event: Electron.Event, _url: string, inPlace: boolean, main: boolean) => { if (main && !inPlace) invalidate(); };
+      session.sender.on("did-start-navigation", navigate);
+      session.sender.once("destroyed", invalidate);
+      removers.push(() => { session.sender.removeListener("did-start-navigation", navigate); session.sender.removeListener("destroyed", invalidate); });
+      if (session.sender.isDestroyed() || session.sender.mainFrame !== session.frame
+        || rendererLifecycleEpoch(session.sender) !== session.epoch) invalidate();
+      else session.sender.send("tweaker:store-lifecycle", { operationId, phase, tweakId, instanceToken: tokens.get(session)! });
+    }
+    await barrier.completion;
+  } finally {
+    ipcMain.removeListener("tweaker:store-lifecycle-ack", onAck);
+    for (const remove of removers) remove();
+  }
+}
+
 async function installStoreTweak(entry: TweakStoreEntry): Promise<void> {
   const work = mkdtempSync(join(tmpdir(), "tweaker-store-tweak-"));
-  const archive = join(work, "source.tar.gz");
-  const extractDir = join(work, "extract");
-  const target = join(TWEAKS_DIR, entry.id);
   const stagedTarget = join(work, "staged", entry.id);
 
   try {
-    let source: string;
-    if (entry.source?.kind === "bundled") {
-      // The catalog path is constrained to `tweaks/<id>` by normalization;
-      // resolving it here keeps traversal and cross-entry installs closed.
-      const bundledPath = entry.source.path;
-      if (typeof bundledPath !== "string") throw new Error(`bundled source for ${entry.id} is missing a path`);
-      source = resolveBundledTweakPath(runtimeDir!, { ...entry, source: { kind: "bundled", path: bundledPath as string } });
-      if (!existsSync(source) || !statSync(source).isDirectory()) {
-        throw new Error(`bundled source for ${entry.id} is missing from the installer runtime`);
-      }
-      log("info", `installing bundled tweak ${entry.id} from ${source}`);
-    } else {
-      const url = storeArchiveUrl(entry);
-      log("info", `installing store tweak ${entry.id} from ${entry.repo ?? "(unknown)"}@${entry.approvedCommitSha ?? "(unknown)"}`);
-      const res = await fetch(url, {
-        headers: { "User-Agent": `tweaker/${TWEAKER_VERSION}` },
-        redirect: "follow",
-      });
-      if (!res.ok) throw new Error(`download failed: ${res.status}`);
-      const bytes = Buffer.from(await res.arrayBuffer());
-      writeFileSync(archive, bytes);
-      mkdirSync(extractDir, { recursive: true });
-      extractTarArchive(archive, extractDir);
-      source = findTweakRoot(extractDir) ?? "";
-      if (!source) throw new Error("downloaded archive did not contain manifest.json");
+    await acquireStoreTweak(entry, { runtimeDir: runtimeDir!, runtimeVersion: TWEAKER_VERSION, storeIndexUrl: TWEAK_STORE_INDEX_URL, work, stagedTarget, log: message => log("info", message) });
+    const participants = [...rendererLifecycleSessions.values()].filter(session =>
+      currentRendererLifecycleSession(session.sender, session.frame) === session);
+    if (isTweakEnabled(entry.id) && entry.manifest.scope !== "main" && participants.length === 0) {
+      throw new Error("No current renderer can acknowledge store activation");
     }
-    validateStoreTweakSource(entry, source);
-    rmSync(stagedTarget, { recursive: true, force: true });
-    copyTweakSource(source, stagedTarget);
-    const stagedFiles = hashTweakSource(stagedTarget);
-    writeFileSync(
-      join(stagedTarget, ".tweaker-store.json"),
-      JSON.stringify(
-        {
-          ...(entry.repo ? { repo: entry.repo } : {}),
-          ...(entry.approvedCommitSha ? { approvedCommitSha: entry.approvedCommitSha } : {}),
-          ...(entry.source ? { source: entry.source } : {}),
-          installedAt: new Date().toISOString(),
-          storeIndexUrl: TWEAK_STORE_INDEX_URL,
-          files: stagedFiles,
-        },
-        null,
-        2,
-      ),
-    );
-    await assertStoreTweakCleanForAutoUpdate(entry, target, work);
-    rmSync(target, { recursive: true, force: true });
-    cpSync(stagedTarget, target, { recursive: true });
+    const phase = async (operationId: string, action: "shutdown" | "activate") => {
+      if (action === "shutdown") {
+        await Promise.all([stopAllMainTweaks(), storeRendererLifecycle(operationId, action, entry.id, participants)]);
+        clearTweakModuleCache();
+      } else {
+        await loadAllMainTweaks();
+        await storeRendererLifecycle(operationId, action, entry.id, participants);
+        const current = tweakState.discovered.find(tweak => tweak.manifest.id === entry.id);
+        if (current && isTweakEnabled(entry.id) && current.manifest.scope !== "renderer") {
+          const record = lifecycleJournal.records[lifecycleRecordKey("main", entry.id)];
+          if (record?.attemptId !== lifecycleAttemptId || record.status !== "ready") throw new Error("Main tweak activation failed");
+        }
+      }
+    };
+    activeStoreParticipants = participants;
+    try {
+      await installStoreTransaction({
+        tweaksDir: TWEAKS_DIR, id: entry.id,
+        prepare: staging => { cpSync(stagedTarget, staging, { recursive: true }); },
+        assertUnchanged: path => assertStoreTweakCleanForAutoUpdate(entry, path, work, TWEAKER_VERSION),
+        shutdown: operationId => phase(operationId, "shutdown"),
+        activate: operationId => phase(operationId, "activate"),
+        shutdownReplacement: operationId => phase(operationId, "shutdown"),
+        reactivatePrevious: operationId => phase(operationId, "activate"),
+      });
+    } catch (error) {
+      if (error instanceof StoreTransactionError && error.blocked && storeReconciliation) storeReconciliation.blockedIds.push(entry.id);
+      throw error;
+    } finally { activeStoreParticipants = null; }
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
@@ -6154,153 +6542,6 @@ async function fetchManifestAtCommit(repo: string, commitSha: string): Promise<P
   });
   if (!res.ok) throw new Error(`manifest fetch returned ${res.status}`);
   return await res.json() as Partial<TweakManifest>;
-}
-
-function extractTarArchive(archive: string, targetDir: string): void {
-  const result = spawnSync("tar", ["-xzf", archive, "-C", targetDir], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.status !== 0) {
-    throw new Error(`tar extraction failed: ${result.stderr || result.stdout || result.status}`);
-  }
-}
-
-function validateStoreTweakSource(entry: TweakStoreEntry, source: string): void {
-  const manifestPath = join(source, "manifest.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as TweakManifest;
-  if (manifest.id !== entry.manifest.id) {
-    throw new Error(`downloaded tweak id ${manifest.id} does not match approved id ${entry.manifest.id}`);
-  }
-  const approvedRepo = entry.source?.kind === "remote" ? entry.source.repo : entry.repo;
-  if (approvedRepo && manifest.githubRepo !== approvedRepo) {
-    throw new Error(`downloaded tweak repo ${manifest.githubRepo} does not match approved repo ${approvedRepo}`);
-  }
-  if (manifest.version !== entry.manifest.version) {
-    throw new Error(`downloaded tweak version ${manifest.version} does not match approved version ${entry.manifest.version}`);
-  }
-}
-
-function findTweakRoot(dir: string): string | null {
-  if (!existsSync(dir)) return null;
-  if (existsSync(join(dir, "manifest.json"))) return dir;
-  for (const name of readdirSync(dir)) {
-    const child = join(dir, name);
-    try {
-      if (!statSync(child).isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    const found = findTweakRoot(child);
-    if (found) return found;
-  }
-  return null;
-}
-
-function copyTweakSource(source: string, target: string): void {
-  cpSync(source, target, {
-    recursive: true,
-    filter: (src) => !/(^|[/\\])(?:\.git|node_modules)(?:[/\\]|$)/.test(src),
-  });
-}
-
-async function assertStoreTweakCleanForAutoUpdate(
-  entry: TweakStoreEntry,
-  target: string,
-  work: string,
-): Promise<void> {
-  if (!existsSync(target)) return;
-  const metadata = readStoreInstallMetadata(target);
-  if (!metadata) return;
-  if (metadata.repo !== entry.repo) {
-    throw new StoreTweakModifiedError(entry.manifest.name);
-  }
-  const currentFiles = hashTweakSource(target);
-  const baselineFiles = metadata.files ?? await fetchBaselineStoreTweakHashes(metadata, work);
-  if (!sameFileHashes(currentFiles, baselineFiles)) {
-    throw new StoreTweakModifiedError(entry.manifest.name);
-  }
-}
-
-function readStoreInstallMetadata(target: string): StoreInstallMetadata | null {
-  const currentPath = join(target, ".tweaker-store.json");
-  const legacyPath = join(target, LEGACY_STORE_METADATA);
-  const metadataPath = existsSync(currentPath) ? currentPath : legacyPath;
-  if (!existsSync(metadataPath)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(metadataPath, "utf8")) as Partial<StoreInstallMetadata>;
-    const bundled = parsed.source?.kind === "bundled";
-    if (!bundled && (typeof parsed.repo !== "string" || typeof parsed.approvedCommitSha !== "string")) return null;
-    return {
-      ...(typeof parsed.repo === "string" ? { repo: parsed.repo } : {}),
-      ...(typeof parsed.approvedCommitSha === "string" ? { approvedCommitSha: parsed.approvedCommitSha } : {}),
-      ...(parsed.source ? { source: parsed.source } : {}),
-      installedAt: typeof parsed.installedAt === "string" ? parsed.installedAt : "",
-      storeIndexUrl: typeof parsed.storeIndexUrl === "string" ? parsed.storeIndexUrl : "",
-      files: isHashRecord(parsed.files) ? parsed.files : undefined,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function fetchBaselineStoreTweakHashes(
-  metadata: StoreInstallMetadata,
-  work: string,
-): Promise<Record<string, string>> {
-  if (!metadata.repo || !metadata.approvedCommitSha) {
-    throw new Error("Could not verify local tweak changes before update: source baseline is not remote");
-  }
-  const baselineDir = join(work, "baseline");
-  const archive = join(work, "baseline.tar.gz");
-  const res = await fetch(`https://codeload.github.com/${metadata.repo}/tar.gz/${metadata.approvedCommitSha}`, {
-    headers: { "User-Agent": `tweaker/${TWEAKER_VERSION}` },
-    redirect: "follow",
-  });
-  if (!res.ok) throw new Error(`Could not verify local tweak changes before update: ${res.status}`);
-  writeFileSync(archive, Buffer.from(await res.arrayBuffer()));
-  mkdirSync(baselineDir, { recursive: true });
-  extractTarArchive(archive, baselineDir);
-  const source = findTweakRoot(baselineDir);
-  if (!source) throw new Error("Could not verify local tweak changes before update: baseline manifest missing");
-  return hashTweakSource(source);
-}
-
-function hashTweakSource(root: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  collectTweakFileHashes(root, root, out);
-  return out;
-}
-
-function collectTweakFileHashes(root: string, dir: string, out: Record<string, string>): void {
-  for (const name of readdirSync(dir).sort()) {
-    if (name === ".git" || name === "node_modules" || name === ".tweaker-store.json" || name === LEGACY_STORE_METADATA) continue;
-    const full = join(dir, name);
-    const rel = relative(root, full).split("\\").join("/");
-    const stat = statSync(full);
-    if (stat.isDirectory()) {
-      collectTweakFileHashes(root, full, out);
-      continue;
-    }
-    if (!stat.isFile()) continue;
-    out[rel] = createHash("sha256").update(readFileSync(full)).digest("hex");
-  }
-}
-
-function sameFileHashes(a: Record<string, string>, b: Record<string, string>): boolean {
-  const ak = Object.keys(a).sort();
-  const bk = Object.keys(b).sort();
-  if (ak.length !== bk.length) return false;
-  for (let i = 0; i < ak.length; i++) {
-    const key = ak[i];
-    if (key !== bk[i] || a[key] !== b[key]) return false;
-  }
-  return true;
-}
-
-function isHashRecord(value: unknown): value is Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.values(value as Record<string, unknown>).every((v) => typeof v === "string");
 }
 
 function normalizeVersion(v: string): string {
@@ -6917,13 +7158,27 @@ function makeLogger(scope: string) {
 function makeMainIpc(tweak: DiscoveredTweak) {
   const id = tweak.manifest.id;
   const ch = (c: string) => `tweaker:${id}:${c}`;
-  const requireIpc = () => assertTweakPermission(tweak, "ipc");
+  let disposed = false;
+  const requireIpc = () => {
+    if (disposed) throw new Error(`tweak ${id} IPC activation has ended`);
+    assertTweakPermission(tweak, "ipc");
+  };
+  const disposers = new Set<() => void>();
+  const track = (dispose: () => void) => {
+    disposers.add(dispose);
+    return () => { disposers.delete(dispose); dispose(); };
+  };
   return {
+    dispose: () => {
+      disposed = true;
+      for (const dispose of disposers) dispose();
+      disposers.clear();
+    },
     on: (c: string, h: (...args: unknown[]) => void) => {
       requireIpc();
       const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
       ipcMain.on(ch(c), wrapped);
-      return () => ipcMain.removeListener(ch(c), wrapped as never);
+      return track(() => ipcMain.removeListener(ch(c), wrapped as never));
     },
     send: (c: string, ...args: unknown[]) => {
       requireIpc();
@@ -6970,12 +7225,12 @@ function makeMainIpc(tweak: DiscoveredTweak) {
       if (id === "co.tweakers.projects" && c === "projects") {
         mainTweakReadHandlers.set(`${id}:${c}`, invokeHandler);
       }
-      return () => {
+      return track(() => {
         if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
         mainIpcHandlerRegistrations.delete(channel);
         if (mainTweakReadHandlers.get(`${id}:${c}`) === invokeHandler) mainTweakReadHandlers.delete(`${id}:${c}`);
         try { ipcMain.removeHandler(channel); } catch {}
-      };
+      });
     },
     handleWithContext: (
       c: string,
@@ -7003,11 +7258,11 @@ function makeMainIpc(tweak: DiscoveredTweak) {
         });
         return handler(context, ...args);
       });
-      return () => {
+      return track(() => {
         if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
         mainIpcHandlerRegistrations.delete(channel);
         try { ipcMain.removeHandler(channel); } catch {}
-      };
+      });
     },
   };
 }
@@ -7153,10 +7408,6 @@ const APPLE_PRIVACY_PANES: Record<"screen-recording" | "accessibility" | "input-
   "input-monitoring": "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
 };
 
-const MAX_APPSHOT_PIXELS = 16_000_000;
-const MAX_APPSHOT_BYTES = 20 * 1024 * 1024;
-const DEFAULT_APPSHOT_TEXT_LIMIT = 100_000;
-
 async function getCapturePermissionStatus(): Promise<CodexPermissionStatus> {
   if (process.platform !== "darwin") {
     return {
@@ -7182,160 +7433,6 @@ function normalizeScreenStatus(value: string): CodexPermissionStatus["screenReco
 async function openPermissionSettings(kind: "screen-recording" | "accessibility" | "input-monitoring"): Promise<void> {
   if (process.platform !== "darwin") return;
   await shell.openExternal(APPLE_PRIVACY_PANES[kind]);
-}
-
-async function captureFrontmostWindow(options: { includeAccessibilityText?: boolean; maxTextCharacters?: number } = {}): Promise<FrontmostWindowCapture> {
-  const frontmost = await readFrontmostWindowInfo(Math.max(0, Math.min(options.maxTextCharacters ?? DEFAULT_APPSHOT_TEXT_LIMIT, DEFAULT_APPSHOT_TEXT_LIMIT)));
-  const source = await findDesktopSourceForFrontmost(frontmost);
-  if (!source) throw new Error("frontmost window was not available to Electron capture");
-  const image = source.thumbnail.toPNG();
-  if (image.length > MAX_APPSHOT_BYTES) throw new Error("frontmost window capture exceeded the AppShots byte limit");
-  const size = source.thumbnail.getSize();
-  if (size.width * size.height > MAX_APPSHOT_PIXELS) throw new Error("frontmost window capture exceeded the AppShots pixel limit");
-  return {
-    captureId: randomUUID(),
-    capturedAt: new Date().toISOString(),
-    app: {
-      name: frontmost.appName || "Unknown",
-      bundleIdentifier: frontmost.bundleIdentifier,
-      pid: frontmost.pid,
-    },
-    window: {
-      id: Number(source.id.replace(/^window:/, "").split(":")[0]) || 0,
-      title: frontmost.windowTitle || source.name || null,
-      bounds: { x: 0, y: 0, width: size.width, height: size.height },
-    },
-    image: {
-      mimeType: "image/png",
-      dataBase64: image.toString("base64"),
-      width: size.width,
-      height: size.height,
-      byteLength: image.length,
-    },
-    accessibility: options.includeAccessibilityText === false
-      ? { status: "unavailable", text: null, characterCount: 0 }
-      : frontmost.accessibility,
-  };
-}
-
-interface FrontmostWindowInfo {
-  appName: string;
-  bundleIdentifier: string | null;
-  pid: number;
-  windowTitle: string | null;
-  accessibility: FrontmostWindowCapture["accessibility"];
-}
-
-async function readFrontmostWindowInfo(maxTextCharacters: number): Promise<FrontmostWindowInfo> {
-  if (process.platform !== "darwin") {
-    return {
-      appName: "Unknown",
-      bundleIdentifier: null,
-      pid: -1,
-      windowTitle: null,
-      accessibility: { status: "unavailable", text: null, characterCount: 0 },
-    };
-  }
-  const script = `
-set maxChars to ${Math.max(0, Math.floor(maxTextCharacters))}
-tell application "System Events"
-  set frontProc to first application process whose frontmost is true
-  set appName to name of frontProc as text
-  set appPid to unix id of frontProc as integer
-  set winTitle to ""
-  set axText to ""
-  try
-    set winTitle to name of front window of frontProc as text
-  end try
-  try
-    set rawText to value of entire contents of front window of frontProc
-    set oldDelims to AppleScript's text item delimiters
-    set AppleScript's text item delimiters to linefeed
-    set axText to rawText as text
-    set AppleScript's text item delimiters to oldDelims
-  end try
-end tell
-set bundleId to ""
-try
-  tell application "System Events" to set bundleId to bundle identifier of first application process whose frontmost is true
-end try
-if maxChars > 0 and length of axText > maxChars then set axText to text 1 thru maxChars of axText
-return appName & linefeed & appPid & linefeed & bundleId & linefeed & winTitle & linefeed & axText
-`;
-  try {
-    const { stdout } = await execFileResult("/usr/bin/osascript", ["-e", script], 3_000, 512 * 1024);
-    const [appName = "Unknown", pidText = "-1", bundleIdentifier = "", windowTitle = "", ...textLines] = stdout.split(/\r?\n/);
-    const text = normalizeAccessibilityText(textLines.join("\n"));
-    const status = text ? (text.length >= maxTextCharacters && maxTextCharacters > 0 ? "truncated" : "captured") : "unavailable";
-    return {
-      appName: appName.trim() || "Unknown",
-      bundleIdentifier: bundleIdentifier.trim() || null,
-      pid: Number(pidText) || -1,
-      windowTitle: windowTitle.trim() || null,
-      accessibility: { status, text: text || null, characterCount: text.length },
-    };
-  } catch (error) {
-    return {
-      appName: "Unknown",
-      bundleIdentifier: null,
-      pid: -1,
-      windowTitle: null,
-      accessibility: {
-        status: systemPreferences.isTrustedAccessibilityClient(false) ? "unavailable" : "permission-denied",
-        text: null,
-        characterCount: 0,
-      },
-    };
-  }
-}
-
-function normalizeAccessibilityText(value: string): string {
-  const lines = value
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-  return [...new Set(lines)].join("\n");
-}
-
-async function findDesktopSourceForFrontmost(frontmost: FrontmostWindowInfo): Promise<Electron.DesktopCapturerSource | null> {
-  const sources = await desktopCapturer.getSources({
-    types: ["window"],
-    thumbnailSize: { width: 4096, height: 4096 },
-    fetchWindowIcons: false,
-  });
-  const title = compactSourceName(frontmost.windowTitle);
-  const appName = compactSourceName(frontmost.appName);
-  return sources.find((source) => title && compactSourceName(source.name).includes(title))
-    ?? sources.find((source) => appName && compactSourceName(source.name).includes(appName))
-    ?? sources.find((source) => !/ChatGPT|Codex/i.test(source.name))
-    ?? sources[0]
-    ?? null;
-}
-
-function compactSourceName(value: string | null | undefined): string {
-  return String(value || "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
-}
-
-async function registerCaptureHotkey(
-  tweak: DiscoveredTweak,
-  options: { preferred?: "DoubleCommand"; fallbackAccelerator: string; suppressNativeAppshots?: boolean },
-  listener: () => void,
-): Promise<CodexHotkeyRegistration> {
-  assertTweakPermission(tweak, "global-shortcut");
-  const accelerator = typeof options.fallbackAccelerator === "string" && options.fallbackAccelerator.trim()
-    ? options.fallbackAccelerator.trim()
-    : "Command+Shift+2";
-  await app.whenReady();
-  if (!globalShortcut.register(accelerator, listener)) {
-    throw new Error(`Could not register AppShots shortcut: ${accelerator}`);
-  }
-  return {
-    active: "fallback",
-    unregister: async () => {
-      try { globalShortcut.unregister(accelerator); } catch {}
-    },
-  };
 }
 
 function getOwlViewCapabilities(): CodexRuntimeCapabilities["views"] {
@@ -7804,15 +7901,14 @@ function makeCodexApi(tweak: DiscoveredTweak) {
         if (kind === "input-monitoring") assertTweakPermission(tweak, "global-shortcut");
         return openPermissionSettings(kind);
       },
-      captureFrontmostWindow: async (options?: { includeAccessibilityText?: boolean; maxTextCharacters?: number }) => {
-        assertTweakPermission(tweak, "screen-capture");
-        if (options?.includeAccessibilityText !== false) assertTweakPermission(tweak, "accessibility");
-        return captureFrontmostWindow(options);
+      captureFrontmostWindow: async () => {
+        throw new Error("Custom capture was retired. Use native Codex AppShots.");
       },
     },
     hotkeys: {
-      registerCaptureHotkey: (options: { preferred?: "DoubleCommand"; fallbackAccelerator: string; suppressNativeAppshots?: boolean }, listener: () => void) =>
-        registerCaptureHotkey(tweak, options, listener),
+      registerCaptureHotkey: async () => {
+        throw new Error("Capture shortcuts are owned by native Codex AppShots.");
+      },
     },
     createBrowserView: createCodexBrowserView,
     createWindow: createCodexWindow,

@@ -8,11 +8,37 @@ This project uses semver for the installer, runtime, SDK, and published CLI pack
 
 ### Added
 
+- Added runtime/SDK 1.1 activation cleanup and cancellation, shared UI surface snapshots,
+  isolated backend event observers and explicit text/model request transforms.
+- Added an adapter for the native Codex AppShots and Computer History services.
+  Native helper sharing and live acceptance remain pending.
+
+
 - Added User Questions 0.5.0 with rich option details and tradeoffs, explicit
   Skip/Other and multi-select answers, task-bound resumable drafts, acknowledged
   enhanced/generic delivery, and retryable `display_failed` recovery.
 
 ### Changed
+
+- Accounts 0.10.16 releases completed reconnect helpers before refreshing usage,
+  reads Storage from the bound native home, and orders legacy project chats by
+  their requested timestamps before pagination.
+- Projects 0.8.1 restores folder colors for native project rows with emoji labels.
+
+- Accounts 0.10.15 preserves the native profile identity when selecting subscription
+  usage, shows bound saved identities during authentication failures, and serves
+  saved projects through a bounded read-only account projection.
+- Added resumable missing-artifact recovery with verified archive restoration and
+  successor receipts, preserving the original retirement evidence.
+
+- UI Improvements 0.3 owns titlebar controls and rich blocks; Projects 0.8 owns
+  thread summary profiles. Destination settings win during migration and legacy
+  settings remain available for rollback.
+- AppShots 0.2 uses native Codex settings and no longer runs custom screenshot,
+  clipboard, attachment, or hotkey automation.
+- Fixed invalid/duplicate tweak discovery, asynchronous teardown and reload ordering,
+  stale Accounts enrollment and User Questions shutdown cleanup.
+
 
 - User Questions answers now state preference-not-rule semantics and conflict
   guidance. Its policy compatibility flow is explicit Preview/Apply/Restore,

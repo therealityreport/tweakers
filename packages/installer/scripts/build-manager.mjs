@@ -1,3 +1,5 @@
+import { ownEntrypoint } from "../../../scripts/owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 /**
  * Build the fixed-protocol manager as one deployable ESM file. The immutable
  * launcher never executes a source checkout or a node_modules tree, so every

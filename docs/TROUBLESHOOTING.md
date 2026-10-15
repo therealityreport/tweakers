@@ -26,21 +26,15 @@ The re-sign step failed or was skipped. Run:
 tweaker doctor
 ```
 
-If the signature check fails, manually re-sign:
-
-```sh
-tweaker repair --force
-xattr -dr com.apple.quarantine /Applications/Codex.app
-```
-
-On macOS, Tweaker signs ad-hoc by default. `tweaker install --local`
-or `tweaker repair --local` opts into a local "Tweaker Local Signing"
-identity, but that can involve Keychain access prompts.
+If doctor reports a signature failure, follow its guarded repair instructions
+for the exact app it identifies. A promotable macOS candidate uses Tweakers'
+stable local signing identity; ad-hoc signing is limited to explicit
+candidate-only validation. Do not remove quarantine from a guessed app path.
 
 ## App launches but nothing about tweaker appears
 
 1. Open DevTools (View menu) and look for `[tweaker]` lines.
-2. Check `~/Library/Application Support/tweaker/log/loader.log`.
+2. Check `<Tweakers user root>/log/loader.log` (`~/Library/Application Support/Tweakers` on a fresh macOS setup; existing legacy roots may differ).
 3. If empty, the loader is not being executed → integrity check failed and the app silently fell back. Run `tweaker repair`.
 
 ## Codex auto-updated and the patch is gone
@@ -156,7 +150,9 @@ Common causes:
 - `manifest.json` not valid JSON
 - Missing `id`/`name`/`version` fields
 - Entry script throws during `require`
-- ESM-style `export default` in a `.js` file (use `.mjs` or `module.exports`)
+- Renderer entries must be bundled to runtime-loadable CommonJS or use
+  `module.exports`; renaming raw `export default` source to `.mjs` does not make
+  it loadable.
 
 ## Uninstall is incomplete
 

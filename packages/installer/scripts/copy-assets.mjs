@@ -1,3 +1,5 @@
+import { ownEntrypoint } from "../../../scripts/owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 // Copies the loader stub + bundled runtime/manager into installer/assets/
 // so the published npm package can extract them at install time.
 import { createHash } from "node:crypto";
@@ -9,6 +11,8 @@ import {
   removeGeneratedConflictCopies,
 } from "../../../scripts/generated-assets.mjs";
 import { syncTweaks } from "../../../scripts/sync-tweaks.mjs";
+import { productionDependencyPaths } from "../../../scripts/production-dependencies.mjs";
+import { stageRuntimeRepairSourceCustody } from "../dist/runtime-repair-source-custody.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const defaultRoot = resolve(here, "..", "..", "..");
@@ -83,6 +87,9 @@ const workspacePackageTargets = new Map([
 const workspaceSdkPackage = "tweakers-sdk";
 
 export function copyInstallerAssets(root = defaultRoot, { publicationDependencies, only } = {}) {
+  // Resolve a checkout alias once so nested dependency aliases use the same
+  // lexical boundary as their canonical parent (not /var versus /private/var).
+  root = realpathSync(root);
   if (only !== undefined) {
     if (only === "app-launcher") return copyAppLauncherAsset(root, publicationDependencies);
     if (only === "manager-launcher") return copyManagerLauncherAssets(root, publicationDependencies);
@@ -230,7 +237,14 @@ function stageManagerManagedRuntimeAssets(root, stagedAssets) {
   rmSync(destination, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   mkdirSync(destination, { recursive: true });
   const rootPolicy = createManagedRuntimeCopyPolicy(root, destination);
+  const productionPaths = productionDependencyPaths(root, ["packages/installer", "packages/runtime"]);
   for (const relativeSource of managerManagedRuntimeCopies) {
+    if (relativeSource === "node_modules") {
+      for (const dependency of productionPaths) {
+        copyManagerManagedRuntimeTree(join(root, dependency), join(destination, dependency), { ...rootPolicy, productionOnly: true });
+      }
+      continue;
+    }
     const source = resolve(root, ...relativeSource.split("/"));
     if (!existsSync(source)) continue;
     const target = join(destination, ...relativeSource.split("/"));
@@ -256,6 +270,7 @@ function stageManagerManagedRuntimeAssets(root, stagedAssets) {
   rmSync(join(destination, "packages", "installer", "dist", "manager.mjs.map"), { force: true });
   assertMaterializedBinShims(rootPolicy);
   sweepFinderJunk(destination);
+  stageRuntimeRepairSourceCustody(root, destination);
   normalizeManagerManagedRuntimeModes(destination);
   writeManagedRuntimeFingerprint(destination);
 }
@@ -487,6 +502,9 @@ function isBinShim(policy, source) {
  */
 function copyManagerManagedRuntimeTree(source, target, policy, ancestry = new Set()) {
   const resolvedSource = resolve(source);
+  // Electron supplies build-time declarations. Its downloaded desktop is never
+  // a managed-runtime dependency; the verified host supplies Electron at runtime.
+  if(policy.kind === "workspace-source" && [policy.sourceRoot,policy.canonicalRoot].some(root=>relative(root,resolvedSource).replaceAll("\\","/")==="node_modules/electron/dist"))return;
   let stat;
   try {
     stat = lstatSync(resolvedSource);
@@ -575,6 +593,7 @@ function copyManagerManagedRuntimeTree(source, target, policy, ancestry = new Se
   if (stat.isDirectory()) {
     mkdirSync(target, { recursive: true });
     for (const entry of readdirSync(resolvedSource).sort((left, right) => left.localeCompare(right))) {
+      if (policy.productionOnly && ["node_modules", "test", "tests", "__tests__"].includes(entry)) continue;
       // Transaction workspaces are generated output, never source input.  The
       // policy also rejects a link into generated installer assets at any
       // depth, before it can reach a recursive prior generation.

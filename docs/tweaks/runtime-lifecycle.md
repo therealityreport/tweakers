@@ -115,3 +115,55 @@ Tweaker stores enable flags in `<userRoot>/config.json`.
 - Tweak start errors are logged and do not stop other tweaks.
 - Renderer load failures are mirrored to `<userRoot>/log/preload.log`.
 - Main load failures are written to `<userRoot>/log/main.log`.
+
+## Activation resources (runtime 1.1)
+
+`api.lifecycle.signal` is cancelled when an activation is stopped or fails.
+Register cleanup as soon as a resource is acquired with
+`api.lifecycle.add(() => resource.dispose())`. Its returned disposer is idempotent.
+The host releases tracked IPC, settings pages and host-surface subscriptions after
+`stop()`, including a failed startup. Async `stop()` is awaited; a shutdown that
+exceeds five seconds holds reload rather than starting an overlapping activation.
+Direct DOM changes and unregistered timers still require the tweak's cleanup.
+Check the signal after asynchronous work before changing the DOM.
+
+Renderer reload requests arriving during startup are coalesced into another
+reload, so a newer enabled state is not dropped.
+
+## Backend hooks
+
+Main-scoped tweaks with `backend-hooks` permission can register isolated modules:
+
+```js
+module.exports = {
+  async start(api) {
+    await api.backend.register({ entry: "hooks.cjs", exportName: "transform", kind: "transform" });
+  },
+};
+```
+
+```js
+// hooks.cjs — executes in its own worker; do not depend on start() closures.
+exports.transform = ({ params }) => ({
+  input: params.input.map(item => item.type === "text"
+    ? { ...item, text: item.text + "\nUse concise explanations." }
+    : item),
+});
+```
+
+Transforms apply only to `turn/start` and `turn/steer`. Return a partial update,
+not the complete request. Existing text inputs may change; other input items,
+request IDs, thread IDs, permission policy and authentication remain native-owned.
+`turn/start` also permits `model`, `effort`, and `summary` string/null updates.
+Hooks run in tweak-ID order, then registration order. A failed, invalid or timed
+out transform returns an explicit error to the caller before provider dispatch.
+There is no tool-result replacement or permission override.
+
+`kind: "observe"` receives `{method, params}` for `turn/started`, `turn/completed`,
+`item/started`, and `item/completed`. Notifications are observational and cannot
+replace output. Failures are isolated and do not delay the native stream.
+Each hook has a queue limit of 16, a one-second invocation deadline, a 64 MiB
+worker heap limit, and no idle polling. A tweak may register up to eight hooks.
+The host closes workers on failed startup, disable and reload. Inspect
+`api.backend.diagnostics()` for failed or pending hooks. Workers isolate execution
+and memory pressure; they are not a security sandbox for untrusted code.

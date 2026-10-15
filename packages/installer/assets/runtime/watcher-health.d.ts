@@ -73,13 +73,15 @@ export interface RuntimeFingerprintEvidence {
     fingerprint: string;
     fileCount: number;
 }
-export declare function getWatcherHealth(userRoot: string, probeDependencies?: WatcherHealthProbeDependencies): WatcherHealth;
+export declare function getWatcherHealth(userRoot: string, probeDependencies?: WatcherHealthProbeDependencies, observedRuntimeFingerprints?: RuntimeFingerprintSet, effectiveConfig?: () => Record<string, unknown>): WatcherHealth;
 /**
  * Reads the canonical health truth and publishes a privacy-bounded snapshot
  * for read-only consumers such as Menu Bar. A failing current snapshot never
  * replaces the last-known-good watcher snapshot.
  */
-export declare function getAndPublishWatcherHealth(userRoot: string, probeDependencies?: WatcherHealthProbeDependencies, publisherDependencies?: WatcherHealthPublisherDependencies): WatcherHealth;
+export declare function getAndPublishWatcherHealth(userRoot: string, probeDependencies?: WatcherHealthProbeDependencies, publisherDependencies?: WatcherHealthPublisherDependencies, effectiveConfig?: () => Record<string, unknown>): WatcherHealth;
+/** Routine UI health avoids a synchronous walk of every runtime file. */
+export declare function getAndPublishWatcherHealthAsync(userRoot: string, probeDependencies?: WatcherHealthProbeDependencies, publisherDependencies?: WatcherHealthPublisherDependencies, effectiveConfig?: () => Record<string, unknown>): Promise<WatcherHealth>;
 export declare function publishWatcherHealthSnapshot(userRoot: string, health: WatcherHealth, dependencies?: WatcherHealthPublisherDependencies): PublishedWatcherHealth;
 export declare function analyzeLaunchdWatcherDefinition(input: {
     appRoot: string;
@@ -93,5 +95,6 @@ export declare function analyzeWatcherCycleReceipt(receipt: WatcherCycleReceipt)
 export declare function classifyRuntimeFingerprints(values: RuntimeFingerprintSet): RuntimeFingerprintHealth;
 export declare function launchdDisabledState(output: string | null, label: string): boolean | null;
 export declare function parseLaunchdLoadedCommand(output: string): string | null;
+export declare function readRuntimeFingerprintEvidenceAsync(root: string): Promise<RuntimeFingerprintEvidence | null>;
 export declare function readRuntimeFingerprintEvidence(root: string): RuntimeFingerprintEvidence | null;
 export {};

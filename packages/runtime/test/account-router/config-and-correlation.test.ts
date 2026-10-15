@@ -132,7 +132,9 @@ test("only the frozen generated method inventory can route", () => {
   assert.equal(classifyServerNotification("turn/completed", { threadId: "thread-1" }), "verify_persisted_owner_then_forward");
   assert.equal(classifyServerNotification("future/unknown"), "unknown");
   assert.equal(parseJsonRpcLine('{"id":1.25,"method":"thread/start"}'), null);
-  assert.equal(parseJsonRpcLine('{"id":"a","method":"thread/start"}')?.id, "a");
+  const parsed = parseJsonRpcLine('{"id":"a","method":"thread/start"}');
+  assert.ok(parsed && "id" in parsed);
+  assert.equal(parsed.id, "a");
 });
 
 test("control output rejects secret-shaped keys and values while retaining opaque status", () => {

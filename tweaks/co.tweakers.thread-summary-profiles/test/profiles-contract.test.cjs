@@ -5,6 +5,14 @@ const test = require("node:test");
 const moduleUnderTest = require("../index.js");
 const tweak = moduleUnderTest.__test;
 
+test("Profiles errors never render arbitrary private IPC error details", () => {
+  const canonical = require("../../co.tweakers.projects/lib/thread-summary-profiles").__test;
+  const rendered = canonical.renderProfilesState({ state: "error", error: "Account person@example.com failed at /Users/person/.codex: Bearer private-value" });
+  assert.equal(rendered.state, "error");
+  assert.equal(rendered.text, "Profiles unavailable.");
+  assert.deepEqual(rendered.rows, []);
+});
+
 class FakeNode {}
 class FakeElement extends FakeNode {
   constructor(tag) {
@@ -178,6 +186,11 @@ test("start reloads when the resolved fiber identity changes and never writes pa
     await flushFrames();
     assert.deepEqual(calls[1].project, { id: "fiber-project", workspacePath: undefined });
     assert.match(mount.textContent, /fiber-project/);
+    hostContext = { id: "next-fiber-project" };
+    observed();
+    await flushFrames();
+    assert.deepEqual(calls[2].project, { id: "next-fiber-project", workspacePath: undefined });
+    assert.match(mount.textContent, /next-fiber-project/);
     moduleUnderTest.stop.call(instance);
   });
 });
@@ -309,4 +322,65 @@ test("profile signatures include Projects revisions and malformed rows are dropp
     profiles: [{ label: "Nameless", value: "x" }, { type: "github", value: "Work" }, { type: "", id: "  ", value: "y" }],
   });
   assert.deepEqual(projection.rows.map((row) => row.id), ["github"]);
+});
+
+
+test("Projects owns the profiles switch, routes reads through its own service, and disposes mounts independently", async (t) => {
+  await withFakeDom(async ({ document, flushFrames }) => {
+    const previous = { MutationObserver: global.MutationObserver, requestAnimationFrame: global.requestAnimationFrame, cancelAnimationFrame: global.cancelAnimationFrame };
+    t.after(() => Object.assign(global, previous));
+    global.MutationObserver = class { observe() {} disconnect() {} };
+    global.requestAnimationFrame = window.requestAnimationFrame;
+    global.cancelAnimationFrame = window.cancelAnimationFrame;
+    document.addEventListener = () => {};
+    document.removeEventListener = () => {};
+    document.querySelector = () => null;
+    window.dispatchEvent = () => {};
+    const createElement = document.createElement;
+    document.createElement = (tag) => {
+      const element = createElement(tag);
+      element.listeners = new Map();
+      element.addEventListener = (type, listener) => element.listeners.set(type, listener);
+      return element;
+    };
+    const { panel } = summaryPanel(document, { projectId: "owned-project", workspacePath: "/private/owned" });
+    const calls = [];
+    const writes = [];
+    const pages = [];
+    const observers = [];
+    const api = {
+      process: "renderer",
+      storage: { get: (_key, fallback) => fallback, set: (key, value) => writes.push([key, value]) },
+      react: { host: { query: () => [], observe(topics) { observers.push(topics); return () => {}; } } },
+      ipc: { on: () => () => {}, invoke(channel, payload) {
+        calls.push([channel, payload]);
+        return Promise.resolve(payload.action === "profiles.read" ? response("owned-project", "Owned profile") : { ok: false });
+      } },
+      settings: { registerPage(page) { pages.push(page); return { unregister() {} }; } },
+    };
+    const projects = require("../../co.tweakers.projects/index.js");
+    const instance = {};
+    projects.start.call(instance, api);
+    const root = document.createElement("div");
+    root.isConnected = true;
+    const cleanupPage = pages[0].render(root);
+    const toggle = root.querySelector('[role="switch"]');
+    assert.equal(toggle.checked, false);
+    toggle.checked = true;
+    toggle.listeners.get("change")();
+    await flushFrames();
+    assert.deepEqual(writes, [["threadSummaryProfiles", true]]);
+    assert.equal(pages.length, 1, "Profiles shares the Projects settings page");
+    assert.ok(observers.some((topics) => topics.includes("thread-context")));
+    const profileRead = calls.find(([, payload]) => payload.action === "profiles.read");
+    assert.equal(profileRead[0], "projects", "owner reads use the same IPC namespace as the Projects service");
+    assert.deepEqual(profileRead[1].project, { id: "owned-project", workspacePath: "/private/owned" });
+    assert.match(panel.querySelector('[data-co-tweakers-thread-summary-profiles]').textContent, /Owned profile/);
+    toggle.checked = false;
+    toggle.listeners.get("change")();
+    assert.equal(panel.querySelector('[data-co-tweakers-thread-summary-profiles]'), null);
+    assert.deepEqual(writes.at(-1), ["threadSummaryProfiles", false]);
+    cleanupPage();
+    projects.stop.call(instance);
+  });
 });

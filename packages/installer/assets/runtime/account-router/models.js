@@ -12,6 +12,20 @@ class AccountModelCatalogsV1 {
     now;
     cache = new Map();
     inFlight = new Map();
+    generation = 0;
+    get revision() { return this.generation; }
+    /** Auth, backend and policy changes also revoke outstanding catalog reads. */
+    invalidate(account) {
+        this.generation += 1;
+        if (account === undefined)
+            this.cache.clear();
+        else
+            this.cache.delete(account);
+        // Page readers observe the global revision. Revoke every unfinished read
+        // so unrelated-account drift cannot publish a ten-minute unknown catalog.
+        // Completed caches for unaffected accounts remain valid.
+        this.inFlight.clear();
+    }
     constructor(fetchCatalog, now = Date.now) {
         this.fetchCatalog = fetchCatalog;
         this.now = now;
@@ -19,12 +33,17 @@ class AccountModelCatalogsV1 {
     async support(model, accounts) {
         if (model.length === 0)
             return { native: false, eligible: new Set(accounts), unsupported: new Set() };
+        const revision = this.revision;
         const catalogs = new Map();
         for (let offset = 0; offset < accounts.length; offset += exports.MODEL_CATALOG_MAX_CONCURRENCY) {
             const batch = accounts.slice(offset, offset + exports.MODEL_CATALOG_MAX_CONCURRENCY);
             const values = await Promise.all(batch.map((account) => this.catalog(account)));
             batch.forEach((account, index) => catalogs.set(account, values[index] ?? null));
         }
+        // A mixed-generation fanout is unknown, never stale eligibility. The owner
+        // rechecks a deferred request against the current revision before dispatch.
+        if (revision !== this.revision)
+            return { native: false, eligible: new Set(accounts), unsupported: new Set() };
         const native = [...catalogs.values()].some((names) => names?.has(model) === true);
         if (!native)
             return { native: false, eligible: new Set(accounts), unsupported: new Set() };
@@ -46,10 +65,13 @@ class AccountModelCatalogsV1 {
         const active = this.inFlight.get(account);
         if (active)
             return active;
-        const request = this.fetchCatalog(account).then(parseModelCatalogV1, () => null).then((names) => {
+        const request = Promise.resolve().then(() => this.fetchCatalog(account)).then(parseModelCatalogV1, () => null).then((names) => {
+            if (this.inFlight.get(account) !== request)
+                return null;
             this.cache.set(account, { expiresAt: this.now() + exports.MODEL_CATALOG_TTL_MS, names: names ? new Set(names) : null });
             return names;
-        }).finally(() => this.inFlight.delete(account));
+        }).finally(() => { if (this.inFlight.get(account) === request)
+            this.inFlight.delete(account); });
         this.inFlight.set(account, request);
         return request;
     }
@@ -65,6 +87,8 @@ function parseModelCatalogV1(value) {
     let encoded;
     try {
         encoded = JSON.stringify(value);
+        if (typeof encoded !== "string")
+            return null;
     }
     catch {
         return null;

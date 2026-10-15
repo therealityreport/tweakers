@@ -1467,6 +1467,7 @@ test("operator CLI has no root defaults and requires an explicit apply flag", ()
     candidateFingerprint: null,
     conversationCount: 0,
     segmentCount: 0,
+    capacity: null,
     sharedSkillsFingerprint: null,
     sharedSkillsTrustedRoots: [],
     sharedSkillsTrustedRootsFingerprint: null,

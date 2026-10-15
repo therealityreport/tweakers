@@ -173,6 +173,9 @@ function runTargetGuiCommand(command: string, args: string[], encoding: BufferEn
     encoding,
     env: invocation.env,
     stdio: ["ignore", "pipe", "pipe"],
+    // `lsregister -dump` is tens of MB on a busy machine.
+    maxBuffer: 128 * 1024 * 1024,
+    timeout: 60_000,
   });
 }
 
@@ -234,6 +237,74 @@ export function reconcileLaunchServices(
       result.garbageCollected = true;
     } catch (error) {
       result.failed.push({ path: "LaunchServices database", error: commandErrorMessage(error) });
+    }
+  }
+  return result;
+}
+
+/** Parse `lsregister -dump` into registered bundle paths for one identifier. */
+export function registeredBundlePaths(dump: string, bundleId: string): string[] {
+  const paths: string[] = [];
+  let path: string | null = null;
+  for (const line of dump.split("\n")) {
+    const pathMatch = /^path:\s+(.+?)(?:\s+\(0x[0-9a-f]+\))?\s*$/.exec(line);
+    if (pathMatch) { path = pathMatch[1]!; continue; }
+    const idMatch = /^identifier:\s+(\S+)\s*$/.exec(line);
+    if (idMatch && path !== null) {
+      if (idMatch[1] === bundleId) paths.push(path);
+      path = null;
+    }
+    if (/^-{10,}/.test(line)) path = null;
+  }
+  return [...new Set(paths)];
+}
+
+/**
+ * Leave exactly one LaunchServices registration for a promoted Tweakers app.
+ *
+ * Doctor candidates and retired generations are registered by macOS when they
+ * are built or probed. Once moved away, their stale entries share the live
+ * bundle identifier, so the Dock and `open -b` can resolve the wrong copy (or
+ * show the upstream icon). Unregister every other path for this identifier,
+ * including paths that no longer exist, then re-register the live app.
+ */
+export function reconcileVariantLaunchServices(
+  options: { appRoot: string; bundleId: string },
+  adapters: LaunchServicesAdapters & { dump?: () => string } = {},
+): LaunchServicesResult {
+  const result: LaunchServicesResult = {
+    unregistered: [],
+    skipped: [],
+    failed: [],
+    registeredCanonical: false,
+    garbageCollected: false,
+  };
+  if ((adapters.platform ?? currentPlatform()) !== "darwin") return result;
+  const run = adapters.run ?? ((command, args) => { runTargetGuiCommand(command, args); });
+  const canonical = resolve(options.appRoot);
+  let dump: string;
+  try {
+    dump = adapters.dump?.() ?? runTargetGuiCommand(LAUNCH_SERVICES_TOOL, ["-dump"]);
+  } catch (error) {
+    result.failed.push({ path: "LaunchServices database", error: commandErrorMessage(error) });
+    return result;
+  }
+  for (const path of registeredBundlePaths(dump, options.bundleId)) {
+    if (resolve(path) === canonical) continue;
+    try {
+      run(LAUNCH_SERVICES_TOOL, ["-u", path]);
+      result.unregistered.push(path);
+    } catch (error) {
+      if (launchServicesRegistrationAbsent(error)) result.skipped.push(path);
+      else result.failed.push({ path, error: commandErrorMessage(error) });
+    }
+  }
+  if ((adapters.exists ?? existsSync)(canonical)) {
+    try {
+      run(LAUNCH_SERVICES_TOOL, ["-f", canonical]);
+      result.registeredCanonical = true;
+    } catch (error) {
+      result.failed.push({ path: canonical, error: commandErrorMessage(error) });
     }
   }
   return result;

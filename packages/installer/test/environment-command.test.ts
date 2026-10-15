@@ -31,6 +31,7 @@ const ROOT = "/tmp/tweakers-environment-command";
 function paths(): ResolvedUserPaths {
   return {
     root: ROOT,
+    managedMcpRoot: `${ROOT}/managed-mcp`,
     runtime: `${ROOT}/runtime`,
     tweaks: `${ROOT}/tweaks`,
     backup: `${ROOT}/backup`,
@@ -50,6 +51,18 @@ function paths(): ResolvedUserPaths {
     environmentTransactionFile: `${ROOT}/transactions/environment.json`,
     environmentReceiptRoot: `${ROOT}/transactions/environment`,
     environmentLockFile: `${ROOT}/transactions/environment.lock`,
+    environmentRuntimeProofFile: `${ROOT}/environment-runtime-proof.json`,
+    environmentWatcherPromotionFile: `${ROOT}/transactions/environment-watcher.json`,
+    environmentModeCacheRoot: `${ROOT}/environment-cache`,
+    environmentModeCacheCurrentFile: `${ROOT}/environment-cache/current.json`,
+    environmentModeCacheGenerationsRoot: `${ROOT}/environment-cache/generations`,
+    environmentModeCachePreparationRoot: `${ROOT}/environment-cache/next`,
+    environmentModeCacheLockFile: `${ROOT}/environment-cache/environment-mode-cache.lock`,
+    desktopUpdateReceiptFile: `${ROOT}/transactions/desktop-update.json`,
+    desktopUpdateArchiveRoot: `${ROOT}/transactions/desktop-update`,
+    desktopUpdateLockFile: `${ROOT}/transactions/desktop-update.lock`,
+    desktopUpdateHeartbeatFile: `${ROOT}/transactions/desktop-update.heartbeat.json`,
+    desktopUpdateLogFile: `${ROOT}/log/desktop-update.log`,
   };
 }
 
@@ -253,8 +266,8 @@ test("status is read-only and reports per-app-experience availability from recom
       patchedPayloadBuildable: true,
     },
   });
-  assert.equal(result.schemaVersion, 1);
   assert.ok("channels" in result);
+  assert.equal(result.schemaVersion, 1);
   assert.equal(result.cacheV2.schemaVersion, 2);
   assert.equal(result.cacheV2.state, "unavailable");
   assert.deepEqual(result.cacheV2.invalidationReasons, ["no environment mode cache has been published"]);
@@ -331,6 +344,7 @@ test("status --observe never runs expensive profile or managed Alpha verificatio
   const cachedVersions: Array<string | null | undefined> = [];
   const fixture = dependencies({
     loadState: (_input, loadDependencies) => {
+      assert.ok(loadDependencies);
       assert.ok(loadDependencies.inspectProfile);
       cachedVersions.push(loadDependencies.inspectProfile(
         unverifiedRegistry.profiles.stable,
@@ -538,7 +552,7 @@ test("submit accepts only the matching prepared receipt and derives helper paths
 
   const result = await environment("submit", { transaction: "safe-id", json: true }, fixture.deps);
 
-  assert.equal(result.kind, "environment-commit-helper");
+  assert.ok("kind" in result && result.kind === "environment-commit-helper");
   assert.deepEqual(fixture.submits, [{
     transactionId: "safe-id",
     cliPath: `${ROOT}/transactions/environment/safe-id/prepared/managed-runtime/requested/packages/installer/dist/cli.js`,

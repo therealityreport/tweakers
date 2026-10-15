@@ -11,6 +11,8 @@ exports.readAndPreflightNativeHistoryBaseSourceStaticV1 = readAndPreflightNative
 exports.readAndPreflightNativeHistorySourceV1 = readAndPreflightNativeHistorySourceV1;
 exports.observeNativeHistoryWritersV1 = observeNativeHistoryWritersV1;
 exports.observeNativeAccountWritersV1 = observeNativeAccountWritersV1;
+exports.observeNativeExecutionHomeWritersV1 = observeNativeExecutionHomeWritersV1;
+exports.observeNativeExecutionHomeOperationWritersV1 = observeNativeExecutionHomeOperationWritersV1;
 exports.observeNativeAccountOperationWritersV1 = observeNativeAccountOperationWritersV1;
 exports.nativeHistoryAccountSourceForV1 = nativeHistoryAccountSourceForV1;
 exports.nativeHistoryThreadReadContextV1 = nativeHistoryThreadReadContextV1;
@@ -26,6 +28,7 @@ const node_child_process_1 = require("node:child_process");
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
+const node_os_1 = require("node:os");
 const types_1 = require("./types");
 const native_history_extensions_1 = require("./native-history-extensions");
 var native_history_extensions_2 = require("./native-history-extensions");
@@ -58,7 +61,7 @@ function nativeHistoryEffectiveAuthHomeV1(binding, account) {
     if (!secret || !nativeHistoryBindingSafeV1(binding))
         return null;
     try {
-        return (0, native_auth_binding_1.readNativeAuthBindingV1)(binding.stateRoot, binding.source, secret)?.document.accounts.find((entry) => entry.opaqueAccountId === account)?.authHome
+        return (0, native_auth_binding_1.readNativeAuthBindingV1)(binding.stateRoot, binding.source, secret)?.accounts.find((entry) => entry.opaqueAccountId === account)?.authHome
             ?? binding.accounts.find((entry) => entry.opaqueAccountId === account)?.codexHome ?? null;
     }
     catch {
@@ -232,7 +235,33 @@ function observeNativeAccountWritersV1(binding, opaqueAccountId, ownedPids = [],
         ? [account.codexHome, account.sqliteHome]
         : [account.accountRoot], account.kind === "native_external" ? ownedPids : [], dependencies, account.kind === "native_external" ? "account_external" : "managed", true);
 }
-/** Native operations run in the selected broker child, without an external materialization write. */
+/** Fence the exact unpublished execution home; it has no signed auth entry yet. */
+function observeNativeExecutionHomeWritersV1(binding, account, destination, dependencies = {}) {
+    const secret = bindingSecrets.get(binding);
+    const stateRoot = binding.stateRoot;
+    if (!secret || !stateRoot || destination !== (0, node_path_1.join)(stateRoot, "accounts", account, "execution-home")
+        || !binding.accounts.some(entry => entry.opaqueAccountId === account)
+        || !bindingPathsAndIdentitiesMatchWithSecret(binding, secret))
+        return { ok: false, reason: "source_drift", foreignPids: [] };
+    return observeNativeHistoryWriterScopeV1(binding, [destination], [], dependencies, "managed", true);
+}
+/** Configuration operations of an official child use only its published, signed execution home. */
+function observeNativeExecutionHomeOperationWritersV1(binding, opaqueAccountId, nativeChildPid, dependencies = {}) {
+    const secret = bindingSecrets.get(binding);
+    const expected = (0, node_path_1.join)(binding.stateRoot, "accounts", opaqueAccountId, "execution-home");
+    const home = nativeHistoryEffectiveAuthHomeV1(binding, opaqueAccountId);
+    const valid = () => !!secret && bindingPathsAndIdentitiesMatchWithSecret(binding, secret)
+        && home === expected && nativeHistoryEffectiveAuthHomeV1(binding, opaqueAccountId) === home
+        && binding.accounts.some(entry => entry.opaqueAccountId === opaqueAccountId)
+        && binding.accounts.every(entry => [entry.codexHome, entry.sqliteHome].every(root => !pathsOverlap(expected, root)));
+    if (!valid())
+        return { ok: false, reason: "source_drift", foreignPids: [] };
+    if (!validPid(nativeChildPid))
+        return { ok: false, reason: "writer_census_failed", foreignPids: [] };
+    const observed = observeNativeHistoryWriterScopeV1(binding, [expected], [nativeChildPid], dependencies, "managed", true, expected);
+    return valid() ? observed : { ok: false, reason: "source_drift", foreignPids: [] };
+}
+/** Legacy operations retain the selected original account-root fence. */
 function observeNativeAccountOperationWritersV1(binding, opaqueAccountId, nativeChildPid, dependencies = {}) {
     const secret = bindingSecrets.get(binding);
     if (!secret || !bindingPathsAndIdentitiesMatchWithSecret(binding, secret))
@@ -240,10 +269,39 @@ function observeNativeAccountOperationWritersV1(binding, opaqueAccountId, native
     const account = binding.accounts.find((entry) => entry.opaqueAccountId === opaqueAccountId);
     if (!account || !validPid(nativeChildPid))
         return { ok: false, reason: "writer_census_failed", foreignPids: [] };
-    return observeNativeHistoryWriterScopeV1(binding, account.kind === "native_external" ? [account.codexHome, account.sqliteHome] : [account.accountRoot], [nativeChildPid], dependencies, account.kind === "native_external" ? "account_external" : "managed", true);
+    return observeNativeHistoryWriterScopeV1(binding, account.kind === "native_external" ? [account.codexHome, account.sqliteHome] : [account.accountRoot], [nativeChildPid], dependencies, account.kind === "native_external" ? "account_external" : "managed", true, account.codexHome);
+}
+const DESKTOP_ACCOUNT_FILES = new Set(["sqlite/codex-dev.db", "sqlite/codex-dev.db-wal", "sqlite/codex-dev.db-shm", "ipc/ipc.sock"]);
+/** Read full executable names, never argv, and retain the same PID/lstart identity used by owned-process-tree. */
+function owningDesktopIdentity(rows, spawn) {
+    const broker = rows.find(row => row.pid === process.pid);
+    const bridge = rows.find(row => row.pid === broker?.ppid);
+    const desktop = rows.find(row => row.pid === bridge?.ppid);
+    if (!broker || !bridge || !desktop || new Set([broker.pid, bridge.pid, desktop.pid]).size !== 3)
+        return null;
+    try {
+        const result = spawn("/bin/ps", ["-ww", "-p", [broker.pid, bridge.pid, desktop.pid].join(","), "-o", "pid=,ppid=,lstart=,comm="], {
+            encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024, env: { PATH: "/usr/bin:/bin", LC_ALL: "C" },
+        });
+        if (result.error || result.signal || result.status !== 0 || typeof result.stdout !== "string" || result.stderr?.trim())
+            return null;
+        const identities = result.stdout.trim().split("\n").map(line => /^\s*(\d+)\s+(\d+)\s+((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+)$/.exec(line));
+        if (identities.length !== 3 || identities.some(row => !row))
+            return null;
+        const verified = [broker, bridge, desktop].map(expected => identities.find(row => Number(row[1]) === expected.pid && Number(row[2]) === expected.ppid));
+        if (verified.some(row => !row))
+            return null;
+        const executable = verified[2][4];
+        if (!executable.startsWith("/Applications/Tweakers.app/") || (0, node_path_1.resolve)(executable) !== executable)
+            return null;
+        return { pid: desktop.pid, fingerprint: JSON.stringify(verified.map(row => row.slice(1))) };
+    }
+    catch {
+        return null;
+    }
 }
 /** Full static proof precedes every scoped census; never clone the binding. */
-function observeNativeHistoryWriterScopeV1(binding, roots, ownedPids, dependencies, scope, bindingAlreadyValidated = false) {
+function observeNativeHistoryWriterScopeV1(binding, roots, ownedPids, dependencies, scope, bindingAlreadyValidated = false, operationHome) {
     const secret = bindingSecrets.get(binding);
     if (!bindingAlreadyValidated && (!secret || !bindingPathsAndIdentitiesMatchWithSecret(binding, secret))) {
         return { ok: false, reason: "source_drift", foreignPids: [] };
@@ -268,6 +326,10 @@ function observeNativeHistoryWriterScopeV1(binding, roots, ownedPids, dependenci
     const psRows = parsePsRows(ps.stdout);
     if (!psRows)
         return { ok: false, reason: "writer_census_failed", foreignPids: [] };
+    // Only account operations in the exact private desktop home may use this
+    // exception. Native ~/.codex, global fences and thread checks never do.
+    const privateHome = (0, node_path_1.join)(dependencies.home?.() ?? (0, node_os_1.homedir)(), "Library/Application Support/Tweakers/variants/tweakers/codex-home");
+    const desktopBefore = operationHome === privateHome ? owningDesktopIdentity(psRows, spawn) : null;
     // Child app-server processes legitimately create short-lived plugin/MCP
     // descendants which hold files below CODEX_HOME. Permit only the validated
     // descendant tree of the exact broker child PIDs; never inherit arbitrary
@@ -303,6 +365,8 @@ function observeNativeHistoryWriterScopeV1(binding, roots, ownedPids, dependenci
     const opens = parseLsofOpenPaths(observed.stdout);
     if (!opens)
         return { ok: false, reason: "writer_census_failed", foreignPids: [] };
+    const desktopAfter = desktopBefore ? owningDesktopIdentity(psRows, spawn) : null;
+    const desktopPid = desktopAfter?.fingerprint === desktopBefore?.fingerprint ? desktopAfter?.pid : undefined;
     for (const entry of opens) {
         const underBoundRoot = roots.some((root) => lsofPathBelowRoot(entry.path, root));
         if (!underBoundRoot)
@@ -312,6 +376,10 @@ function observeNativeHistoryWriterScopeV1(binding, roots, ownedPids, dependenci
         if (!observedPids.has(entry.pid))
             return { ok: false, reason: "writer_census_failed", foreignPids: [] };
         if (permitted.has(entry.pid))
+            continue;
+        if (entry.pid === desktopPid && operationHome
+            && DESKTOP_ACCOUNT_FILES.has((0, node_path_1.relative)(operationHome, entry.path))
+            && entry.path === (0, node_path_1.join)(operationHome, (0, node_path_1.relative)(operationHome, entry.path)))
             continue;
         // The global history fence stays narrow: another backend may read ordinary
         // metadata below an external home while keeping its history elsewhere.
@@ -461,7 +529,7 @@ function sourcePathsAndIdentitiesFailure(stateRoot, source, secret, authorityOnl
         return "authentication_binding_invalid";
     }
     for (const account of source.accounts) {
-        const rawAccountId = readAuthAccountId(authBinding?.document.accounts.find(entry => entry.opaqueAccountId === account.opaqueAccountId)?.authHome ?? account.codexHome);
+        const rawAccountId = readAuthAccountId(authBinding?.accounts.find(entry => entry.opaqueAccountId === account.opaqueAccountId)?.authHome ?? account.codexHome);
         if (!rawAccountId || !sameSecretString(nativeHistoryAuthIdentityHmacV1(rawAccountId, secret), account.authIdentityHmac)
             || !sameOpaqueAccountId(rawAccountId, secret, account.opaqueAccountId))
             return "authentication_binding_invalid";

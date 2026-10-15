@@ -2,7 +2,7 @@
 """
 mcp-idle-reaper v2  (file keeps its v1 name: codex-mcp-idle-reaper.py)
 ======================================================================
-Reaps only verified, launchd-owned detached Codex MCP trees.
+Reaps verified detached Codex MCP trees and registered Tweakers keyboard monitors.
 Runs every 60s via launchd (com.thomashulihan.codex-mcp-idle-reaper).
 
 Why (observed 2026-06-10)
@@ -32,6 +32,9 @@ Rules (each 60s cycle)
  3. codex-children : observe only. A live transport can be restored only by
                      restarting its owning task/app, so count/age never kills it.
  4. claude-idle    : observation-only legacy lane.
+ 5. tweakers-keyboard: register the exact live Electron/monitor identities;
+                      clean only after that owner exits, with no new owner.
+                      Never adopt an unregistered orphan.
 
 Safety
 ------
@@ -42,6 +45,9 @@ Safety
 * only processes owned by the current uid
 * each detached-tree signal requires an immediate fresh identity and descendant
   revalidation; status is published as terminating before the first SIGTERM
+* attached MCP cleanup is disabled by default. An opt-in only reports missing
+  session evidence until a trusted producer supplies owner/session identity,
+  positive idle or closed state, and no active requests.
 
 Ops
 ---
@@ -97,6 +103,7 @@ NODE_REPL_ORPHAN_MIN_AGE = int(os.environ.get("REAPER_NODE_REPL_ORPHAN_MIN_AGE",
 CLAUDE_IDLE_SECS = int(os.environ.get("REAPER_CLAUDE_IDLE_SECS", "900"))
 CLAUDE_CPU_EPS = float(os.environ.get("REAPER_CLAUDE_CPU_EPS", "2.0"))
 DETACHED_IDLE_SECS = int(os.environ.get("REAPER_DETACHED_IDLE_SECS", "600"))
+ATTACHED_CLEANUP_OPT_IN = os.environ.get("REAPER_ATTACHED_MCP_CLEANUP", "") == "1"
 TERM_GRACE_SECS = float(os.environ.get("REAPER_TERM_GRACE_SECS", "5"))
 LOG = Path(os.environ.get("REAPER_LOG", str(TMP / "codex-mcp-idle-reaper.log")))
 STATE = Path(os.environ.get("REAPER_STATE", str(TMP / "codex-mcp-idle-reaper-state.json")))
@@ -372,8 +379,105 @@ class Reaper:
         self.lifecycle_snapshot: dict[int, LifecycleProcess] = {}
         self.lifecycle_trees: list[TreeClassification] = []
         self.lifecycle_state: dict = {}
+        self.keyboard_records: list[dict] = []
+        self.keyboard_plans: list[dict] = []
         self.detached_plans: dict[str, dict[int, ProcessIdentity]] = {}
         self.detached_roots: dict[str, tuple[ProcessIdentity, ProcessIdentity]] = {}
+
+    def plan_keyboard_monitors(self, prior_state: dict) -> None:
+        """Register only a live direct Tweakers child; never adopt an orphan."""
+        snapshot = self.lifecycle_snapshot
+        main_path = "/Applications/Tweakers.app/Contents/MacOS/Tweakers Electron"
+        monitor_path = "/Applications/Tweakers.app/Contents/Resources/native/bare-modifier-monitor"
+        records = []
+        plans = []
+        prior_records = prior_state.get("tweakers_keyboard_monitors", [])
+        if not isinstance(prior_records, list):
+            prior_records = []
+        for record in prior_records:
+            if not isinstance(record, dict):
+                continue
+            helper = record.get("helper", {})
+            owner = record.get("owner", {})
+            if not isinstance(helper, dict) or not isinstance(owner, dict):
+                continue
+            if helper.get("executable") != monitor_path or owner.get("executable") != main_path:
+                continue
+            if not isinstance(helper.get("pid"), int) or not isinstance(owner.get("pid"), int):
+                continue
+            if helper["pid"] <= 1 or owner["pid"] <= 1 or not all(
+                isinstance(owner.get(key), str) and owner[key] for key in ("birth", "command_shape")
+            ):
+                continue
+            process = snapshot.get(helper["pid"])
+            if not process or process.uid != os.getuid() or not process.identity:
+                continue
+            if process.identity.to_json() != helper:
+                continue
+            # A reused owner PID is deliberately ambiguous, even if its start
+            # token differs. A new desktop generation also blocks old cleanup.
+            if owner["pid"] not in snapshot and process.ppid == 1 and not any(
+                item.executable == main_path for item in snapshot.values()
+            ):
+                plans.append(record)
+            records.append(record)
+        for process in snapshot.values():
+            owner = snapshot.get(process.ppid)
+            if process.executable != monitor_path or process.uid != os.getuid() or not process.identity:
+                continue
+            if not owner or owner.uid != os.getuid() or owner.executable != main_path or not owner.identity:
+                continue
+            record = {"owner": owner.identity.to_json(), "helper": process.identity.to_json()}
+            if record not in records:
+                records.append(record)
+        self.keyboard_records = records
+        self.keyboard_plans = plans
+        self.lifecycle_state["tweakers_keyboard_monitors"] = records
+
+    def execute_keyboard_monitors(self) -> int:
+        """The existing reaper remains the sole signal owner for this lane."""
+        sent = 0
+        for record in self.keyboard_plans:
+            helper = record["helper"]
+            owner = record["owner"]
+            def eligible():
+                snapshot = self.snapshot_provider()
+                process = snapshot.get(helper["pid"])
+                return bool(
+                    process and process.uid == os.getuid() and process.ppid == 1
+                    and process.identity and process.identity.to_json() == helper
+                    and owner["pid"] not in snapshot
+                    and helper["pid"] not in self.protected
+                    and not any(item.executable == owner["executable"] for item in snapshot.values())
+                )
+            if self.dry or not eligible():
+                continue
+            identity_hash = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:24]
+            action = {"action_id": "keyboard-" + identity_hash,
+                      "tree_key": "tweakers-keyboard-monitor:" + identity_hash,
+                      "lane": "tweakers_keyboard_monitor", "helper": helper,
+                      "owner": owner, "timestamp": self.clock(), "state": "terminating"}
+            self.receipt_writer(LIFECYCLE_ACTIONS, action)
+            # Receipt writing may take time: revalidate immediately before signal.
+            if not eligible():
+                continue
+            try:
+                self.signal_sender(helper["pid"], signal.SIGTERM)
+                sent += 1
+            except ProcessLookupError:
+                continue
+            self.sleeper(TERM_GRACE_SECS)
+            if eligible():
+                try:
+                    self.signal_sender(helper["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            remaining = self.snapshot_provider().get(helper["pid"])
+            action = {**action, "timestamp": self.clock(), "state": "survived" if (
+                remaining and remaining.identity and remaining.identity.to_json() == helper
+            ) else "exited"}
+            self.receipt_writer(LIFECYCLE_ACTIONS, action)
+        return sent
 
     def mark_tree(self, root: int, tag: str) -> None:
         # Inert in v2: no lane calls this; the strict detached lane plans
@@ -823,7 +927,8 @@ class Reaper:
     # -- execution -------------------------------------------------------------
     def execute(self) -> tuple[int, int, dict[str, int]]:
         # Legacy standalone-orphan and Claude-idle findings are observation
-        # only. Only the strict identity-frozen detached lane can signal.
+        # only. Detached trees and registered keyboard helpers each revalidate
+        # their own frozen identities before signalling.
         freed = sum(
             self.lifecycle_snapshot[pid].rss_kib
             for plan in self.detached_plans.values()
@@ -831,7 +936,10 @@ class Reaper:
             if pid in self.lifecycle_snapshot
         )
         detached_count, detached_tags = self.execute_detached()
-        return detached_count, freed, detached_tags
+        keyboard_count = self.execute_keyboard_monitors()
+        if keyboard_count:
+            detached_tags["tweakers-keyboard-monitor"] = keyboard_count
+        return detached_count + keyboard_count, freed, detached_tags
 
 
 def rotate_log() -> None:
@@ -887,6 +995,8 @@ def status_counts(reaper: Reaper) -> dict[str, int]:
         ) // 1024,
         "actionable_orphans": len(reaper.actionable_orphans),
         "observed_standalone_orphans": len(reaper.legacy_findings["standalone_orphan"]),
+        "tweakers_keyboard_registered": len(reaper.keyboard_records),
+        "tweakers_keyboard_pending": len(reaper.keyboard_plans),
         "observed_claude_idle_roots": len(reaper.legacy_findings["claude_idle"]),
         "claude_sessions": sum(1 for p in reaper.procs.values() if is_claude_main(p)),
         "would_kill": len(reaper.victims),
@@ -894,15 +1004,30 @@ def status_counts(reaper: Reaper) -> dict[str, int]:
 
 
 def lifecycle_status_payload(
-    reaper: Reaper, mode: str, error: str | None = None
+    reaper: Reaper, mode: str, error: str | None = None,
+    *, attached_cleanup_opt_in: bool = ATTACHED_CLEANUP_OPT_IN,
 ) -> dict:
     counts = status_counts(reaper)
-    return build_status(
+    status = build_status(
         reaper.lifecycle_trees,
         counts=counts,
         generated_at=reaper.clock(),
         job={"ok": error is None, "mode": mode, "error": error},
     )
+    # The existing process snapshot cannot prove session idle/closed state or
+    # absence of active MCP requests. Never turn CPU or process age into that
+    # authority, even when an operator explicitly enables the future lane.
+    status["attached_cleanup"] = {
+        "enabled": attached_cleanup_opt_in,
+        "state": "evidence_unavailable" if attached_cleanup_opt_in else "disabled",
+        "reason": (
+            "trusted per-session owner identity, idle/closed state, active-request "
+            "count, and 600-second idle proof are unavailable"
+            if attached_cleanup_opt_in else None
+        ),
+        "signaled": 0,
+    }
+    return status
 
 
 def main() -> int:
@@ -918,6 +1043,8 @@ def main() -> int:
     lifecycle_prior, lifecycle_state_valid = atomic_read_json(LIFECYCLE_STATE)
     try:
         reaper.plan_detached_wrappers(lifecycle_prior, lifecycle_state_valid)
+        if lifecycle_state_valid:
+            reaper.plan_keyboard_monitors(lifecycle_prior)
     except Exception as exc:
         lifecycle_error = f"lifecycle classification failed: {type(exc).__name__}: {exc}"
 

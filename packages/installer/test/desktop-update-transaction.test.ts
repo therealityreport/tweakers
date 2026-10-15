@@ -230,6 +230,8 @@ function environmentReceipt(
     ownerPid: process.pid,
     source,
     requested: { ...requested, appliedAt: phase === "committed" ? NOW : null },
+    prepared: null,
+    applied: null,
     oldMainPid: 100,
     newMainPid: phase === "committed" || phase === "rolled-back" ? 101 : null,
     attempt: phase === "prepared" ? 0 : 1,
@@ -258,7 +260,7 @@ function fakeCoordinator(calls: string[]): EnvironmentCoordinator {
       return prepared;
     },
     status: () => prepared,
-    verify: async () => ({ ok: true, observedPid: 101, visibleWindow: true, appliedSelection: prepared?.requested ?? null, error: null }),
+    verify: async () => ({ ok: true, observedPid: 101, visibleWindow: true, appliedSelection: prepared?.requested ?? null, appliedEvidence: null, error: null }),
     rollback: async (id) => {
       calls.push(`rollback:${id}`);
       prepared = environmentReceipt(id!, prepared!.source, prepared!.requested, "rolled-back");
@@ -564,7 +566,7 @@ test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a f
       },
     };
     let verificationKind: string | null = null;
-    let verificationPair: DesktopUpdateModeCachePair | null = null;
+    const verificationPairs: Array<DesktopUpdateModeCachePair | null> = [];
     let verificationPreviousMainPid: number | null | undefined;
     const { calls, deps } = dependencies({
       modeCacheV2,
@@ -576,7 +578,7 @@ test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a f
       },
       verifyFinal: async (input) => {
         verificationKind = input.environmentTransactionKind;
-        verificationPair = input.modeCachePair;
+        verificationPairs.push(input.modeCachePair);
         verificationPreviousMainPid = input.previousMainPid;
         return { ok: true, error: null };
       },
@@ -591,7 +593,7 @@ test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a f
     assert.equal(receipt.source.appExperience, "tweakers");
     assert.equal(receipt.refreshSource, "development");
     assert.equal(verificationKind, "mode-cache-v2");
-    assert.equal(verificationPair?.generationId, "mode-generation-2");
+    assert.equal(verificationPairs[0]?.generationId, "mode-generation-2");
     // Verification proves the desktop RESTARTED into Tweakers, so it must be
     // handed the pre-cutover official PID (201), never the target PID the
     // warm commit just launched (301) - that demanded a second restart that

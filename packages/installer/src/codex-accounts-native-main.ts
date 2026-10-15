@@ -30,9 +30,12 @@ export function patchAccountsNativeMainSources(sources: ReadonlyMap<string, stri
   edit('"workspace-root-options":async({canonicalizeRoots:e,hostId:t,signal:r})=>{let i=',
     '"workspace-root-options":async({canonicalizeRoots:e,hostId:t,signal:r})=>{if(t===`local`)await __twAccountsDesktopProjects.ensure(this);let i=');
   edit('async initializeProjects(e){await Promise.allSettled(this.pendingProjectWrites.values()),e.throwIfAborted();let t=await this.connection.codexHome();e.throwIfAborted();let r=',
-    'async initializeProjects(e){await Promise.allSettled(this.pendingProjectWrites.values()),e.throwIfAborted();let t=await this.connection.codexHome();e.throwIfAborted();await __twAccountsDesktopProjects.ensureBackend(this,t);e.throwIfAborted();let r=');
+    'async initializeProjects(e){await Promise.allSettled(this.pendingProjectWrites.values()),e.throwIfAborted();let t=await this.connection.codexHome();e.throwIfAborted();if(await __twAccountsDesktopProjects.ensureBackend(this,t))return;e.throwIfAborted();let r=');
   edit('await DOe(this.pendingProjectWrites,e,async()=>{r.throwIfAborted(),this.projectSupport===`supported`&&(await t(r),r.throwIfAborted())',
     'await DOe(this.pendingProjectWrites,e,async()=>{r.throwIfAborted(),await __twAccountsDesktopProjects.ensureWrite(this),r.throwIfAborted(),this.projectSupport===`supported`&&(await t(r),r.throwIfAborted())');
+  const metadataLock = /async withProjectMetadataLock\((e,t,[a-z])\)\{/g;
+  if ([...main!.matchAll(metadataLock)].length !== 1) throw new Error("Native project metadata lock anchor changed.");
+  main = main!.replace(metadataLock, (anchor) => anchor + "await __twAccountsDesktopProjects.ensureWrite(this);");
   edit('getInitialSidebarBootstrap(){let e=this.threadCatalogSyncManager;',
     'getInitialSidebarBootstrap(){void __twAccountsDesktopProjects.ensure(this.fetchHandler).catch(()=>{});let e=this.threadCatalogSyncManager;');
   edit("async function Ms({appServerConnection:e,", "async function Ms({codexHome:__twAccountsHome,appServerConnection:e,");
@@ -56,6 +59,26 @@ export function nativeAccountsDesktopProjectsSource(): string {
   return `\n;var __twAccountsDesktopProjects=((__name)=>(${nativeAccountsDesktopProjects.toString()})({enabled:()=>globalThis.__tweakersAccountsDesktopProjectsEnabledV1?.()===true,hostKey:()=>\`local:\${n.ci()}\`,onFocus:(fn)=>l.app.on("browser-window-focus",fn)}))((fn)=>fn);\n`;
 }
 
+/** Resolve the signed read scope on every request; native cleanup keeps its own guards. */
+export function nativeAccountsDeviceStorage(factory: (home: string) => any, fallback: string, resolveHome: () => string | null): any {
+  let service: any = null;
+  let serviceHome: string | null = null;
+  const home = () => {
+    const selected = resolveHome();
+    if (selected !== null && (typeof selected !== "string" || !selected.startsWith("/"))) throw new Error("Native storage source is unavailable.");
+    return selected ?? fallback;
+  };
+  const invoke = async (method: "read" | "refresh", args: any[]) => {
+    const selected = home();
+    if (!service || serviceHome !== selected) { service = factory(selected); serviceHome = selected; }
+    const current = service;
+    const result = await current[method](...args);
+    if (home() !== selected) throw new Error("Native storage source changed. Refresh Storage.");
+    return result;
+  };
+  return { read: (...args: any[]) => invoke("read", args), refresh: (...args: any[]) => invoke("refresh", args) };
+}
+
 /** Read overlays keep the native project consumers and their normal write paths. */
 export function nativeAccountsDesktopProjects(native: any): any {
   const keys = new Set([
@@ -65,6 +88,7 @@ export function nativeAccountsDesktopProjects(native: any): any {
   ]);
   const records = new Map<any, any>();
   const overrideKey = "tweakers-accounts-project-overrides-v1";
+  const writeKeys = new Set([...keys, overrideKey, "app-server-projects-migration-by-host", "app-server-pending-project-deletions-by-host", "projectless-thread-ids"]);
   const object = (value: any) => value !== null && typeof value === "object" && !Array.isArray(value);
   const clone = (value: any) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
   const remoteProjectIds = (value: any) => new Set(Array.isArray(value) && value.length <= 512
@@ -105,7 +129,7 @@ export function nativeAccountsDesktopProjects(native: any): any {
         || (field.identities !== undefined && (!object(field.identities) || Object.values(field.identities).some((entries: any) =>
           !object(entries) || Object.values(entries).some((id: any) => typeof id !== "string"))))) throw new Error("Native project overrides are invalid.");
     }
-    record = { controller, connection, hostKey, fields, store, values: null, fingerprint: null, pending: null, refreshedAt: 0, generation: 0, verified: false, rawGet: get, rawSet: set };
+    record = { controller, connection, hostKey, fields, store, values: null, fingerprint: null, pending: null, refreshedAt: 0, generation: 0, verified: false, access: "read_only", authorityGeneration: null, backends: new Set(), unsubscribe: null, rawGet: get, rawSet: set };
     records.set(store, record);
     const baseline = (key: string, local: any) => merge(key, record.values?.[key], local, record.hostKey);
     const applyField = (key: string, value: any, field: any) => {
@@ -154,8 +178,10 @@ export function nativeAccountsDesktopProjects(native: any): any {
       return effective(key, local);
     };
     store.set = function(key: string, value: any, ...args: any[]) {
-      if (this !== store || !enabled() || !keys.has(key)) return set.call(this, key, value, ...args);
+      if (this !== store || !enabled() || !writeKeys.has(key)) return set.call(this, key, value, ...args);
       if (!record.values || !record.verified) throw new Error("Account projects are unavailable; changes are disabled until refresh succeeds.");
+      if (record.access !== "read_write") throw new Error("Saved projects are read-only; sign in to make changes.");
+      if (!keys.has(key)) return set.call(this, key, value, ...args);
       const base = baseline(key, get.call(store, key));
       const intended = value ?? (Array.isArray(base) ? [] : {});
       let field;
@@ -192,9 +218,24 @@ export function nativeAccountsDesktopProjects(native: any): any {
     return record;
   };
   const bindRecord = (record: any, connection: any, hostKey: string) => {
-    if (record.connection === connection && record.hostKey === hostKey) return;
+    if (record.connection === connection && record.hostKey === hostKey && record.unsubscribe !== null) return;
     const sameHome = record.hostKey === hostKey;
-    record.generation++; record.connection = connection; record.hostKey = hostKey; record.pending = null; record.refreshedAt = 0; record.verified = false;
+    record.unsubscribe?.();
+    record.generation++; record.connection = connection; record.hostKey = hostKey; record.pending = null; record.writePreparation = null; record.refreshedAt = 0; record.verified = false; record.access = "read_only"; record.authorityGeneration = null; record.notificationAuthority = null;
+    record.unsubscribe = typeof connection.registerInternalNotificationHandler === "function" ? connection.registerInternalNotificationHandler((message: any) => {
+      if (message?.method !== "tweakers/desktopProjects/changed" || record.connection !== connection || record.hostKey !== hostKey) return;
+      const params = message.params;
+      if (params?.version !== 1 || !Number.isSafeInteger(params.authorityGeneration) || params.authorityGeneration < 0
+        || (params.access !== undefined && !["read_only", "read_write"].includes(params.access))) {
+        record.generation++; record.verified = false; record.access = "read_only";
+      } else {
+        const previous = record.notificationAuthority;
+        if (!previous || params.authorityGeneration > previous.generation) record.notificationAuthority = { generation: params.authorityGeneration, access: params.access };
+        else if (params.authorityGeneration === previous.generation && params.access !== undefined) previous.access = params.access;
+        if (record.notificationAuthority?.access === "read_only") { record.verified = false; record.access = "read_only"; }
+      }
+      void ensureRecord(record, true);
+    }) : () => {};
     if (!sameHome) { record.values = null; record.fingerprint = null; }
   };
   const normalizeProjection = (record: any, result: any) => {
@@ -257,31 +298,58 @@ export function nativeAccountsDesktopProjects(native: any): any {
       record.rawSet.call(record.store, overrideKey, saved); record.fields = fields;
     }
   };
-  const ensureRecord = async (record: any, force = false) => {
+  const ensureRecord = async (record: any, force = false, prepareWrite = false) => {
+    // Authority renewal emits a change notification. Coalesce that read with
+    // its write preparation instead of invalidating the result it requested.
+    if (record.writePreparation) return record.writePreparation;
     if (force) { record.generation++; record.pending = null; record.verified = false; }
     if (record.pending) return record.pending;
     if (!force && Date.now() - record.refreshedAt < 5_000) return;
     const generation = record.generation, connection = record.connection;
     const pending = (async () => {
       try {
-        const result = await connection.sendAppServerRequest("tweakers/desktopProjects/read", {});
+        const result = await connection.sendAppServerRequest("tweakers/desktopProjects/read", prepareWrite ? { prepareWrite: true } : {});
         if (!enabled() || generation !== record.generation || connection !== record.connection) return;
-        if (result?.version !== 1 || !object(result.values) || !object(result.projectIdMap)
+        if (result?.version !== 1 || !["read_only", "read_write"].includes(result.access)
+          || !Number.isSafeInteger(result.authorityGeneration) || result.authorityGeneration < 0
+          || !["saved_local", "app_server"].includes(result.source) || (result.access === "read_write" && result.source !== "app_server") || !object(result.values) || !object(result.projectIdMap)
           || Object.keys(result.values).some((name) => !keys.has(name)) || Buffer.byteLength(JSON.stringify(result), "utf8") > 8 * 1024 * 1024) throw new Error("Native project projection is unavailable.");
+        const announced = record.notificationAuthority;
+        if (announced && (result.authorityGeneration < announced.generation
+          || (result.authorityGeneration === announced.generation && announced.access !== undefined && result.access !== announced.access))) throw new Error("Native project authority changed during preparation.");
         const normalized = normalizeProjection(record, result);
         const values = { ...normalized.values, "app-server-project-id-by-legacy-project-id-by-host": { [record.hostKey]: normalized.projectIdMap } };
-        reconcileFields(record, values);
-        const fingerprint = JSON.stringify(values);
+        if (result.access === "read_write") reconcileFields(record, values);
+        const fingerprint = JSON.stringify([result.access, result.authorityGeneration, result.source, values]);
         const changed = record.fingerprint !== fingerprint;
+        const authorityChanged = record.access !== result.access || record.authorityGeneration !== result.authorityGeneration;
         record.values = values; record.fingerprint = fingerprint; record.refreshedAt = Date.now(); record.verified = true;
+        record.access = result.access; record.authorityGeneration = result.authorityGeneration;
+        if (authorityChanged) for (const backend of record.backends) {
+          backend.projectsReady = false; backend.migrationIdentity = null; backend.pendingDeletions?.stop();
+          if (backend.connected && !backend.disposed) {
+            const authorityGeneration = record.authorityGeneration;
+            // A prior connection migration may still be settling. Its native
+            // completion clears threadMigration; retry after it instead of
+            // losing a recovery notification while that guard is occupied.
+            void Promise.resolve(backend.threadMigration).catch(() => {}).then(() => {
+              if (record.verified && record.authorityGeneration === authorityGeneration && backend.connected && !backend.disposed) backend.startConnectionSync?.();
+            });
+          }
+        }
         if (changed) notify(record);
       } catch {
         if (generation !== record.generation || connection !== record.connection) return;
-        record.verified = false; record.refreshedAt = Date.now();
+        record.verified = false; record.access = "read_only"; record.refreshedAt = Date.now();
+        for (const backend of record.backends) { backend.projectsReady = false; backend.migrationIdentity = null; backend.pendingDeletions?.stop(); }
       }
     })();
     record.pending = pending;
-    return pending.finally(() => { if (record.pending === pending) record.pending = null; });
+    if (prepareWrite) record.writePreparation = pending;
+    return pending.finally(() => {
+      if (record.pending === pending) record.pending = null;
+      if (record.writePreparation === pending) record.writePreparation = null;
+    });
   };
   const ensure = async (controller: any, key?: string) => {
     if (!enabled() || (key !== undefined && !keys.has(key))) return;
@@ -292,16 +360,48 @@ export function nativeAccountsDesktopProjects(native: any): any {
     if (!record.values) throw new Error("Account projects are unavailable; project initialization will retry.");
   };
   const ensureBackend = async (backend: any, home: string) => {
-    if (!enabled() || backend.cache.hostId !== "local") return;
+    if (!enabled() || backend.cache.hostId !== "local") return false;
     const record = recordFor(backend.globalState, backend.connection, `local:${home}`);
+    if (!record.backends.has(backend)) {
+      record.backends.add(backend);
+      backend.connectionLifetime?.signal?.addEventListener("abort", () => record.backends.delete(backend), { once: true });
+    }
     bindRecord(record, backend.connection, `local:${home}`);
     await ensureRecord(record);
     if (!record.values || !record.verified) throw new Error("Account projects are unavailable; project initialization will retry.");
+    if (record.access === "read_write") return false;
+    // Seed only in-memory lookup state. Native initialization below this hook
+    // imports projects, migrates assignments and resumes deferred deletions.
+    backend.pendingDeletions?.stop();
+    backend.migrationIdentity = null;
+    backend.projectSupport = "supported";
+    backend.legacyProjectIdsByServerId?.clear(); backend.serverProjectsByLegacyId?.clear();
+    for (const [publicId, nativeId] of Object.entries(record.values["app-server-project-id-by-legacy-project-id-by-host"]?.[record.hostKey] ?? {})) {
+      const project = record.values["local-projects"]?.[publicId];
+      if (!project) continue;
+      backend.legacyProjectIdsByServerId?.set(nativeId, publicId);
+      backend.serverProjectsByLegacyId?.set(publicId, { id: nativeId, name: project.name, roots: project.rootPaths.map((path: string) => ({ path })), metadata: clone(project.metadata ?? {}), createdAt: project.createdAt / 1000, updatedAt: project.updatedAt / 1000 });
+    }
+    backend.projectsReady = true;
+    return true;
   };
   const ensureWrite = async (backend: any) => {
-    const home = await backend.connection.codexHome();
+    const connection = backend.connection;
+    const home = await connection.codexHome();
+    if (backend.connection !== connection) throw new Error("Account project connection changed.");
     if (typeof home !== "string" || !home.startsWith("/")) throw new Error("Account project connection home is unavailable.");
-    return ensureBackend(backend, home);
+    if (!enabled() || backend.cache.hostId !== "local") return;
+    const record = recordFor(backend.globalState, backend.connection, `local:${home}`);
+    bindRecord(record, backend.connection, `local:${home}`);
+    if (!record.values || !record.verified) throw new Error("Account projects are unavailable; project initialization will retry.");
+    const preparation = ensureRecord(record, true, true);
+    const generation = record.generation;
+    await preparation;
+    const currentHome = await connection.codexHome();
+    if (!enabled() || backend.connection !== connection || record.connection !== connection || record.hostKey !== `local:${home}`
+      || currentHome !== home || record.generation !== generation) throw new Error("Account project connection changed during preparation.");
+    if (!record.values || !record.verified) throw new Error("Account projects are unavailable; project initialization will retry.");
+    if (record.access !== "read_write") throw new Error("Saved projects are read-only; sign in to make changes.");
   };
   const refresh = () => {
     for (const record of records.values()) {

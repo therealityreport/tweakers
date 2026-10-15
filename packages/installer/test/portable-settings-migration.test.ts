@@ -401,7 +401,7 @@ test("an excluded source pin family does not conflict with valid destination pin
   privateJson(f.targetProjects, {
     schemaVersion: 1,
     nodes: source.nodes.slice(0, 2).map((node) => {
-      const projected = { ...node, connections: {} };
+      const projected: Record<string, unknown> = { ...node, connections: {} };
       delete projected.githubRepo;
       if (projected.id === "project-tweakers") projected.pinnedTaskIds = [PUBLIC_THREAD];
       return projected;

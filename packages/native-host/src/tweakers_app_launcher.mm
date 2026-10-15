@@ -20,7 +20,7 @@
 namespace {
 
 constexpr char kElectronName[] = "Tweakers Electron";
-constexpr char kDoctorRelativeExecutable[] = "Resources/tweakers/native/Tweakers Doctor.app/Contents/MacOS/Tweakers Doctor";
+constexpr char kDoctorRelativeExecutable[] = "Resources/tweakers/native/Tweakers Manager.app/Contents/MacOS/Tweakers Manager";
 constexpr char kInstalledLauncherName[] = "ChatGPT";
 constexpr char kConfigDirectory[] = "tweakers";
 constexpr char kUserDataConfig[] = "variant-user-data-path";
@@ -166,6 +166,60 @@ bool RemoveUntrustedUserDataSwitches(int argc, char *const argv[], std::vector<c
   return true;
 }
 
+// This explicit launch-only flag reaches the existing narrow runtime validator.
+// No inherited environment or caller-selected data/account root is admitted.
+bool ReadAcceptanceConfigArgument(
+  const std::string &userData,
+  std::vector<char *> *arguments,
+  std::string *config
+) {
+  static constexpr char kFlag[] = "--tweakers-acceptance-config";
+  static constexpr char kPrefix[] = "--tweakers-acceptance-config=";
+  std::vector<char *> forwarded;
+  bool found = false;
+  for (size_t index = 0; index < arguments->size(); ++index) {
+    const char *argument = (*arguments)[index];
+    std::string requested;
+    if (std::strcmp(argument, kFlag) == 0) {
+      if (++index >= arguments->size()) return Fail("acceptance configuration flag needs a path");
+      requested = (*arguments)[index];
+    } else if (std::strncmp(argument, kPrefix, sizeof(kPrefix) - 1) == 0) {
+      requested = argument + sizeof(kPrefix) - 1;
+    } else {
+      forwarded.push_back((*arguments)[index]);
+      continue;
+    }
+    if (found) return Fail("acceptance configuration flag must occur once");
+    found = true;
+    const std::string userRoot = Dirname(userData);
+    const std::string prefix = userRoot + "/acceptance/";
+    const std::string suffix = "/config.json";
+    if (!IsCanonicalAbsolutePath(requested) || requested.rfind(prefix, 0) != 0
+        || requested.size() != prefix.size() + 36 + suffix.size()
+        || requested.substr(requested.size() - suffix.size()) != suffix) {
+      return Fail("acceptance configuration is outside its fixed private path");
+    }
+    const std::string id = requested.substr(prefix.size(), 36);
+    for (size_t offset = 0; offset < id.size(); ++offset) {
+      const bool dash = offset == 8 || offset == 13 || offset == 18 || offset == 23;
+      if ((dash && id[offset] != '-') || (!dash && std::string("0123456789abcdef").find(id[offset]) == std::string::npos)) {
+        return Fail("acceptance configuration has an invalid launch identifier");
+      }
+    }
+    struct stat file {};
+    if (!IsSafePrivateDirectory(userRoot, getuid(), "acceptance user root")
+        || !IsSafePrivateDirectory(userRoot + "/acceptance", getuid(), "acceptance root")
+        || !IsSafePrivateDirectory(Dirname(requested), getuid(), "acceptance launch directory")
+        || !IsSafeAppFile(requested, getuid(), false, "acceptance configuration", &file)
+        || (file.st_mode & 0777) != 0600 || file.st_size <= 0 || file.st_size > 1024 * 1024) {
+      return Fail("acceptance configuration is not an owner-private regular file");
+    }
+    *config = std::move(requested);
+  }
+  *arguments = std::move(forwarded);
+  return true;
+}
+
 bool IsSafeUserName(const std::string &value) {
   if (value.empty() || value.size() > 255) return false;
   for (const unsigned char character : value) {
@@ -235,6 +289,7 @@ bool BuildExactLaunchEnvironment(
   const std::string &userData,
   const std::string &codexHome,
   const std::string &accountsBrokerRoot,
+  const std::string &acceptanceConfig,
   std::vector<std::string> *storage,
   std::vector<char *> *environment
 ) {
@@ -257,7 +312,7 @@ bool BuildExactLaunchEnvironment(
   }
 
   storage->clear();
-  storage->reserve(15);
+  storage->reserve(16);
   AddEnvironment(storage, "HOME", home);
   AddEnvironment(storage, "USER", user);
   AddEnvironment(storage, "LOGNAME", user);
@@ -273,6 +328,7 @@ bool BuildExactLaunchEnvironment(
   AddEnvironment(storage, "TWEAKER_ACCOUNTS_BROKER_ROOT", accountsBrokerRoot);
   AddEnvironment(storage, "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED", "1");
   AddEnvironment(storage, "TWEAKERS_DERIVED_VARIANT", "1");
+  if (!acceptanceConfig.empty()) AddEnvironment(storage, "TWEAKERS_ACCEPTANCE_CONFIG_FILE", acceptanceConfig);
 
   environment->clear();
   environment->reserve(storage->size() + 1);
@@ -311,7 +367,7 @@ bool ReadVerifiedManagerLauncher(std::string *manager) {
 
 bool LaunchDoctorForEarlyFailure(const std::string &contentsDirectory, uid_t launcherOwner) {
   const std::string doctor = Join(contentsDirectory, kDoctorRelativeExecutable);
-  if (!IsSafeAppFile(doctor, launcherOwner, true, "Tweakers Doctor")) return false;
+  if (!IsSafeAppFile(doctor, launcherOwner, true, "Tweakers Manager")) return false;
   std::string manager;
   if (!ReadVerifiedManagerLauncher(&manager)) return false;
 
@@ -322,14 +378,14 @@ bool LaunchDoctorForEarlyFailure(const std::string &contentsDirectory, uid_t lau
   }};
   std::array<char *, 1> environment = {{nullptr}};
   posix_spawn_file_actions_t actions;
-  if (posix_spawn_file_actions_init(&actions) != 0) return Fail("could not prepare Tweakers Doctor");
+  if (posix_spawn_file_actions_init(&actions) != 0) return Fail("could not prepare Tweakers Manager");
   posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
   posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
   posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
   pid_t child = 0;
   const int spawned = posix_spawn(&child, doctor.c_str(), &actions, nullptr, arguments.data(), environment.data());
   posix_spawn_file_actions_destroy(&actions);
-  if (spawned != 0) return Fail("could not open Tweakers Doctor");
+  if (spawned != 0) return Fail("could not open Tweakers Manager");
   return true;
 }
 
@@ -417,12 +473,15 @@ int main(int argc, char *argv[]) {
 
   std::vector<char *> forwarded;
   if (!RemoveUntrustedUserDataSwitches(argc, argv, &forwarded)) return failToDoctor();
+  std::string acceptanceConfig;
+  if (!ReadAcceptanceConfigArgument(userData, &forwarded, &acceptanceConfig)) return failToDoctor();
   std::vector<std::string> environmentStorage;
   std::vector<char *> environment;
   if (!BuildExactLaunchEnvironment(
     userData,
     codexHome,
     accountsBrokerRoot,
+    acceptanceConfig,
     &environmentStorage,
     &environment
   )) return failToDoctor();

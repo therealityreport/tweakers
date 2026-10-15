@@ -82,6 +82,7 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
   const rollback = [];
   let mutationCount = 0;
   let committed = false;
+  let rollbackFailed = false;
   let publicationResult = null;
 
   const mutated = (path, operation) => {
@@ -131,7 +132,7 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
         rollback.push({ kind: "remove", path: target });
         mutated(target, "create-directory");
       } else if (existing.type !== "directory") {
-        const backup = backupNode(existing, target, journal, rollback.length);
+        const backup = backupNode(existing, target, journal, rollback.length, dependencies);
         rollback.push({ kind: "restore", path: target, backup, type: existing.type });
         remove(target);
         mkdirSync(target, { mode: entry.mode });
@@ -153,7 +154,7 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
       if (existing && generatedEntriesEqual(existing, entry)) continue;
 
       if (existing) {
-        const backup = backupNode(existing, target, journal, rollback.length);
+        const backup = backupNode(existing, target, journal, rollback.length, dependencies);
         rollback.push({ kind: "restore", path: target, backup, type: existing.type });
         // rename(2) atomically replaces files and symlinks. A directory must
         // be removed first because POSIX will not replace it with a leaf.
@@ -176,7 +177,7 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
       const target = join(destinationPath, name);
       const existing = pathEntry(target);
       if (!existing) continue;
-      const backup = backupNode(existing, target, journal, rollback.length);
+      const backup = backupNode(existing, target, journal, rollback.length, dependencies);
       rollback.push({ kind: "restore", path: target, backup, type: existing.type });
       remove(target);
       mutated(target, "remove-stale");
@@ -189,7 +190,7 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
         throw new Error(`generated companion destination is not a file: ${companion.destination}`);
       }
       if (existing) {
-        const backup = backupNode(existing, companion.destination, journal, rollback.length);
+        const backup = backupNode(existing, companion.destination, journal, rollback.length, dependencies);
         rollback.push({ kind: "restore", path: companion.destination, backup, type: existing.type });
       } else {
         mkdirSync(dirname(companion.destination), { recursive: true });
@@ -204,7 +205,8 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
     return publicationResult;
   } catch (error) {
     const rollbackErrors = [];
-    for (const action of rollback.reverse()) {
+    const failedRollbackActions = [];
+    for (const action of [...rollback].reverse()) {
       try {
         if (action.kind === "remove") {
           remove(action.path);
@@ -215,9 +217,25 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
         }
       } catch (rollbackError) {
         rollbackErrors.push(rollbackError);
+        failedRollbackActions.push(action);
       }
     }
     if (rollbackErrors.length > 0) {
+      rollbackFailed = true;
+      try {
+        writeFileSync(join(workspace, "recovery.json"), `${JSON.stringify({
+          version: 1,
+          kind: "tweakers-generated-assets-recovery",
+          destination: destinationPath,
+          committed: false,
+          staged,
+          journal,
+          rollbackActions: rollback,
+          failedRollbackActions,
+        }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+      } catch (recoveryError) {
+        rollbackErrors.push(recoveryError);
+      }
       throw new AggregateError([error, ...rollbackErrors], `generated asset publication and rollback failed: ${destinationPath}`);
     }
     throw error;
@@ -225,11 +243,15 @@ export function publishGeneratedDirectorySync(destination, populate, dependencie
     // Cleanup is outside the commit decision. Once every journaled mutation
     // succeeds, a FileProvider cleanup error may leave a private temp path but
     // must not turn the committed publication into an unrolled-back failure.
-    try {
-      cleanupWorkspace(workspace);
-    } catch (cleanupError) {
-      publicationResult?.cleanupErrors.push({ workspace, message: errorMessage(cleanupError) });
-      reportCleanupError(onCleanupError, cleanupError, { committed, workspace });
+    if (rollbackFailed) {
+      reportCleanupError(onCleanupError, new Error("Generated asset rollback failed; recovery journal retained"), { committed, workspace, rollbackFailed });
+    } else {
+      try {
+        cleanupWorkspace(workspace);
+      } catch (cleanupError) {
+        publicationResult?.cleanupErrors.push({ workspace, message: errorMessage(cleanupError) });
+        reportCleanupError(onCleanupError, cleanupError, { committed, workspace });
+      }
     }
   }
 }
@@ -297,16 +319,32 @@ function generatedEntriesEqual(left, right) {
   return true;
 }
 
-function backupNode(entry, source, journal, index) {
+function backupNode(entry, source, journal, index, dependencies) {
   const backup = join(journal, String(index));
   if (entry.type === "directory") {
     cpSync(source, backup, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
   } else if (entry.type === "symlink") {
     symlinkSync(entry.target, backup);
   } else {
-    // A hard-link journal retains the exact old inode after rename-overwrite,
-    // allowing rollback to restore identity as well as bytes and mode.
-    linkSync(source, backup);
+    // Retain the old inode when hard links are permitted. macOS may deny a
+    // link to a signed resource; a verified copy still preserves rollback
+    // bytes and mode, but cannot retain the old inode.
+    try {
+      (dependencies.linkJournalFile ?? linkSync)(source, backup);
+    } catch (error) {
+      if (error?.code !== "EPERM") throw error;
+      const expected = { ...entry, data: entry.data ?? readFileSync(source) };
+      (dependencies.copyJournalFile ?? cpSync)(source, backup, {
+        verbatimSymlinks: true,
+        preserveTimestamps: true,
+        errorOnExist: true,
+        force: false,
+      });
+      const copied = pathEntry(backup, true);
+      if (!copied || copied.type !== "file" || !generatedEntriesEqual(expected, copied)) {
+        throw new Error(`Generated asset copy journal does not match the prior file: ${source}`);
+      }
+    }
   }
   return backup;
 }

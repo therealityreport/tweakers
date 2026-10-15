@@ -1,3 +1,5 @@
+import { ownEntrypoint } from "../../../scripts/owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -14,7 +16,7 @@ const outDir = resolve(root, "dist");
 const out = resolve(outDir, "tweaker_native_host.node");
 const managerLauncherOutput = resolve(outDir, "Tweakers Manager Launcher");
 const appLauncherOutput = resolve(outDir, "Tweakers App Launcher");
-const doctorAppOutput = resolve(outDir, "Tweakers Doctor.app");
+const doctorAppOutput = resolve(outDir, "Tweakers Manager.app");
 const doctorIconSource = resolve(root, "..", "installer", "assets", "tweakers.icns");
 const managerLauncherAsset = resolve(root, "assets", "Tweakers Manager Launcher");
 const managerSigningPolicy = readManagerSigningPolicy(resolve(root, "manager-signing-policy.json"));
@@ -81,11 +83,11 @@ run("codesign", ["--force", "--sign", "-", appLauncherOutput], { stdio: "inherit
 run("codesign", ["--verify", "--strict", appLauncherOutput], { stdio: "inherit" });
 console.log(`[native-host] built ${appLauncherOutput}`);
 
-if (!existsSync(doctorIconSource)) throw new Error(`Tweakers Doctor icon is missing: ${doctorIconSource}`);
-const doctorCandidate = resolve(outDir, `.Tweakers Doctor.app.candidate-${process.pid}`);
+if (!existsSync(doctorIconSource)) throw new Error(`Tweakers Manager icon is missing: ${doctorIconSource}`);
+const doctorCandidate = resolve(outDir, `.Tweakers Manager.app.candidate-${process.pid}`);
 rmSync(doctorCandidate, { recursive: true, force: true });
 const doctorContents = resolve(doctorCandidate, "Contents");
-const doctorExecutable = resolve(doctorContents, "MacOS", "Tweakers Doctor");
+const doctorExecutable = resolve(doctorContents, "MacOS", "Tweakers Manager");
 mkdirSync(dirname(doctorExecutable), { recursive: true });
 mkdirSync(resolve(doctorContents, "Resources"), { recursive: true });
 run("xcrun", ["clang++", "-std=c++20", "-fobjc-arc", "-ObjC++", "-mmacosx-version-min=13.0", "-isysroot", sdkPath,
@@ -94,7 +96,7 @@ cpSync(doctorIconSource, resolve(doctorContents, "Resources", "tweakers.icns"));
 writeFileSync(resolve(doctorContents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleExecutable</key><string>Tweakers Doctor</string>
+<key>CFBundleExecutable</key><string>Tweakers Manager</string>
 <key>CFBundleIdentifier</key><string>com.therealityreport.tweakers.doctor</string>
 <key>CFBundleName</key><string>Tweakers Manager</string>
 <key>CFBundleDisplayName</key><string>Tweakers Manager</string>
@@ -112,6 +114,8 @@ run("codesign", ["--force", "--sign", "-", "--identifier", "com.therealityreport
 run("codesign", ["--verify", "--deep", "--strict", doctorCandidate], { stdio: "inherit" });
 rmSync(doctorAppOutput, { recursive: true, force: true });
 renameSync(doctorCandidate, doctorAppOutput);
+// Retire the pre-rename bundle and raw helper names.
+rmSync(resolve(outDir, "Tweakers Doctor.app"), { recursive: true, force: true });
 rmSync(resolve(outDir, "Tweakers Doctor"), { force: true });
 console.log(`[native-host] built ${doctorAppOutput}`);
 

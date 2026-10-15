@@ -420,7 +420,7 @@ test("tweakers-live prepare and stale classification never consult the live-path
     assert.equal(result.state, "ready");
     assert.ok(result.receipt);
 
-    const reasons = bindings.warmCommit.classifyStaleBeforeCutover(result.receipt, "bounded-check-failed");
+    const reasons = await bindings.warmCommit.classifyStaleBeforeCutover(result.receipt, "bounded-check-failed");
     assert.equal(reasons.some((reason) => /not signed by OpenAI Team/.test(reason)), false);
   });
 });
@@ -508,8 +508,8 @@ test("production preflight reopens the exact absent source and revalidates the p
 
       const preflight = await bindings.warmCommit.preflight(prepared.receipt);
 
-      assert.equal(preflight.state, "ready");
       if (preflight.state !== "ready") assert.fail(preflight.reason);
+      assert.equal(preflight.state, "ready");
       assert.deepEqual(reopened, [fixture.current.selectedDesktopPath]);
       assert.deepEqual(preflight.source, {
         appPath: fixture.current.selectedDesktopPath,

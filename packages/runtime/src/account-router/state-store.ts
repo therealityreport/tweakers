@@ -81,6 +81,11 @@ export class RouterStateStore {
     return structuredClone(this.state);
   }
 
+  /** Read-only lookup for hot paths that need one owner, not a full state copy. */
+  ownerOf(threadId: string): RouterState["threadOwners"][string] | undefined {
+    return this.state.threadOwners[threadId];
+  }
+
   update(mutator: (state: RouterState) => void): RouterState {
     const next = structuredClone(this.state);
     mutator(next);

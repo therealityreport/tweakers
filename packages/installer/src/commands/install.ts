@@ -39,6 +39,7 @@ import { writeFuse } from "../fuses.js";
 import {
   clearQuarantine,
   codeSigningKeychainArgs,
+  codeSigningCertificateLeafHash,
   isDeveloperIdSignedBackup,
   prepareCodeSigning,
   signCodexApp,
@@ -54,6 +55,8 @@ import {
   capturePreparedPrebuiltCombinedCandidateEvidence,
   resolvePrebuiltCombinedCandidateCliInput,
   validatePrebuiltCombinedCandidate,
+  assertAcceptedBackendClosure,
+  readAcceptedBuildReceipt,
   type PrebuiltCombinedCandidateCliOptions,
   type PrebuiltCombinedCandidateInput,
   type PrebuiltCombinedCandidateAuthority,
@@ -76,6 +79,8 @@ import {
 import { patchCodexModelSelectionInExtractedApp } from "../codex-model-selection.js";
 import { patchCodexInactiveThreadRetentionInExtractedApp } from "../codex-inactive-thread-retention.js";
 import { patchCodexAccountsNativeInExtractedApp } from "../codex-accounts-native.js";
+import { patchCodexBillingAnalyticsInExtractedApp } from "../codex-billing-analytics.js";
+import { patchCodexNativeServicePolicyInExtractedApp } from "../codex-native-service-policy.js";
 import {
   runOptionalRendererPatch,
   summarizeRendererPatches,
@@ -120,6 +125,7 @@ import {
   recordProtectedPostPromotionHealthProbe,
 } from "../protected-acceptance-coordinator.js";
 import { migrateAutomatically } from "./migrate.js";
+import { captureOfficialBundledBackendClosure, assertOfficialBundledBackendSigningClosure, type OfficialBundledBackendClosure } from "../native-bundled-backend.js";
 import { readDevTweaksRoot } from "../config.js";
 import { ensureManagedRuntime, reconcileManagedCliShims } from "../managed-runtime.js";
 import { reconcileDock, reconcileLaunchServices } from "../macos-app-identity.js";
@@ -182,6 +188,7 @@ interface Opts {
     paths: UserPaths;
     finalUserRoot: string;
     bundledDerivedBackend?: BundledDerivedBackendArtifact;
+    officialBundledBackend?: OfficialBundledBackendClosure;
   };
   /** Candidate-only callers may bind app signing to a read-only prepared identity. */
   preparedSigningIdentity?: PreparedSigningIdentity;
@@ -244,6 +251,86 @@ export function bundledDerivedBackendPath(appRoot: string): string {
   return join(appRoot, "Contents", "Resources", "codex");
 }
 
+export function bundledDerivedCodeModeHostPath(appRoot: string): string {
+  return join(appRoot, "Contents", "Resources", "codex-code-mode-host");
+}
+
+export function requiresBundledDerivedCodeModeHost(version: string): boolean {
+  const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  return parts !== null && (Number(parts[1]) > 0 || Number(parts[2]) >= 153);
+}
+
+/** Validate the companion against its prepared receipt before candidate writes. */
+export function validateBundledDerivedCodeModeHost(
+  backend: BundledDerivedBackendArtifact,
+  deps: { fingerprint?: (file: string) => string; verifyHelperSignature?: (file: string, official: boolean) => boolean } = {},
+): BundledDerivedCodeModeHostArtifact | undefined {
+  const helper = backend.codeModeHost;
+  if (!helper) {
+    if (requiresBundledDerivedCodeModeHost(backend.version)) throw new Error("Bundled-derived backend requires a receipt-bound code-mode helper");
+    return undefined;
+  }
+  requireInternalExactFile(helper.binaryPath, "Bundled-derived code-mode helper");
+  requireInternalExactFile(helper.receiptPath, "Bundled-derived code-mode helper receipt");
+  if (!/^[a-f0-9]{64}$/.test(helper.fingerprint) || !/^[a-f0-9]{64}$/.test(helper.receiptSha256)
+    || sha256RegularFile(helper.receiptPath) !== helper.receiptSha256) throw new Error("Code-mode helper receipt or fingerprint changed");
+  const receipt = JSON.parse(readFileSync(helper.receiptPath, "utf8"));
+  let backendSha: unknown, backendVersion: unknown, helperSha: unknown, helperVersion: unknown;
+  let official = false;
+  let acceptedClosureVerified = false;
+  if (receipt?.schemaVersion === 1 && receipt.kind === "codex-code-mode-host-companion") {
+    if ((helper.resources?.length ?? 0) !== 0) throw new Error("Historical companion receipt does not bind external resources");
+    backendSha = receipt.backend?.sha256; backendVersion = receipt.backend?.version;
+    helperSha = receipt.helper?.sha256; helperVersion = receipt.helper?.version;
+    const provenance = receipt.provenance;
+    if (receipt.helper?.binaryPath !== helper.binaryPath || provenance?.repository !== "openai/codex"
+      || provenance.releaseTag !== `rust-v${backend.version}` || !/^[a-f0-9]{40}$/.test(provenance.commit)
+      || !/^[a-f0-9]{64}$/.test(provenance.archiveSha256) || provenance.teamIdentifier !== "2DC432GLL2"
+      || provenance.assetName !== "codex-code-mode-host-aarch64-apple-darwin.tar.gz") throw new Error("Code-mode helper upstream provenance is invalid");
+    official = true;
+  } else if (receipt?.schemaVersion === 2 && receipt.channel === "bundled"
+    && ["canary-passed", "promoting", "promoted", "soaking", "completed"].includes(receipt.phase)
+    && receipt.source?.repository === "openai/codex" && /^[a-f0-9]{40}$/.test(receipt.source?.checkoutCommit)) {
+    backendSha = receipt.candidateBinary?.digests?.find((d: { algorithm: string; scope: string }) => d.algorithm === "sha256" && d.scope === "derived candidate binary")?.value;
+    helperSha = receipt.candidateBinary?.digests?.find((d: { algorithm: string; scope: string }) => d.algorithm === "sha256" && d.scope === "derived candidate code-mode helper")?.value;
+    backendVersion = receipt.version; helperVersion = receipt.candidateBinary?.version;
+    if (JSON.stringify(helper.resources ?? []) !== JSON.stringify(receipt.backendClosure?.resources ?? [])) {
+      throw new Error("Derived helper resource closure differs from its receipt");
+    }
+  } else if (receipt?.schemaVersion === 2 && receipt.kind === "tweakers-prebuilt-codex-build") {
+    const accepted = readAcceptedBuildReceipt(helper.receiptPath, new Date());
+    assertAcceptedBackendClosure(accepted, {
+      fingerprintFile: deps.fingerprint ?? sha256RegularFile,
+      ...(deps.verifyHelperSignature ? { verifyBackendSignature: (file) => deps.verifyHelperSignature!(file, false) } : {}),
+    });
+    if (accepted.binary.path !== backend.binaryPath || accepted.closure.codeModeHost.path !== helper.binaryPath) {
+      throw new Error("Accepted helper authority path differs from the requested backend/helper pair");
+    }
+    if (JSON.stringify(helper.resources ?? []) !== JSON.stringify(accepted.closure.resources)) {
+      throw new Error("Accepted resource closure differs from the requested helper descriptor");
+    }
+    acceptedClosureVerified = true;
+    backendSha = accepted.binary.sha256; backendVersion = accepted.binary.version;
+    helperSha = accepted.closure.codeModeHost.sha256; helperVersion = accepted.binary.version;
+  } else throw new Error("Code-mode helper receipt does not describe an eligible companion");
+  if (backendSha !== backend.fingerprint.toLowerCase() || backendVersion !== backend.version
+    || helperSha !== helper.fingerprint || helperVersion !== backend.version) throw new Error("Code-mode helper receipt does not match the backend/helper pair");
+  if (acceptedClosureVerified) return helper;
+  if ((deps.fingerprint ?? sha256RegularFile)(helper.binaryPath).toLowerCase() !== helper.fingerprint) throw new Error("Code-mode helper fingerprint does not match its receipt");
+  const verify = deps.verifyHelperSignature ?? ((file: string, upstream: boolean) => verifySignature(file).ok
+    && (!upstream || signatureInfo(file).teamIdentifier === "2DC432GLL2"));
+  if (!verify(helper.binaryPath, official)) throw new Error("Code-mode helper signature is invalid");
+  for (const resource of helper.resources ?? []) {
+    if (isAbsolute(resource.relativePath) || resource.relativePath.split(/[\\/]/).some(part => ["", ".", ".."].includes(part))
+      || ["codex", "codex-code-mode-host", "app.asar", "tweakers"].includes(resource.relativePath.split(/[\\/]/)[0]!)) {
+      throw new Error("Backend helper resource path is unsafe");
+    }
+    requireInternalExactFile(resource.sourcePath, "Backend helper resource");
+    if ((deps.fingerprint ?? sha256RegularFile)(resource.sourcePath) !== resource.sha256) throw new Error("Backend helper resource fingerprint does not match its receipt");
+  }
+  return helper;
+}
+
 // A newly relocated signed backend can trigger a cold macOS trust scan.
 // Keep the probe bounded while allowing that first launch to finish.
 export const BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS = 60_000;
@@ -260,6 +347,7 @@ export function stageBundledDerivedBackendInsideApp(
     fingerprint?: (file: string) => string;
     readVersion?: (file: string) => string | null;
     copy?: (source: string, destination: string) => void;
+    verifyHelperSignature?: (file: string, official: boolean) => boolean;
   } = {},
 ): string {
   requireInternalExactPath(appRoot, "Bundled-derived candidate app");
@@ -284,8 +372,12 @@ export function stageBundledDerivedBackendInsideApp(
     throw new Error("Bundled-derived backend version does not match its validated descriptor");
   }
 
+  const helper = validateBundledDerivedCodeModeHost(artifact, deps);
+
   const destination = bundledDerivedBackendPath(appRoot);
   const temporary = `${destination}.bundled-derived-${process.pid}.tmp`;
+  const helperDestination = bundledDerivedCodeModeHostPath(appRoot);
+  const helperTemporary = `${helperDestination}.bundled-derived-${process.pid}.tmp`;
   mkdirSync(dirname(destination), { recursive: true });
   try {
     (deps.copy ?? copyFileSync)(artifact.binaryPath, temporary);
@@ -296,9 +388,29 @@ export function stageBundledDerivedBackendInsideApp(
     if (readVersion(temporary) !== artifact.version) {
       throw new Error("Staged bundled-derived backend version does not match its validated descriptor");
     }
+    if (helper) {
+      (deps.copy ?? copyFileSync)(helper.binaryPath, helperTemporary);
+      chmodSync(helperTemporary, 0o755);
+      if (fingerprint(helperTemporary).toLowerCase() !== helper.fingerprint) throw new Error("Staged code-mode helper fingerprint does not match its receipt");
+      // Recheck the prepared input after both copies, before replacing either file.
+      validateBundledDerivedCodeModeHost(artifact, deps);
+      for (const resource of helper.resources ?? []) {
+        const destinationResource = join(appRoot, "Contents", "Resources", resource.relativePath);
+        if (isAbsolute(resource.relativePath) || resource.relativePath.split(/[\\/]/).some(part => part === ".." || part === "." || part === "")) {
+          throw new Error("Backend helper resource path is unsafe");
+        }
+        requireInternalExactFile(resource.sourcePath, "Backend helper resource");
+        if (fingerprint(resource.sourcePath) !== resource.sha256) throw new Error("Backend helper resource changed before staging");
+        mkdirSync(dirname(destinationResource), { recursive: true });
+        (deps.copy ?? copyFileSync)(resource.sourcePath, destinationResource);
+        if (fingerprint(destinationResource) !== resource.sha256) throw new Error("Staged backend helper resource differs from its receipt");
+      }
+    }
     renameSync(temporary, destination);
+    if (helper) renameSync(helperTemporary, helperDestination);
   } finally {
     rmSync(temporary, { force: true });
+    rmSync(helperTemporary, { force: true });
   }
   if (fingerprint(destination).toLowerCase() !== expectedFingerprint) {
     throw new Error("Embedded bundled-derived backend fingerprint failed final verification");
@@ -306,6 +418,7 @@ export function stageBundledDerivedBackendInsideApp(
   if (readVersion(destination) !== artifact.version) {
     throw new Error("Embedded bundled-derived backend version failed final verification");
   }
+  if (helper && fingerprint(helperDestination).toLowerCase() !== helper.fingerprint) throw new Error("Embedded code-mode helper fingerprint failed final verification");
   return destination;
 }
 
@@ -347,12 +460,13 @@ export function stageNativeHostInsideApp(appRoot: string, runtimeRoot: string): 
   const destination = stagedNativeHostPath(appRoot);
   mkdirSync(dirname(destination), { recursive: true });
   copyFileSync(source, destination);
-  const doctor = join(runtimeRoot, "native", "Tweakers Doctor.app");
+  const managerName = existsSync(join(runtimeRoot, "native", "Tweakers Manager.app")) ? "Tweakers Manager.app" : "Tweakers Doctor.app";
+  const doctor = join(runtimeRoot, "native", managerName);
   if (existsSync(doctor)) {
     // Early launcher failures happen before the managed runtime can load.
     // Keep the recovery app inside the candidate's final signature as well.
     if (!lstatSync(doctor).isDirectory() || lstatSync(doctor).isSymbolicLink()) throw new Error("Packaged Doctor app is unsafe");
-    const copiedDoctor = join(dirname(destination), "Tweakers Doctor.app");
+    const copiedDoctor = join(dirname(destination), managerName);
     if (existsSync(copiedDoctor) && lstatSync(copiedDoctor).isSymbolicLink()) throw new Error("Candidate Doctor app is unsafe");
     if (!realpathSync(dirname(destination)).startsWith(`${realpathSync(appRoot)}/`)) throw new Error("Candidate Doctor app escapes the app");
     cpSync(doctor, copiedDoctor, { recursive: true, dereference: false });
@@ -1262,6 +1376,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       : undefined,
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),
     buildCandidate: async (_pristineRoot, candidateRoot) => {
+      const officialBundledBackend = prebuiltAuthority ? undefined : captureOfficialBundledBackendClosure(_pristineRoot);
       resetCandidateUserRootForBuild(candidateUserRoot);
       candidatePromotionPreimages = fingerprintPromotionSurfaces(promotionSurfaceRoots({
         appHash: source.hash,
@@ -1286,6 +1401,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         candidateContext: {
           paths: candidatePaths,
           finalUserRoot: paths.root,
+          ...(officialBundledBackend ? { officialBundledBackend } : {}),
           ...(prebuiltAuthority ? {
             bundledDerivedBackend: {
               binaryPath: prebuiltAuthority.backend.sourcePath,
@@ -1293,6 +1409,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
               fingerprint: prebuiltAuthority.backend.sha256,
               receiptPath: prebuiltAuthority.acceptedBuildReceipt.path,
               transactionId: prebuiltAuthority.transactionId,
+              preserveSignature: Boolean(signatureInfo(prebuiltAuthority.backend.sourcePath).teamIdentifier),
+              codeModeHost: { binaryPath: prebuiltAuthority.closure.codeModeHost.path,
+                fingerprint: prebuiltAuthority.closure.codeModeHost.sha256, receiptPath: prebuiltAuthority.acceptedBuildReceipt.path,
+                receiptSha256: prebuiltAuthority.acceptedBuildReceipt.sha256, resources: prebuiltAuthority.closure.resources },
             },
           } : {}),
         },
@@ -2183,6 +2303,16 @@ export interface BundledDerivedBackendArtifact {
   transactionId: string;
   /** Preserve a verified installed signature for an unchanged baseline only. */
   preserveSignature?: boolean;
+  /** Exact upstream companion or helper from this source build; never inferred from a newer desktop. */
+  codeModeHost?: BundledDerivedCodeModeHostArtifact;
+}
+
+export interface BundledDerivedCodeModeHostArtifact {
+  binaryPath: string;
+  fingerprint: string;
+  receiptPath: string;
+  receiptSha256: string;
+  resources?: readonly { relativePath: string; sourcePath: string; sha256: string }[];
 }
 
 /**
@@ -2231,6 +2361,7 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
   if (readAsarMarker(source.asarPath) !== "absent") {
     throw new Error("Patched candidate source must be pristine");
   }
+  const officialBundledBackend = input.bundledDerivedBackend ? undefined : captureOfficialBundledBackendClosure(sourceApp);
 
   const candidateUserRoot = `${destinationApp}.tweakers-build-user`;
   rmSync(destinationApp, { recursive: true, force: true });
@@ -2249,6 +2380,7 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
         paths: transactionUserPaths(candidateUserRoot),
         finalUserRoot,
         ...(input.bundledDerivedBackend ? { bundledDerivedBackend: input.bundledDerivedBackend } : {}),
+        ...(officialBundledBackend ? { officialBundledBackend } : {}),
       },
     });
     const candidate = locateCodex(destinationApp);
@@ -2371,7 +2503,11 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
   if (launcher) step(`Installed patched Tweakers launcher${launcher.shortcutPaths.length === 1 ? "" : "s"}: ${launcher.shortcutPaths.map((p) => kleur.cyan(p)).join(", ")}`);
 
   // 1. Backup originals.
-  const pristineAppBackup = codex.platform === "darwin" ? join(paths.backup, "Codex.app") : null;
+  // Independent Tweakers candidates retain the verified installed generation
+  // as fallback. A pristine vendor clone here would silently consume a third
+  // application slot; only the non-executable patch inputs are needed.
+  const pristineAppBackup = codex.platform === "darwin" && !opts.macAppIdentity
+    ? join(paths.backup, "Codex.app") : null;
   const backupAsar = join(paths.backup, "app.asar");
   const backupAsarUnpacked = join(paths.backup, "app.asar.unpacked");
   const backupPlist = codex.metaPath ? join(paths.backup, "Info.plist") : null;
@@ -2462,7 +2598,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
     step.detail(`Updated ElectronAsarIntegrity → ${kleur.dim(patchedAsarHash.slice(0, 12))}…`);
   }
   if (codex.platform === "darwin" && opts.macAppIdentity) {
-    const changed = applyMacAppIdentity(codex.appRoot, opts.macAppIdentity);
+    const changed = applyMacAppIdentity(codex.appRoot, opts.macAppIdentity, opts.candidateContext?.officialBundledBackend);
     step.detail(`Applied isolated macOS app identity (${changed.length} plist${changed.length === 1 ? "" : "s"})`);
     installMacAppLauncher(codex.appRoot, opts.macAppIdentity);
     step.detail("Installed the pre-Electron Tweakers isolation launcher");
@@ -2489,6 +2625,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
   // before the final inside-out signature. Staging it after this point would
   // invalidate the app signature and make the receipt proof meaningless.
   if (opts.candidateContext?.bundledDerivedBackend) {
+    if (opts.candidateContext.officialBundledBackend) throw new Error("Candidate cannot combine official supplied and derived backend authority");
     stageBundledDerivedBackendInsideApp(codex.appRoot, opts.candidateContext.bundledDerivedBackend);
     step.detail(`Staged desktop-bundled-derived Codex ${opts.candidateContext.bundledDerivedBackend.version}`);
   }
@@ -2503,9 +2640,16 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
     const signing = signCodexApp(codex.appRoot, {
       useLocalIdentity: localSigning,
       preparedIdentity: preparedSigning,
+      ...(opts.candidateContext?.officialBundledBackend ? { officialBundledBackend: opts.candidateContext.officialBundledBackend } : {}),
       ...(opts.candidateContext?.bundledDerivedBackend?.preserveSignature ? { retainedSignedBackend: {
         sourcePath: opts.candidateContext.bundledDerivedBackend.binaryPath,
         sha256: opts.candidateContext.bundledDerivedBackend.fingerprint,
+        certificateSha1: codeSigningCertificateLeafHash(opts.candidateContext.bundledDerivedBackend.binaryPath),
+      } } : {}),
+      ...(opts.candidateContext?.bundledDerivedBackend?.codeModeHost ? { retainedSignedCodeModeHost: {
+        sourcePath: opts.candidateContext.bundledDerivedBackend.codeModeHost.binaryPath,
+        sha256: opts.candidateContext.bundledDerivedBackend.codeModeHost.fingerprint,
+        certificateSha1: codeSigningCertificateLeafHash(opts.candidateContext.bundledDerivedBackend.codeModeHost.binaryPath),
       } } : {}),
     });
     resigned = true;
@@ -2520,6 +2664,9 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
       step("Signing: ad-hoc");
     }
     verifyStagedNativeHostForApp(codex.appRoot);
+  }
+  if (opts.candidateContext?.officialBundledBackend) {
+    assertOfficialBundledBackendSigningClosure(codex.appRoot, opts.candidateContext.officialBundledBackend);
   }
 
   // 7. Auto-repair watcher.
@@ -3955,6 +4102,13 @@ async function injectLoader(
     if (pkg["__tweaker"]) originalMain = String(pkg["__tweaker"].originalMain);
     if (pkg[LEGACY_ASAR_META_KEY]) originalMain = String(pkg[LEGACY_ASAR_META_KEY].originalMain);
     applyDoctorPatchRepairs(dir, doctorPatchRepairs);
+    // Independent derived desktops cannot own the native recorder. Refuse an
+    // unknown source before constructing a candidate that could spawn it.
+    // Native installs have no derived product identity and retain native policy.
+    if (appDisplayName) {
+      const nativePolicy = patchCodexNativeServicePolicyInExtractedApp(dir, originalMain);
+      step(`Verified derived native-service policy (${nativePolicy.profile}); native capture unavailable`);
+    }
     const previousAccountsNative = pkg["__tweaker"]?.accountsNative;
     pkg["__tweaker"] = {
       originalMain,
@@ -4005,6 +4159,8 @@ async function injectLoader(
     );
     reportRendererPatch(step, inactiveThreadRetentionPatch, "Codex inactive-thread retention policy");
 
+    if (patchCodexBillingAnalyticsInExtractedApp(dir)) step("Verified Billing Analytics compatibility fallback");
+
     const accountsNative = patchCodexAccountsNativeInExtractedApp(dir, previousAccountsNative);
     pkg["__tweaker"].accountsNative = accountsNative;
     // Build the hooks even when disabled. Enabling Accounts later must not
@@ -4019,8 +4175,13 @@ async function injectLoader(
           && config.tweaks?.["co.tweakers.account-switcher"]?.enabled !== false;
       }
     }
-    if (accountsEnabled && accountsNative.status !== "compatible") {
-      throw new Error(accountsNative.reason ?? "Accounts native integration is incompatible with this candidate.");
+    // The same native patch carries local projects/sessions from both
+    // subscriptions, which must not depend on the Accounts toggle. Building
+    // without it silently ships a Tweakers with an empty project sidebar, so
+    // refuse the candidate and keep the working installation instead.
+    void accountsEnabled;
+    if (accountsNative.status !== "compatible") {
+      throw new Error(`This ChatGPT build is not supported by Tweakers yet, so local projects and sessions would be missing. Your current Tweakers was kept. (${accountsNative.reason ?? "native integration unavailable"})`);
     }
     step(accountsNative.status === "compatible" ? "Verified native Accounts integration" : "Accounts unavailable for this desktop build; native behavior preserved");
 

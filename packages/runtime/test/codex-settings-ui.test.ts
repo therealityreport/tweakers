@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import {
   ConfigCardUpdateCoordinator,
   createEnvironmentConfigController,
@@ -28,6 +29,26 @@ function functionBody(name: string, nextName: string): string {
   assert.ok(start >= 0 && end > start, `${name} source range exists`);
   return source.slice(start, end);
 }
+
+test("settings content selection crosses display contents and skips retained invisible overlays", () => {
+  const body = functionBody("findContentArea", "maybeDumpDom")
+    .replaceAll(": HTMLElement | null", "").replaceAll(" as HTMLElement[]", "").replaceAll(": HTMLElement", "");
+  let hiddenReads = 0;
+  const sidebar = { parentElement: null as unknown };
+  const hidden = { hidden: false, contains: () => false, getAttribute: () => null,
+    getBoundingClientRect: () => { hiddenReads++; return { width: 1514, height: 798 }; } };
+  const visible = { hidden: false, contains: () => false, getAttribute: () => null,
+    getBoundingClientRect: () => ({ width: 990, height: 798 }) };
+  const contents = { hidden: false, contains: () => false, getAttribute: () => null, children: [visible],
+    getBoundingClientRect: () => ({ width: 0, height: 0 }) };
+  sidebar.parentElement = { children: [sidebar, hidden, contents], parentElement: null };
+  const selected = runInNewContext(`${body}; findContentArea()`, {
+    findSidebarItemsGroup: () => sidebar,
+    getComputedStyle: (node: unknown) => ({ display: node === contents ? "contents" : "block", visibility: node === hidden ? "hidden" : "visible" }),
+  });
+  assert.equal(selected, visible);
+  assert.equal(hiddenReads, 0);
+});
 
 interface TestReceipt {
   transactionId: string;

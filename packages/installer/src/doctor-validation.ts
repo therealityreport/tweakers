@@ -1,14 +1,15 @@
+import { doctorSourceFile, hasDoctorBaseline, readDoctorBaseline } from "./doctor-baseline.js";
 import { doctorImplementationScopes } from "./doctor-implementation.js";
 import { verifyProbedAccountsTransferRecovery } from "./accounts-transfer-compatibility.js";
 import { validateDoctorPatchRepair, type DoctorPatchRepairV1 } from "./doctor-patch-repair.js";
 import { createRequire } from "node:module";
-import { collectDoctorProtocolCoverage, DOCTOR_PROTOCOL_CONTRACTS, type DoctorProtocolCoverage } from "./doctor-protocol.js";
+import { applyReviewedWorkspaceRoutingContinuity, applyReviewedRetainedBackend20156, matchesReviewedRetainedBackend20156, collectDoctorProtocolCoverage, DOCTOR_PROTOCOL_CONTRACTS, type DoctorProtocolCoverage } from "./doctor-protocol.js";
 import { DOCTOR_CHECK_OWNERS } from "./doctor-review-plan.js";
 import type { ReviewDoctorSourceChangesResult } from "./doctor-review.js";
 import asar from "@electron/asar";
 import { parse } from "acorn";
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -17,6 +18,7 @@ import {
   readFileSync,
   readlinkSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -28,6 +30,7 @@ import { readHeaderHash } from "./asar.js";
 import { patchCodexWindowServicesSource } from "./codex-window-services.js";
 import { verifyWindowServicesOutput } from "./commands/install.js";
 import { patchCodexAccountsNativeSources } from "./codex-accounts-native.js";
+import { patchCodexBillingAnalyticsSource } from "./codex-billing-analytics.js";
 import { patchCodexModelSelectionSource } from "./codex-model-selection.js";
 import { patchCodexInactiveThreadRetentionSource } from "./codex-inactive-thread-retention.js";
 import { createJsonlManagedMcpAppServerTransport } from "./managed-mcp-canary-app-server-adapter.js";
@@ -89,7 +92,7 @@ interface ProtocolProbeResult {
 
 interface DoctorValidationDependencies {
   run(command: string, args: readonly string[], options: { env: NodeJS.ProcessEnv; timeout: number }): CommandResult;
-  probeBackend(executable: string, environment: Readonly<Record<string, string>>, cwd: string): Promise<ProtocolProbeResult>;
+  probeBackend(executable: string, environment: Readonly<Record<string, string>>, cwd: string, retained20156?: boolean): Promise<ProtocolProbeResult>;
 }
 
 const DEFAULT_DEPENDENCIES: DoctorValidationDependencies = {
@@ -101,8 +104,12 @@ const DEFAULT_DEPENDENCIES: DoctorValidationDependencies = {
       stdio: ["ignore", "pipe", "pipe"],
     });
   },
-  async probeBackend(executable, environment, cwd) {
-    const args = ["app-server", "-c", 'cli_auth_credentials_store="ephemeral"'];
+  async probeBackend(executable, environment, cwd, retained20156) {
+    // MCP OAuth has a separate credential store: an isolated HOME and ephemeral
+    // account auth do not prevent its default store from reading macOS Keychain.
+    // This disposable, empty probe home must never read the user's MCP secrets.
+    const args = ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled", "-c", 'cli_auth_credentials_store="ephemeral"',
+      "-c", 'mcp_oauth_credentials_store="file"'];
     const argv = [executable, ...args];
     let stderr = "";
     try {
@@ -118,10 +125,20 @@ const DEFAULT_DEPENDENCIES: DoctorValidationDependencies = {
       try {
         const initialized = await transport.request("initialize", {
           clientInfo: { name: "tweakers-doctor-validation", title: "Tweakers Doctor Validation", version: "1.0.0" },
-          capabilities: { experimentalApi: true },
+          capabilities: { experimentalApi: true, ...(retained20156 ? { explicitGatewayOauth: true, optOutNotificationMethods: [] } : {}) },
         }, 15_000);
         if (!validInitializeResponse(initialized, cwd)) throw new Error("initialize response does not bind to the isolated CODEX_HOME or required platform fields");
+        if (retained20156 && !/^tweakers-doctor-validation\/0\.153\.4(?: |$)/.test((initialized as Record<string, string>).userAgent!)) throw new Error("Retained 20156 initialization did not report the unspoofed 0.153.4 backend version");
         transport.notify("initialized");
+        const requirements = await transport.request("configRequirements/read", {}, 15_000);
+        if (!isRecord(requirements) || !Object.hasOwn(requirements, "requirements")
+          || !(requirements.requirements === null || isRecord(requirements.requirements))) {
+          throw new Error("configRequirements/read did not expose startup requirements");
+        }
+        const configuration = await transport.request("config/read", { includeLayers: false }, 15_000);
+        if (!isRecord(configuration) || !isRecord(configuration.config) || !isRecord(configuration.origins)) {
+          throw new Error("config/read did not expose startup configuration and origins");
+        }
         const models = await transport.request("model/list", {}, 15_000);
         if (!validModelListResponse(models)) throw new Error("model/list response does not match the required ModelListResponse fields");
         const account = await transport.request("account/read", {refreshToken: false}, 15_000);
@@ -132,7 +149,7 @@ const DEFAULT_DEPENDENCIES: DoctorValidationDependencies = {
         if (!isRecord(threads) || !Array.isArray(threads.data) || threads.data.length !== 0) throw new Error("isolated thread/list did not return empty history");
         return {
           state: "passed",
-          summary: `initialize, model/list (${models.data.length} models), unauthenticated account/read, thread/loaded/list and thread/list passed`,
+          summary: `initialize${retained20156 ? " (explicitGatewayOauth accepted; actual backend 0.153.4)" : ""}, configRequirements/read, config/read (includeLayers:false), model/list (${models.data.length} models), unauthenticated account/read, thread/loaded/list and thread/list passed`,
           command: { argv, exitCode: null, stdout: "initialize: isolated codexHome and platform fields; model/list: validated model rows; child deliberately terminated", stderr },
         };
       } finally {
@@ -192,8 +209,12 @@ export async function collectDoctorValidation(input: {
   outputRoot: string;
   tweakersSourceRoot: string;
   compatibilityOnly?: boolean;
+  /** False only for a configuration-bound update with Accounts explicitly disabled. */
+  accountsEnabled?: boolean;
   patchRepairs?: DoctorPatchRepairV1[];
   candidateEvidence?: DoctorSourceEvidence;
+  /** Check a registered backend before allocating a newer upstream candidate. */
+  retainedBackendPreflight?: DoctorSourceEvidence;
   /** Same-upstream maintenance only; the registered backend must remain byte-identical. */
   retainedBackendBaseline?: { evidence: DoctorSourceEvidence; originalAsarHeaderHash: string };
 }): Promise<DoctorValidationReport> {
@@ -224,15 +245,20 @@ export async function collectDoctorValidation(input: {
     ? validateAsarPackage("after", input.after)
     : skippedUntrusted("after-asar-package-integrity", input.after.asar.path, "package structure and static import resolution; no runtime claim"));
   checks.push(...(sourceChecks[1]!.state === "passed"
-    ? validatePatchCompatibility(input.after, scopedComparison, input.patchRepairs)
+    ? validatePatchCompatibility(input.after, scopedComparison, input.patchRepairs, input.accountsEnabled !== false)
     : skippedPatchCompatibility(input.after, scopedComparison)));
+  if (input.retainedBackendPreflight) {
+    checks.push(await validateRetainedDoctorBackend(input.after, input.retainedBackendPreflight, outputRoot, input.before));
+  }
   if (!input.compatibilityOnly && hasChangedBinaries(input.comparison)) {
     checks.push(sourceChecks.every((entry) => entry.state === "passed")
       ? validateBinaryMetadata(input.before, input.after, input.comparison, outputRoot)
       : skippedUntrusted("binary-metadata", "retained app bundles", "structural architecture, linkage, and source signature evidence only"));
   }
   const protocolAfter = input.candidateEvidence ?? input.after;
-  let protocolBefore = input.before;
+  // A substituted backend must support the interfaces shipped with the new UI,
+  // including fields added since the prior upstream build.
+  let protocolBefore = input.candidateEvidence ? input.after : input.before;
   let retainedBaselineTrusted = true;
   if (input.retainedBackendBaseline) {
     const {evidence, originalAsarHeaderHash} = input.retainedBackendBaseline;
@@ -257,14 +283,18 @@ export async function collectDoctorValidation(input: {
       summary: recoveryReady ? "Exact candidate runtime has a verified retained Accounts recovery copy" : "Candidate Accounts recovery receipt is missing, changed, or unavailable; rebuild the candidate recovery copy",
       scope: "Accounts recovery and reader compatibility", commands: [], artifacts: [join(input.tweakersSourceRoot, "accounts-transfer-recovery.v1.json")] });
   }
+  const retained20156 = !!input.candidateEvidence && matchesReviewedRetainedBackend20156(input.after, input.candidateEvidence, true);
   const protocolChecks = await validateBackendProtocol(protocolBefore, protocolAfter, scopedComparison, outputRoot,
-    [sourceChecks[0]!.state === "passed" && retainedBaselineTrusted, (candidateBytes ?? sourceChecks[1])!.state === "passed"]);
+    [sourceChecks[0]!.state === "passed" && retainedBaselineTrusted, (candidateBytes ?? sourceChecks[1])!.state === "passed"], retained20156);
   checks.push(...protocolChecks.map(c => input.candidateEvidence && c.id === "after-backend-protocol-smoke" ? {...c, id: "candidate-backend-protocol-smoke"} : c));
 
   const needsProtocol = scopedComparison.requiredChecks.some(id => id === "generated-app-server-schema-compatibility" || id === "backend-version-and-app-server-compatibility");
-  const protocolCoverage = needsProtocol ? collectDoctorProtocolCoverage(protocolBefore, protocolAfter) : undefined;
+  let protocolCoverage = needsProtocol ? collectDoctorProtocolCoverage(protocolBefore, protocolAfter) : undefined;
   if (protocolCoverage) {
     const trusted = retainedBaselineTrusted && checks[0]!.state === "passed" && sourceChecks.every(item => item.state === "passed") && (!candidateBytes || candidateBytes.state === "passed");
+    if (trusted && input.candidateEvidence) protocolCoverage = applyReviewedWorkspaceRoutingContinuity(protocolCoverage, input.before, input.after, input.candidateEvidence, true);
+    if (trusted && input.candidateEvidence && retained20156) protocolCoverage = applyReviewedRetainedBackend20156(protocolCoverage, input.after, input.candidateEvidence, true,
+      protocolChecks.some(item => item.id === "after-backend-protocol-smoke" && item.state === "passed"));
     checks.push(check("app-server-schema-contracts", !trusted ? "unsupported" : protocolCoverage.interfaces.every(item => item.status === "compatible") ? "passed" : protocolCoverage.interfaces.some(item => item.status === "incompatible") ? "failed" : "unsupported",
       !trusted ? "Source binding failed; protocol compatibility is untrusted" : protocolCoverage.interfaces.map(item => `${item.owner}: ${item.method}: ${item.status}${item.reasons.length ? ` (${item.reasons.join("; ")})` : ""}`).join("\n"),
       [join(outputRoot, "doctor-protocol-coverage.json")], [], "Exact generated schema contracts; no authenticated behavior claim"));
@@ -310,16 +340,67 @@ function validateBinding(
     [before.artifact, after.artifact], [], "source evidence identity only");
 }
 
+export async function validateRetainedDoctorBackend(upstream: DoctorSourceEvidence, retained: DoctorSourceEvidence, outputRoot: string, previous?: DoctorSourceEvidence): Promise<DoctorValidationCheck> {
+  const output = exactAbsolutePath(outputRoot, "Retained backend verification output");
+  const artifact = join(output, "retained-backend-protocol-coverage.json");
+  let ancestor = output;
+  while (!existsSync(ancestor)) ancestor = dirname(ancestor);
+  const physicalOutput = resolve(realpathSync(ancestor), relative(ancestor, output));
+  for (const app of [upstream.appPath, retained.appPath]) {
+    if (sameOrInside(artifact, app) || sameOrInside(join(physicalOutput, basename(artifact)), realpathSync(app))) throw new Error("Retained backend evidence must be outside app bundles");
+  }
+  mkdirSync(output, { recursive: true, mode: 0o700 });
+  const trusted = [upstream, retained, ...(previous ? [previous] : [])].every(evidence => fingerprintEvidence(evidence) === evidence.fingerprint
+    && verifyDoctorSourceBytes("before", evidence).state === "passed");
+  let coverage = collectDoctorProtocolCoverage(upstream, retained);
+  if (trusted && previous) coverage = applyReviewedWorkspaceRoutingContinuity(coverage, previous, upstream, retained, false);
+  let initializeProbe: ProtocolProbeResult | undefined;
+  if (trusted && matchesReviewedRetainedBackend20156(upstream, retained, false)) {
+    initializeProbe = await probeRetained20156Backend(bundlePath(retained.appPath, retained.backend.path), outputRoot);
+    coverage = applyReviewedRetainedBackend20156(coverage, upstream, retained, false, initializeProbe.state === "passed");
+  }
+  const failures = coverage.interfaces.filter(item => item.status !== "compatible");
+  writeJsonAtomically(artifact, coverage);
+  const state = !trusted ? "unsupported" : failures.some(item => item.status === "incompatible") ? "failed" : failures.length ? "unsupported" : "passed";
+  return check("retained-backend-upstream-compatibility", state,
+    !trusted ? "Retained shared-history backend or upstream evidence changed; compatibility is unverified."
+      : state === "passed" ? `Retained shared-history backend supports the checked upstream interfaces.${initializeProbe ? ` ${initializeProbe.summary}` : ""}`
+      : `The retained shared-history backend is incompatible or unverified for this desktop interface. Disabling Accounts does not replace this backend. A verified backend transition is required before installing. ${failures.map(item => `${item.method}: ${item.reasons.join("; ")}`).join("\n")}`,
+    [upstream.artifact, retained.artifact, artifact], initializeProbe ? [initializeProbe.command] : [], "Retained shared-history backend compatibility before candidate construction");
+}
+
+async function probeRetained20156Backend(executable: string, outputRoot: string): Promise<ProtocolProbeResult> {
+  const root = realpathSync(mkdtempSync(join(outputRoot, "retained-20156-probe-"))), home = join(root, "home"), temporary = join(root, "tmp");
+  mkdirSync(home, { mode: 0o700 }); mkdirSync(temporary, { mode: 0o700 });
+  try {
+    return await dependencies.probeBackend(executable, { PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter), HOME: home, CODEX_HOME: home, CODEX_SQLITE_HOME: home, TMPDIR: temporary }, home, true);
+  } finally {
+    // Keep disposable probe material recoverable under the user's Trash policy.
+    const trash = process.env.HOME && join(process.env.HOME, ".Trash");
+    if (trash && existsSync(trash) && lstatSync(trash).isDirectory() && !lstatSync(trash).isSymbolicLink()) renameSync(root, join(realpathSync(trash), `tweakers-retained-probe-${randomUUID()}`));
+  }
+}
+
 export function verifyDoctorSourceBytes(side: "before" | "after", evidence: DoctorSourceEvidence): DoctorValidationCheck {
   const problems: string[] = [];
   const artifacts: string[] = [];
-  const expectedPaths = new Set(evidence.shippedFiles.map((entry) => entry.path));
+  let baseline: ReturnType<typeof readDoctorBaseline> | null = null;
+  try {
+    baseline = hasDoctorBaseline(evidence.appPath) ? readDoctorBaseline(evidence.appPath) : null;
+    if (baseline && (baseline.fingerprint !== evidence.baselineFingerprint || JSON.stringify(baseline.originalFiles) !== JSON.stringify(evidence.shippedFiles))) problems.push("baseline evidence identity changed");
+    if (!baseline && evidence.baselineFingerprint) problems.push("baseline receipt is missing");
+  } catch(error) {
+    return check(`${side}-source-bytes`, "failed", `baseline verification failed: ${errorMessage(error)}`, [], [], "retained baseline integrity; execution refused");
+  }
+  const retained = baseline ? new Set(baseline.files.map(f=>f.path)) : null;
+  const expectedPaths = new Set(evidence.shippedFiles.filter(f=>!retained||retained.has(f.path)).map((entry) => entry.path));
   let actualPaths: Set<string>;
-  try { actualPaths = new Set(collectBundleEntries(evidence.appPath)); }
+  try { actualPaths = baseline ? new Set(baseline.files.map(f=>f.path)) : new Set(collectBundleEntries(evidence.appPath)); }
   catch (error) { actualPaths = new Set(); problems.push(`bundle inventory unavailable: ${errorMessage(error)}`); }
   for (const path of expectedPaths) if (!actualPaths.has(path)) problems.push(`${path}: evidence entry is missing`);
   for (const path of actualPaths) if (!expectedPaths.has(path)) problems.push(`${path}: retained bundle entry is absent from evidence`);
   for (const file of evidence.shippedFiles) {
+    if (retained && !retained.has(file.path)) continue;
     const path = bundlePath(evidence.appPath, file.path);
     artifacts.push(path);
     verifyFileEvidence(path, file, problems);
@@ -337,7 +418,7 @@ export function verifyDoctorSourceBytes(side: "before" | "after", evidence: Doct
     for (const member of evidence.asar.members) verifyAsarMember(asarPath, member, problems);
   }
   return check(`${side}-source-bytes`, problems.length === 0 ? "passed" : "failed",
-    problems.join("; ") || `all ${evidence.shippedFiles.length} shipped files and ${evidence.asar.members.length} ASAR members match evidence`,
+    problems.join("; ") || (baseline ? "Retained baseline bytes and ASAR members verified; excluded desktop inventory is historical evidence" : `all ${evidence.shippedFiles.length} shipped files and ${evidence.asar.members.length} ASAR members match evidence`),
     artifacts, [], "exact retained source bytes and inventory hashes");
 }
 
@@ -369,7 +450,7 @@ function validateAsarPackage(side: "before" | "after", evidence: DoctorSourceEvi
     [asarPath, plistPath], [], "package structure and static import resolution; no runtime claim");
 }
 
-function validatePatchCompatibility(evidence: DoctorSourceEvidence, comparison: DoctorSourceComparison, repairs: DoctorPatchRepairV1[] = []): DoctorValidationCheck[] {
+function validatePatchCompatibility(evidence: DoctorSourceEvidence, comparison: DoctorSourceComparison, repairs: DoctorPatchRepairV1[] = [], accountsEnabled = true): DoctorValidationCheck[] {
   const asarPath = bundlePath(evidence.appPath, evidence.asar.path);
   let sources: Map<string, string>;
   try { sources = javascriptSources(asarPath); }
@@ -391,13 +472,26 @@ function validatePatchCompatibility(evidence: DoctorSourceEvidence, comparison: 
     const modelSelection = optionalSingleSourcePatchCheck("model-selection-patch", rendererSources(sources),
       (_path, source) => patchCodexModelSelectionSource(source) !== null, "optional renderer model-selection hook");
     if (modelSelection) checks.push(modelSelection);
-    checks.push(singleSourcePatchCheck("inactive-thread-retention-patch", rendererSources(sources), true,
-      (path, source) => {
+    const billingSources = new Map([...rendererSources(sources)].filter(([path]) => /\/billing-analytics-[^/]+\.js$/.test(path)));
+    if (billingSources.size > 0) checks.push(singleSourcePatchCheck("billing-analytics-patch", billingSources, true,
+      (path, source) => patchCodexBillingAnalyticsSource(basename(path), source).status !== "not-applicable",
+      "Billing Analytics compatibility fallback"));
+    const retentionScopes = ["webview/", ".vite/build/"].filter(prefix => [...sources.keys()].some(path => path.startsWith(prefix)));
+    const retentionChecks = retentionScopes.map(prefix => singleSourcePatchCheck("inactive-thread-retention-patch",
+      new Map([...sources].filter(([path]) => path.startsWith(prefix))), true, (path, source) => {
         const repair = repairs.find(r => r.path === path);
         if (repair) validateDoctorPatchRepair(repair, source);
         return patchCodexInactiveThreadRetentionSource(source, repair?.telemetryAnchor) !== null;
-      }, "renderer inactive-thread hook"));
-    try {
+      }, `${prefix} native inactive-thread hook`));
+    checks.push(check("inactive-thread-retention-patch",
+      retentionChecks.length > 0 && retentionChecks.every(result => result.state === "passed") ? "passed" : "failed",
+      retentionChecks.map(result => result.summary).join("; ") || "No native retention scope is available",
+      retentionChecks.flatMap(result => result.artifacts), [], "native main and renderer inactive-thread hooks"));
+    if (!accountsEnabled) {
+      checks.push(check("accounts-native-patch", "passed",
+        "Accounts is disabled in the update configuration; its UI hooks are not required. Compatibility must be verified before enabling Accounts.",
+        [], [], "Disabled Accounts UI; backend compatibility is checked separately"));
+    } else try {
       const result = patchCodexAccountsNativeSources(sources);
       const compatible = result.record.status === "compatible";
       checks.push(check("accounts-native-patch", compatible ? "passed" : "failed",
@@ -502,6 +596,7 @@ function validateBinaryMetadata(
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
   for (const evidence of [before, after]) {
+    if (evidence.baselineFingerprint) { readDoctorBaseline(evidence.appPath); continue; }
     const result = runRecorded("/usr/bin/codesign", ["--verify", "--deep", "--strict", evidence.appPath]);
     commands.push(result);
     artifacts.add(evidence.appPath);
@@ -523,6 +618,7 @@ async function validateBackendProtocol(
   comparison: DoctorSourceComparison,
   outputRoot: string,
   sourceBytesTrusted: readonly [boolean, boolean],
+  retained20156 = false,
 ): Promise<DoctorValidationCheck[]> {
   const required = comparison.requiredChecks.includes("backend-version-and-app-server-compatibility");
   const results: DoctorValidationCheck[] = [];
@@ -563,7 +659,7 @@ async function validateBackendProtocol(
       TMPDIR: temporary,
     };
     try {
-      const result = await dependencies.probeBackend(executable, environment, home);
+      const result = await dependencies.probeBackend(executable, environment, home, side === "after" && retained20156);
       results.push(check(`${side}-backend-protocol-smoke`, result.state, result.summary,
         [executable], [result.command], "initialize, model/list, unauthenticated account/read and empty thread list interactions only"));
     } finally {
@@ -628,6 +724,7 @@ function fingerprintEvidence(evidence: DoctorSourceEvidence): DoctorSourceSha256
   return sha256(Buffer.from(canonicalJson({
     schemaVersion: evidence.schemaVersion,
     kind: evidence.kind,
+    ...(evidence.baselineFingerprint ? {baselineFingerprint:evidence.baselineFingerprint} : {}),
     version: evidence.version,
     build: evidence.build,
     backend: evidence.backend,
@@ -838,7 +935,7 @@ function exactAbsolutePath(path: string, label: string): string {
 }
 
 function bundlePath(root: string, local: string): string {
-  const path = resolve(root, ...local.split("/"));
+  const path = doctorSourceFile(root, local);
   const rel = relative(root, path);
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error(`Path escapes its root: ${local}`);
   return path;

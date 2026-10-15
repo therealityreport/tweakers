@@ -1,15 +1,20 @@
 /**
- * Read/write the ElectronAsarIntegrity entry inside Info.plist (macOS).
- * On Windows/Linux, Electron stores integrity in a sidecar `resources/integrity`
- * JSON-ish blob — we read it from a known location at the package root.
+ * Read and write Electron ASAR integrity metadata on macOS.
+ * Windows and Linux currently skip metadata handling and rely on the fuse
+ * behavior described below.
  */
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { readHeaderHash } from "./asar.js";
 import { readPlist, writePlist } from "./plist.js";
 import type { CodexInstall } from "./platform.js";
+import {
+  assertElectronIntegrityDictionaryDigest,
+  integrityDictionaryDigest,
+  setElectronIntegrityDictionaryDigest,
+} from "./electron-integrity-digest.js";
 
-type IntegrityInstall = Pick<CodexInstall, "platform" | "metaPath" | "resourcesDir">;
+type IntegrityInstall = Pick<CodexInstall, "platform" | "metaPath" | "resourcesDir" | "electronBinary">;
 
 export interface IntegrityEntry {
   algorithm: "SHA256";
@@ -49,6 +54,10 @@ export function setIntegrity(install: IntegrityInstall, hash: string): void {
       : readHeaderHash(archive.path).headerHash.toLowerCase();
     existing[archive.key] = { algorithm: "SHA256", hash: archiveHash };
   }
+  // Validate retained entries and the framework layout before publishing any
+  // changed metadata. Newer Electron validates this separate package-time seal.
+  integrityDictionaryDigest(existing);
+  setElectronIntegrityDictionaryDigest(install.electronBinary, existing);
   pl["ElectronAsarIntegrity"] = existing;
   writePlist(install.metaPath, pl);
   assertResourceAsarIntegrity(install);
@@ -60,7 +69,7 @@ export function setIntegrity(install: IntegrityInstall, hash: string): void {
  * top-level archive (for example busy-bar.asar), so candidate validation must
  * prove the complete Resources/*.asar set rather than only app.asar.
  */
-export function assertResourceAsarIntegrity(install: IntegrityInstall): void {
+export function assertResourceAsarIntegrity(install: IntegrityInstall, options: { allowLegacyUnusedSlot?: boolean } = {}): void {
   if (install.platform !== "darwin" || !install.metaPath) return;
   const pl = readPlist(install.metaPath);
   const current = pl["ElectronAsarIntegrity"];
@@ -68,6 +77,7 @@ export function assertResourceAsarIntegrity(install: IntegrityInstall): void {
     throw new Error("ElectronAsarIntegrity is missing or malformed");
   }
   const entries = current as Record<string, IntegrityEntry>;
+  integrityDictionaryDigest(entries);
   for (const archive of resourceAsarArchives(install)) {
     const entry = entries[archive.key];
     const actual = readHeaderHash(archive.path).headerHash.toLowerCase();
@@ -77,6 +87,7 @@ export function assertResourceAsarIntegrity(install: IntegrityInstall): void {
       throw new Error(`ElectronAsarIntegrity does not match ${archive.key}`);
     }
   }
+  assertElectronIntegrityDictionaryDigest(install.electronBinary, entries, options);
 }
 
 interface ResourceAsarArchive {

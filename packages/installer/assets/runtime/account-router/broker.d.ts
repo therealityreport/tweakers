@@ -1,6 +1,7 @@
+import type { BrokerAdmissionStageV1 } from "./admission-diagnostics";
 import { type NativeProfileStatisticsResultV1 } from "./profile-statistics";
 import { type AccountsPreferencesV1 } from "./preferences";
-import type { AccountPoolV3, BrokerBalanceProjectionV1, BrokerRemoteCommandV1, BrokerRemoteProjectionV1, AccountPoolAccountV3, BrokerAccountState, BrokerClientKind, BrokerConnectionKind, BrokerControlStatusV1, BrokerEnrollmentV1, BrokerErrorCode, BrokerEventV1, BrokerHandshakeV1, BrokerHistoryReadProjectionV1, LogicalContinuationProjectionV1, LogicalConversationProjectionV1, LogicalHistorySubscriptionV1, LogicalTurnProjectionV1, BrokerRequestEnvelopeV1, BrokerResponseV1, BrokerSafeProfileV1, ConnectionStateV3, OpaqueAccountId, OpaqueAppToolsRef, OpaqueConnectionDefinitionRef, OpaqueConfirmationId, OpaqueConversationId, OpaqueEnrollmentRef, OpaqueHandoffRef, OpaqueRendererRef, OpaqueTaskRef, PendingHandoffV1, QuotaProjectionV3, RouterConfigV3, TaskOwnershipV3 } from "./types";
+import type { AccountPoolV3, BrokerBalanceProjectionV1, BrokerRemoteCommandV1, BrokerRemoteProjectionV1, AccountPoolAccountV3, BrokerAccountState, BrokerClientKind, BrokerConnectionKind, BrokerControlStatusV1, BrokerEnrollmentV1, BrokerErrorCode, BrokerEventV1, BrokerHandshakeV1, BrokerHistoryReadProjectionV1, LogicalContinuationProjectionV1, LogicalConversationProjectionV1, LogicalHistorySubscriptionV1, LogicalTurnProjectionV1, BrokerQuotaErrorCode, BrokerRequestEnvelopeV1, BrokerResponseV1, BrokerSafeProfileV1, ConnectionStateV3, OpaqueAccountId, OpaqueAppToolsRef, OpaqueConnectionDefinitionRef, OpaqueConfirmationId, OpaqueConversationId, OpaqueEnrollmentRef, OpaqueHandoffRef, OpaqueRendererRef, OpaqueTaskRef, PendingHandoffV1, QuotaProjectionV3, RouterConfigV3, TaskOwnershipV3 } from "./types";
 export interface BrokerAccountSeedV3 {
     opaqueAccountId: OpaqueAccountId;
     enabled: boolean;
@@ -111,6 +112,8 @@ export type BrokerDeviceActionV1 = {
 };
 export interface BrokerDeviceActionResultV1 {
     outcome: "accepted" | "rejected" | "ambiguous";
+    /** Bounded owner-private failure category; raw provider errors never cross IPC. */
+    errorCode?: BrokerQuotaErrorCode;
     /** Owner-private, bounded provider result; it is validated before use. */
     value?: unknown;
 }
@@ -124,6 +127,8 @@ export interface AccountsBrokerOptionsV1 {
     /** Owner-private 256-bit capability; it is never emitted or retained in an event. */
     secret: Buffer;
     childFactory?: BrokerChildFactoryV1;
+    /** Diagnostics cannot change admission and carry no account identity. */
+    onChildAdmissionFailure?: (stage: BrokerAdmissionStageV1) => void;
     now?: () => number;
     idleEvictionMs?: number;
     handoffTtlMs?: number;
@@ -172,17 +177,22 @@ export declare class AccountsBrokerV1 {
     private readonly options;
     private readonly accounts;
     private readonly children;
+    private readonly startupChildLeases;
     private readonly sessions;
+    private readonly rendererTransports;
+    private readonly retiredSessions;
     private readonly tasks;
     private readonly handoffs;
     private readonly enrollments;
     private readonly quotas;
+    private readonly recoveryRevisions;
     private readonly connections;
     private readonly subscribers;
     private readonly eventBuffers;
     private readonly usedHandshakeNonces;
     private sequence;
     private heldWorkCount;
+    private activeOperations;
     private closed;
     private profileRefresh;
     private readonly quotaRefreshes;
@@ -203,6 +213,11 @@ export declare class AccountsBrokerV1 {
     invoke(rendererRef: OpaqueRendererRef, envelope: BrokerRequestEnvelopeV1): Promise<BrokerResponseV1>;
     /** Direct main-process subscription; renderers never receive the socket capability. */
     subscribe(rendererRef: OpaqueRendererRef, handler: (event: BrokerEventV1) => void): () => void;
+    /** Async authenticated work outlives a disconnected transport until it settles. */
+    withActiveOperation<T>(operation: () => Promise<T>): Promise<T>;
+    hasActiveOperations(): boolean;
+    /** Each authenticated socket owns one token; an old close cannot evict its replacement. */
+    retainRendererTransport(rendererRef: OpaqueRendererRef): () => void;
     /** Owner-private helpers may verify the socket's authenticated renderer without exposing session data. */
     hasAuthenticatedRenderer(rendererRef: OpaqueRendererRef): boolean;
     /** Bounded replay buffer used after a main-process reconnect, never by renderers directly. */
@@ -241,15 +256,33 @@ export declare class AccountsBrokerV1 {
         alreadyAssigned?: boolean;
     }>): TaskOwnershipV3 | null;
     /** Acquires a lazy account-local worker. No idle worker is killed while active. */
-    acquireChild(opaqueAccountId: OpaqueAccountId): BrokerChildV1 | null;
+    /** Exclusive owner-only startup residency; ordinary consumers cannot borrow it. */
+    private childAdmissionRefused;
+    reserveStartupChild(opaqueAccountId: OpaqueAccountId): {
+        acquire(): BrokerChildV1 | null;
+        retire(): BrokerChildV1 | null;
+        release(): boolean;
+    } | null;
+    acquireChild(opaqueAccountId: OpaqueAccountId, startupToken?: symbol, recoveryProbe?: boolean): BrokerChildV1 | null;
     /** Host calls only after a proved native resume and durable owner commit. */
     transferNativeTask(taskRef: OpaqueTaskRef, from: OpaqueAccountId, to: OpaqueAccountId): boolean;
     setChildPinned(accountId: OpaqueAccountId, pinned: boolean): void;
     releaseIdleChild(accountId: OpaqueAccountId): BrokerChildV1 | null;
     beginRun(taskRef: OpaqueTaskRef): boolean;
     finishRun(taskRef: OpaqueTaskRef): boolean;
-    /** Owner bridge reports an exited child without exposing its process details. */
-    markChildUnavailable(opaqueAccountId: OpaqueAccountId): void;
+    /** Owner-private generation boundary for asynchronous child health reports. */
+    accountRecoveryRevision(opaqueAccountId: OpaqueAccountId): number;
+    /** Ignore stale live health reports before changing residency or run counters. */
+    markChildUnavailable(opaqueAccountId: OpaqueAccountId, errorCode?: BrokerQuotaErrorCode, observation?: {
+        child: BrokerChildV1;
+        recoveryRevision: number;
+    }): void;
+    /** Failed startup or confirmed exit retires only that exact unusable child. */
+    retireFailedChild(opaqueAccountId: OpaqueAccountId, child: BrokerChildV1, recoveryRevision: number, errorCode?: BrokerQuotaErrorCode): void;
+    /** Report a failed probe before normal child cleanup can hide its cause. */
+    markAccountFailure(opaqueAccountId: OpaqueAccountId, errorCode: BrokerQuotaErrorCode): void;
+    accountFailure(opaqueAccountId: OpaqueAccountId): BrokerQuotaErrorCode | undefined;
+    private recoverTransientAccount;
     /** App-tools routing returns only the origin endpoint handle, never request content. */
     routeAppTools(taskRef: OpaqueTaskRef): BrokerAppToolsRouteV1 | null;
     /** The bridge provides current official quota facts after reducing them locally. */
@@ -257,12 +290,7 @@ export declare class AccountsBrokerV1 {
     /** Reconcile volatile pool counters with the validated durable ledger. */
     syncAssignedTaskCounts(counts: Readonly<Record<string, number>>): void;
     close(): void;
-    /**
-     * The app-server connection is the authoritative renderer lease. Control
-     * socket churn does not call this method, so a second authenticated channel
-     * cannot accidentally evict a live desktop. Pending unsent work is
-     * cancelled; a forwarding receipt remains terminally ambiguous.
-     */
+    /** Last transport closure cancels unsent work while preserving forwarding ambiguity. */
     disconnectRenderer(rendererRef: OpaqueRendererRef): void;
     /** Public for deterministic owner lifecycle tests and timer-free process hosts. */
     sweep(): void;

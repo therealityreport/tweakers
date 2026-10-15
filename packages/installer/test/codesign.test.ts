@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   DEFAULT_LOCAL_SIGNING_IDENTITY,
+  CODE_MODE_HOST_ENTITLEMENTS,
+  CODE_MODE_HOST_SIGNING_IDENTIFIER,
+  codeModeHostSigningCommands,
+  hasExactCodeModeHostSigningPosture,
+  verifyCodeModeHostSigningPosture,
   assertExactPortableEntitlements,
   assertOpenAIDeveloperIdSourceTrust,
   assertPortableEntitlements,
@@ -30,14 +35,19 @@ import {
   signatureInfo,
   signCandidateReceiptResourceBundle,
   signCodexApp,
+  signDeveloperIdBackend,
+  signDeveloperIdCodeModeHost,
   restoreVerifiedSignedBackend,
+  restoreVerifiedSignedCodeModeHost,
   stableDesignatedRequirement,
   verifyCandidateReceiptResourceBundle,
   verifySignature,
   withRestoredUserKeychainPreferences,
   type SecurityCommandRunner,
+  type CodeModeHostSigningPostureEvidence,
 } from "../src/codesign";
 import { readPlist, writePlist } from "../src/plist";
+import { captureOfficialBundledBackendClosure, assertOfficialBundledBackendSigningClosure, NATIVE_CODEX_BACKEND, NATIVE_CODE_MODE_HOST, NATIVE_CODEX_CLI_ROOT } from "../src/native-bundled-backend.js";
 
 test("parseCodeSigningIdentities extracts valid code signing identities", () => {
   const identities = parseCodeSigningIdentities(`
@@ -526,6 +536,68 @@ test("nested Electron helpers preserve the same exact portable entitlement set",
   );
 });
 
+test("derived signing strips the reviewed Communication Notifications capability without changing portable flags", () => {
+  const portable = {
+    "com.apple.security.app-sandbox": false,
+    "com.apple.security.automation.apple-events": true,
+    "com.apple.security.cs.allow-jit": true,
+    "com.apple.security.cs.allow-unsigned-executable-memory": true,
+    "com.apple.security.device.audio-input": true,
+    "com.apple.security.device.camera": true,
+    "com.apple.security.files.user-selected.read-write": true,
+    "com.apple.security.network.client": true,
+    "com.apple.security.personal-information.calendars": true,
+  };
+  for (const communication of [true, false]) {
+    const source = {
+      ...portable,
+      "com.apple.application-identifier": "TEAM.com.openai.codex",
+      "com.apple.developer.team-identifier": "TEAM",
+      "com.apple.security.application-groups": ["TEAM.notifications"],
+      "keychain-access-groups": ["TEAM.com.openai.codex"],
+      "com.apple.developer.aps-environment": "production",
+      "com.apple.developer.usernotifications.communication": communication,
+    };
+    const original = structuredClone(source);
+    for (const transform of [portableEntitlements, portableNestedEntitlements]) {
+      assert.deepEqual(transform(source, "strict"), portable);
+      assert.deepEqual(transform(source, "contained"), {
+        ...portable,
+        "com.apple.security.cs.disable-library-validation": true,
+      });
+    }
+    assert.deepEqual(source, original);
+  }
+});
+
+test("derived signing rejects malformed Communication Notifications values before stripping", () => {
+  for (const value of ["true", 0, null, {}, []]) {
+    for (const transform of [portableEntitlements, portableNestedEntitlements]) {
+      for (const posture of ["strict", "contained"] as const) {
+        assert.throws(
+          () => transform({ "com.apple.developer.usernotifications.communication": value }, posture),
+          /Communication Notifications entitlement must be a boolean/,
+        );
+      }
+    }
+  }
+});
+
+test("final signing audits reject Communication Notifications and related unknown capabilities", () => {
+  const communicationKey = "com.apple.developer.usernotifications.communication";
+  for (const value of [true, false]) {
+    assert.throws(() => assertPortableEntitlements({ [communicationKey]: value }), /Non-portable/);
+    assert.throws(() => assertExactPortableEntitlements({}, { [communicationKey]: value }), /Non-portable/);
+  }
+  for (const key of ["com.apple.developer.usernotifications.filtering", "com.apple.developer.usernotifications.critical-alerts"]) {
+    assert.throws(() => assertPortableEntitlements({ [key]: true }), /Unreviewed non-portable/);
+    assert.throws(() => assertExactPortableEntitlements({}, { [key]: true }), /Unreviewed non-portable/);
+    for (const transform of [portableEntitlements, portableNestedEntitlements]) {
+      assert.throws(() => transform({ [key]: true }), /Unreviewed non-portable/);
+    }
+  }
+});
+
 test("OpenAI Developer ID source trust requires strict verification and Gatekeeper", () => {
   const evidence = {
     signature: {
@@ -700,7 +772,7 @@ test("contained signing identity is passed to codesign with an explicit keychain
 });
 
 
-test("baseline maintenance preserves exact signed backend bytes through outer signing", (t) => {
+test("baseline maintenance preserves the receipt-bound backend and helper through outer signing", (t) => {
   const identity = findDisposableSigningIdentity(t);
   if (!identity) return;
   const root = mkdtempSync(join(tmpdir(), "tweakers-retained-backend-"));
@@ -712,13 +784,135 @@ test("baseline maintenance preserves exact signed backend bytes through outer si
     copyFileSync("/usr/bin/true", source);
     assert.equal(spawnSync("codesign", ["--force", "--sign", identity.hash, "--identifier", "co.tweakers.retained-backend", source]).status, 0);
     copyFileSync(source, target);
+    const helperSource = join(root, "retained-helper"), helperTarget = join(app, "Contents", "Resources", "codex-code-mode-host");
+    copyFileSync("/usr/bin/true", helperSource);
+    assert.equal(spawnSync("codesign", ["--force", "--sign", identity.hash, "--identifier", "co.tweakers.retained-helper", helperSource]).status, 0);
+    copyFileSync(helperSource, helperTarget);
     writePlist(join(app, "Contents", "Info.plist"), { CFBundleIdentifier: "co.tweakers.maintenance-test", CFBundleExecutable: "Audit", CFBundlePackageType: "APPL" });
     assert.equal(spawnSync("codesign", ["--force", "--sign", identity.hash, app]).status, 0);
     const bytes = readFileSync(source), sha256 = createHash("sha256").update(bytes).digest("hex");
+    const helperBytes = readFileSync(helperSource), helperSha256 = createHash("sha256").update(helperBytes).digest("hex");
     assert.throws(() => restoreVerifiedSignedBackend(app, { sourcePath: source, sha256: "0".repeat(64) }, identity.hash), /signature or bytes changed/);
     assert.throws(() => restoreVerifiedSignedBackend(app, { sourcePath: source, sha256 }, "0".repeat(40)), /signature or bytes changed/);
-    signCodexApp(app, { preparedIdentity: { ...identity, created: false }, signingPosture: "strict", retainedSignedBackend: { sourcePath: source, sha256 } });
+    assert.throws(() => restoreVerifiedSignedBackend(app, { sourcePath: source, sha256, certificateSha1: "0".repeat(40) }, identity.hash), /signature or bytes changed/);
+    assert.throws(() => restoreVerifiedSignedBackend(app, { sourcePath: source, sha256, certificateSha1: "0".repeat(40) }, identity.hash,
+      { certificate: () => "0".repeat(40) }), /signature or bytes changed/);
+    // A separately pinned backend is independent of the outer app certificate.
+    restoreVerifiedSignedBackend(app, { sourcePath: source, sha256, certificateSha1: identity.hash }, "0".repeat(40));
+    assert.throws(() => restoreVerifiedSignedCodeModeHost(app, { sourcePath: helperSource, sha256: "0".repeat(64), certificateSha1: identity.hash }, identity.hash), /signature or bytes changed/);
+    assert.throws(() => restoreVerifiedSignedCodeModeHost(app, { sourcePath: helperSource, sha256: helperSha256, certificateSha1: "0".repeat(40) }, identity.hash), /signature or bytes changed/);
+    signCodexApp(app, { preparedIdentity: { ...identity, created: false }, signingPosture: "strict",
+      retainedSignedBackend: { sourcePath: source, sha256, certificateSha1: identity.hash },
+      retainedSignedCodeModeHost: { sourcePath: helperSource, sha256: helperSha256, certificateSha1: identity.hash },
+    });
     assert.deepEqual(readFileSync(target), bytes);
+    assert.deepEqual(readFileSync(helperTarget), helperBytes);
+    assert.equal(createHash("sha256").update(readFileSync(helperTarget)).digest("hex"), helperSha256);
+    assert.equal(codeSigningCertificateLeafHash(helperTarget), identity.hash.toUpperCase());
     assert.equal(verifySignature(app).ok, true);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("inside-out candidate signing preserves the supplied native CLI bundle and helper signatures", (t) => {
+  const identity = findDisposableSigningIdentity(t);
+  if (!identity) return;
+  const root = mkdtempSync(join(tmpdir(), "tweakers-native-signing-"));
+  try {
+    const source = join(root, "Source.app"), candidate = join(root, "Candidate.app");
+    const nativeApp = join(source, NATIVE_CODEX_CLI_ROOT, "CodexCLI.app");
+    mkdirSync(join(source, "Contents/MacOS"), { recursive: true });
+    mkdirSync(join(nativeApp, "Contents/MacOS"), { recursive: true });
+    mkdirSync(join(nativeApp, "Contents/Resources"));
+    mkdirSync(join(source, NATIVE_CODEX_CLI_ROOT, "bin"));
+    copyFileSync("/usr/bin/true", join(source, "Contents/MacOS/Main"));
+    copyFileSync("/usr/bin/true", join(source, NATIVE_CODEX_BACKEND));
+    copyFileSync("/usr/bin/true", join(source, NATIVE_CODE_MODE_HOST));
+    writeFileSync(join(nativeApp, "Contents/Resources/helper-context.json"), "unchanged supplied helper resources");
+    writePlist(join(nativeApp, "Contents/Info.plist"), { CFBundleIdentifier: "co.tweakers.test.native-cli", CFBundleExecutable: "codex", CFBundlePackageType: "APPL" });
+    writePlist(join(source, "Contents/Info.plist"), { CFBundleIdentifier: "co.tweakers.test.native-source", CFBundleExecutable: "Main", CFBundlePackageType: "APPL" });
+    const nativeEntitlements = join(root, "native-entitlements.plist"), outerEntitlements = join(root, "outer-entitlements.plist");
+    // This source entitlement would be stripped by the ordinary portable walk.
+    writePlist(nativeEntitlements, { "application-identifier": "2DC432GLL2.co.tweakers.test.native-cli" });
+    writePlist(outerEntitlements, {});
+    signDisposableCode(join(source, NATIVE_CODEX_BACKEND), identity, nativeEntitlements);
+    signDisposableCode(nativeApp, identity, nativeEntitlements);
+    signDisposableCode(join(source, NATIVE_CODE_MODE_HOST), identity, nativeEntitlements);
+    signDisposableCode(source, identity, outerEntitlements);
+    const closure = captureOfficialBundledBackendClosure(source)!;
+    cpSync(source, candidate, { recursive: true, verbatimSymlinks: true });
+    signCodexApp(candidate, { preparedIdentity: { ...identity, created: false }, signingPosture: "strict", officialBundledBackend: closure });
+    assertOfficialBundledBackendSigningClosure(candidate, closure);
+    assert.equal(verifySignature(candidate).ok, true);
+    assert.deepEqual(readDisposableEntitlements(join(candidate, NATIVE_CODEX_BACKEND)), readDisposableEntitlements(join(source, NATIVE_CODEX_BACKEND)));
+    assert.deepEqual(readDisposableEntitlements(join(candidate, NATIVE_CODE_MODE_HOST)), readDisposableEntitlements(join(source, NATIVE_CODE_MODE_HOST)));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("backend signing rejects local or newly created identities before touching the binary", () => {
+  assert.throws(() => signDeveloperIdBackend("/does-not-exist", { name: DEFAULT_LOCAL_SIGNING_IDENTITY, hash: "0".repeat(40), created: false }), /preexisting Developer ID/);
+  assert.throws(() => signDeveloperIdBackend("/does-not-exist", { name: "Developer ID Application: Example (ABCDEFGHIJ)", hash: "0".repeat(40), created: true }), /preexisting Developer ID/);
+});
+
+test("code-mode helper posture requires the exact native entitlements and hardened Developer ID signature", () => {
+  const evidence: CodeModeHostSigningPostureEvidence = {
+    signature: { ok: true, adHoc: false, teamIdentifier: "ABCDEFGHIJ",
+      authority: ["Developer ID Application: Example (ABCDEFGHIJ)"],
+      output: `Identifier=${CODE_MODE_HOST_SIGNING_IDENTIFIER}\nCodeDirectory v=20500 flags=0x10000(runtime) hashes=1+7\n    -7=${"a".repeat(64)}\n` },
+    entitlements: { ...CODE_MODE_HOST_ENTITLEMENTS }, strictVerification: { ok: true },
+  };
+  assert.equal(hasExactCodeModeHostSigningPosture(evidence), true);
+  for (const entitlements of [null, {},
+    { "com.apple.security.cs.allow-jit": true },
+    { "com.apple.security.cs.allow-unsigned-executable-memory": true },
+    { ...CODE_MODE_HOST_ENTITLEMENTS, "com.apple.security.cs.allow-jit": false },
+    { ...CODE_MODE_HOST_ENTITLEMENTS, "com.apple.security.cs.allow-unsigned-executable-memory": false },
+    { ...CODE_MODE_HOST_ENTITLEMENTS, "com.apple.security.cs.allow-jit": "true" },
+    { ...CODE_MODE_HOST_ENTITLEMENTS, "com.apple.security.cs.allow-unsigned-executable-memory": "true" },
+    { ...CODE_MODE_HOST_ENTITLEMENTS, "com.apple.security.cs.disable-library-validation": true },
+  ]) assert.equal(hasExactCodeModeHostSigningPosture({ ...evidence, entitlements }), false);
+  for (const signature of [
+    { ...evidence.signature, ok: false }, { ...evidence.signature, adHoc: true },
+    { ...evidence.signature, teamIdentifier: null },
+    { ...evidence.signature, authority: [DEFAULT_LOCAL_SIGNING_IDENTITY] },
+    { ...evidence.signature, output: evidence.signature.output.replace("0x10000(runtime)", "0x0(none)") },
+    { ...evidence.signature, output: evidence.signature.output.replace("0x10000", "0x0") },
+    { ...evidence.signature, output: evidence.signature.output.replace(CODE_MODE_HOST_SIGNING_IDENTIFIER, "co.tweakers.codex-backend") },
+    { ...evidence.signature, output: evidence.signature.output.replace(/\s*-7=[a-f0-9]+/, "") },
+    { ...evidence.signature, output: evidence.signature.output.replace("a".repeat(64), "0".repeat(64)) },
+  ]) assert.equal(hasExactCodeModeHostSigningPosture({ ...evidence, signature }), false);
+  assert.equal(hasExactCodeModeHostSigningPosture({ ...evidence, strictVerification: { ok: false } }), false);
+});
+
+test("code-mode helper signing commands pin the preexisting certificate, identifier, DER and runtime", () => {
+  const identity = { name: "Developer ID Application: Example (ABCDEFGHIJ)", hash: "a".repeat(40),
+    created: false, keychainPath: "/private/helper-signing.keychain-db" };
+  const commands = codeModeHostSigningCommands("/private/helper", identity, "/private/helper.plist");
+  assert.deepEqual(commands.sign.slice(0, 6), ["--force", "--sign", identity.hash.toUpperCase(), "--keychain", identity.keychainPath, "--identifier"]);
+  assert.equal(commands.sign[6], CODE_MODE_HOST_SIGNING_IDENTIFIER);
+  assert.deepEqual(commands.sign.slice(9, 14), ["runtime", "--entitlements", "/private/helper.plist", "--generate-entitlement-der", "--requirements"]);
+  assert.match(commands.sign[14]!, new RegExp(`certificate leaf = H"${identity.hash.toUpperCase()}"`));
+  assert.deepEqual(commands.verify.slice(0, 3), ["--verify", "--strict", "-R"]);
+  assert.match(commands.verify[3]!, /identifier "co\.tweakers\.codex-code-mode-host"/);
+  assert.ok(commands.verify[3]!.includes(`certificate leaf = H"${identity.hash.toUpperCase()}"`));
+  assert.deepEqual(Object.keys(CODE_MODE_HOST_ENTITLEMENTS).sort(), ["com.apple.security.cs.allow-jit", "com.apple.security.cs.allow-unsigned-executable-memory"]);
+  assert.throws(() => signDeveloperIdCodeModeHost("/does-not-exist", { ...identity, created: true }), /preexisting Developer ID/);
+  assert.throws(() => signDeveloperIdCodeModeHost("/does-not-exist", { ...identity, name: DEFAULT_LOCAL_SIGNING_IDENTITY }), /preexisting Developer ID/);
+});
+
+test("code-mode helper posture inspection fails closed on command, extraction and verification errors", () => {
+  const metadata = `Identifier=${CODE_MODE_HOST_SIGNING_IDENTIFIER}\nCodeDirectory v=20500 flags=0x10000(runtime) hashes=1+7\n    -7=${"a".repeat(64)}\nAuthority=Developer ID Application: Example (ABCDEFGHIJ)\nTeamIdentifier=ABCDEFGHIJ\n`;
+  const deps = {
+    run: () => ({ status: 0, stdout: "", stderr: metadata }),
+    readEntitlements: () => ({ ...CODE_MODE_HOST_ENTITLEMENTS }),
+    verify: () => ({ ok: true, output: "verified" }),
+  };
+  assert.equal(verifyCodeModeHostSigningPosture("/private/helper", deps), true);
+  assert.equal(verifyCodeModeHostSigningPosture("/private/helper", { ...deps,
+    run: () => ({ status: 1, stdout: "", stderr: metadata }) }), false);
+  assert.equal(verifyCodeModeHostSigningPosture("/private/helper", { ...deps,
+    run: () => { throw new Error("command failed"); } }), false);
+  assert.equal(verifyCodeModeHostSigningPosture("/private/helper", { ...deps,
+    readEntitlements: () => { throw new Error("malformed entitlement extraction"); } }), false);
+  assert.equal(verifyCodeModeHostSigningPosture("/private/helper", { ...deps,
+    verify: () => ({ ok: false, output: "invalid DER signature" }) }), false);
 });

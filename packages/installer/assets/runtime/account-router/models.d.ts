@@ -12,6 +12,10 @@ export declare class AccountModelCatalogsV1 {
     private readonly now;
     private readonly cache;
     private readonly inFlight;
+    private generation;
+    get revision(): number;
+    /** Auth, backend and policy changes also revoke outstanding catalog reads. */
+    invalidate(account?: OpaqueAccountId): void;
     constructor(fetchCatalog: (account: OpaqueAccountId) => Promise<unknown>, now?: () => number);
     support(model: string, accounts: readonly OpaqueAccountId[]): Promise<AccountModelSupportV1>;
     private catalog;

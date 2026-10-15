@@ -24,8 +24,8 @@ import {
   fingerprintPromotionPolicyPath as fingerprintInstallerPolicy,
   trustedPromotionPolicyMode as installerTrustedPolicyMode,
 } from "../src/promotion-policy";
-import promotionHealth from "../../runtime/src/promotion-health";
-import runtimePolicy from "../../runtime/src/promotion-policy";
+import * as promotionHealth from "../../runtime/src/promotion-health";
+import * as runtimePolicy from "../../runtime/src/promotion-policy";
 import { inspectUserQuestionsSource } from "../src/user-questions-source";
 
 const { answerPromotionHealthRequest, PROMOTION_SURFACE_NAMES } = promotionHealth;
@@ -413,9 +413,9 @@ test("schema-v2 request and receipt align installer expectation with runtime sem
     const health = join(root, "health");
     mkdirSync(health);
     writeFileSync(join(health, "request.json"), JSON.stringify({
+      ...expectation,
       schemaVersion: 2,
       requestedAt: "2026-07-21T23:00:00.000Z",
-      ...expectation,
     }), { mode: 0o600 });
     chmodSync(join(health, "request.json"), 0o600);
     const accepted = await answerPromotionHealthRequest(root, {

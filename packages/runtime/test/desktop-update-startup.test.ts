@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import asar from "@electron/asar";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
@@ -10,6 +11,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -27,6 +29,15 @@ import {
   publishIndependentTweakersRuntimeReadyReceipt,
   type DesktopUpdateStartupEvent,
 } from "../src/desktop-update-startup";
+import {
+  combinedPayloadIdentity,
+  validatePrebuiltCombinedCandidate,
+  type AcceptedPrebuiltCodexBuildReceipt,
+} from "../../installer/src/prebuilt-combined-candidate";
+import { assertAcceptedSharedNativeBackendTransitionShape } from "../../installer/src/shared-native-backend-transition";
+import { acceptedOfficialBundledPayloadText, type AcceptedBackendTransitionJournalBindingV1,
+  type OfficialBundledCandidateAuthorityV2 } from "../../sdk/src/accepted-backend-transition-contract";
+import type { AcceptedRuntimeRepairBootstrapProjection } from "../src/accepted-runtime-repair-bootstrap";
 
 const promotionNames = ["runtime", "tweaks", "state.json", "config.json", "app"] as const;
 const immutablePromotionNames = ["runtime", "tweaks", "state.json", "app"] as const;
@@ -57,7 +68,11 @@ test("runtime-ready publication preserves the manager-owned expectation", () => 
   }
 });
 
-function derivedVariantBootstrapFixture(root: string, version: 2 | 3 = 3): {
+/** Accepted backend transitions are journaled only under the managed Manager
+ * layout with UUID transaction ids; superseded-history reads fail closed otherwise. */
+const ACCEPTED_TRANSITION_JOURNAL_ID = "4f2c9b7e-3d1a-4e8b-9c6f-5a7d2e1b0c38";
+
+function derivedVariantBootstrapFixture(root: string, version: 2 | 3 = 3, managed = false, id = "bootstrap-fixture"): {
   userRoot: string;
   target: string;
   resourcesPath: string;
@@ -66,10 +81,9 @@ function derivedVariantBootstrapFixture(root: string, version: 2 | 3 = 3): {
   activePath: string;
   stagedActivePath: string;
 } {
-  const userRoot = join(root, "state");
+  const userRoot = managed ? join(root, "manager", "variants", "tweakers") : join(root, "state");
   const target = join(root, "Tweakers.app");
   const resourcesPath = join(target, "Contents", "Resources");
-  const id = "bootstrap-fixture";
   const journalRoot = join(userRoot, "transactions", "variant-promotion");
   const activePath = join(journalRoot, "active.json");
   const buildRoot = join(userRoot, "builds", id);
@@ -193,6 +207,55 @@ function markFixtureProvisionallyPromoted(fixture: ReturnType<typeof derivedVari
     expectedTweakIds: ["co.tweakers.account-switcher"],
     createdAt: "2026-09-03T12:00:00.000Z",
   });
+}
+
+/** Use the maintained authority producer, not a truncated bootstrap-only lane. */
+function producedAcceptedTransition(
+  root: string,
+  fixture: ReturnType<typeof derivedVariantBootstrapFixture>,
+): AcceptedBackendTransitionJournalBindingV1 {
+  const source = join(root, "accepted-transition-producer");
+  const runtimeRoot = join(source, "runtime"), sourceAppRoot = join(source, "ChatGPT.app");
+  mkdirSync(runtimeRoot, { recursive: true });mkdirSync(sourceAppRoot);
+  const binaryPath = join(source, "codex"), helperPath = join(source, "codex-code-mode-host");
+  const receiptPath = join(source, "accepted-build.json"), documentPath = join(runtimeRoot, "runtime-fingerprint.json");
+  writeFileSync(binaryPath, "accepted-backend");writeFileSync(helperPath, "accepted-helper");writeFileSync(documentPath, "{}\n");
+  const digest = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+  const signature = { identity: "fixture-signing", teamIdentifier: null, designatedRequirement: null };
+  const receipt: AcceptedPrebuiltCodexBuildReceipt = {
+    schemaVersion: 2, kind: "tweakers-prebuilt-codex-build", status: "accepted", acceptedAt: "2026-10-12T07:23:35.880Z",
+    verification: { level: "source-verified", installedAcceptance: "required" },
+    upstream: { repository: "https://github.com/openai/codex.git", tag: "rust-v0.162.0-alpha.17.2", commit: "d".repeat(40) },
+    source: { commit: "d".repeat(40), tree: "e".repeat(40), cargoLockSha256: "a".repeat(64), reviewedDiffSha256: "b".repeat(64), patchSeriesSha256: "c".repeat(64) },
+    build: { command: "cargo build --locked --release --package codex-cli --bin codex --package codex-code-mode-host --bin codex-code-mode-host", toolchain: "fixture-rustc", architecture: "arm64" },
+    tests: [{ name: "lifecycle", command: "cargo test --locked --lib lifecycle", receiptSha256: "f".repeat(64), status: "passed" }],
+    binary: { path: binaryPath, sha256: digest(binaryPath), version: "0.162.0-alpha.17.2", architecture: "arm64", signature },
+    closure: { codeModeHost: { path: helperPath, sha256: digest(helperPath), architecture: "arm64", signature }, resources: [] },
+    runtime: { sourceRoot: runtimeRoot, fingerprint: "1".repeat(64), fileCount: 428, documentSha256: digest(documentPath) },
+  };
+  writePrivateJson(receiptPath, receipt);
+  const authority = validatePrebuiltCombinedCandidate({
+    transactionId: "b54072f1-75be-474e-9076-653cf4e325b6", binaryPath, receiptPath,
+    expectedBinarySha256: receipt.binary.sha256, expectedReceiptSha256: digest(receiptPath), expectedVersion: receipt.binary.version,
+    expectedArchitecture: "arm64", expectedRuntimeFingerprint: receipt.runtime.fingerprint,
+    expectedRuntimeFileCount: receipt.runtime.fileCount, expectedRuntimeDocumentSha256: receipt.runtime.documentSha256,
+    expectedSourceAppFingerprint: "2".repeat(64), expectedBundleId: "com.openai.codex",
+  }, { installerPayloadHash: "3".repeat(64), runtimeRoot, sourceAppRoot, now: new Date("2026-10-12T08:00:00Z") }, {
+    fingerprintFile: digest, probeVersion: () => receipt.binary.version, probeArchitecture: () => "arm64",
+    verifyBackendSignature: () => true, verifyCodeModeHostPosture: () => true,
+    sourceAppFingerprint: () => "2".repeat(64), sourceAppBundleId: () => "com.openai.codex",
+    runtimeEvidence: () => ({ fingerprint: receipt.runtime.fingerprint, fileCount: receipt.runtime.fileCount }),
+  });
+  const lane = { version: 1 as const, identity: { target: fixture.target, userRoot: fixture.userRoot, brokerRoot: join(fixture.userRoot, "accounts-broker") },
+    authority, priorRegistrationFingerprint: `sha256:${"4".repeat(64)}` as const, priorResolverBinarySha256: "5".repeat(64) };
+  assertAcceptedSharedNativeBackendTransitionShape(lane);
+  // Independent golden serialization protects existing signed identities against reordered payload keys.
+  assert.equal(authority.payloadIdentity, createHash("sha256").update(JSON.stringify({
+    schemaVersion: authority.schemaVersion, transactionId: authority.transactionId, installerPayloadHash: authority.installerPayloadHash,
+    acceptedBuildReceipt: authority.acceptedBuildReceipt, backend: authority.backend, closure: authority.closure,
+    runtime: authority.runtime, sourceApp: authority.sourceApp,
+  })).digest("hex"));
+  return { lane, operationId: "6bc2dbac-894a-46cd-a2ae-bfcd1f6796b1" };
 }
 
 async function replaceFixtureAppAsarWithPhysicalArchive(
@@ -627,4 +690,245 @@ test("startup launcher failures are captured as diagnostics instead of escaping"
     error: "launchctl denied",
     errorCode: "TWEAKERS_DESKTOP_UPDATE_LAUNCH_SUBMISSION_FAILED",
   }]);
+});
+
+
+test("Doctor candidate bootstrap preserves exact path binding after staging is consumed", () => {
+  for (const provisional of [false, true]) {
+    const root = mkdtempSync(join(tmpdir(), "tweakers-doctor-bootstrap-"));
+    try {
+      const fixture = derivedVariantBootstrapFixture(root, 3, true);
+      if (provisional) markFixtureProvisionallyPromoted(fixture);
+      const candidate = join(root, "manager", "doctor", "jobs", "1ce0c611-1b13-42d5-a3ba-5a95c8e9c54e", "candidate", "Tweakers.app");
+      const journal = JSON.parse(readFileSync(fixture.journalPath, "utf8"));
+      journal.candidate = candidate;
+      const app = journal.entries.find((entry: {name: string}) => entry.name === "app");
+      app.source = candidate;
+      const check = () => assertTweakersVariantBootstrap({environment: fixture.environment, resourcesPath: fixture.resourcesPath});
+      writePrivateJson(fixture.journalPath, journal);
+      assert.doesNotThrow(check);
+      mkdirSync(dirname(candidate), {recursive: true});
+      assert.doesNotThrow(check);
+      app.source = candidate + ".other";
+      writePrivateJson(fixture.journalPath, journal);
+      assert.throws(check, /generation path is invalid/);
+      for (const invalid of [candidate.replace("1ce0c611-1b13-42d5-a3ba-5a95c8e9c54e", "------------------------------------"), candidate.replace("/candidate/", "/candidate/../candidate/")]) {
+        journal.candidate = app.source = invalid;
+        writePrivateJson(fixture.journalPath, journal);
+        assert.throws(check, /path binding is invalid/);
+      }
+      journal.candidate = app.source = candidate;
+      writePrivateJson(fixture.journalPath, journal);
+      const doctor = join(root, "manager", "doctor");
+      renameSync(doctor, doctor + "-moved");
+      symlinkSync(doctor + "-moved", doctor);
+      assert.throws(check, /symlinked promotion candidate/);
+    } finally { rmSync(root, {recursive: true, force: true}); }
+  }
+});
+
+test("accepted backend producer journals bootstrap provisionally and after commit without rebinding history", () => {
+  for (const provisional of [false, true]) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "accepted-transition-bootstrap-")));
+    try {
+      const fixture = derivedVariantBootstrapFixture(root, 3, true, ACCEPTED_TRANSITION_JOURNAL_ID);
+      const binding = producedAcceptedTransition(root, fixture);
+      if (provisional) {
+        markFixtureProvisionallyPromoted(fixture);
+        const path = join(fixture.userRoot, "runtime-ready-expectation.json");
+        const expectation = JSON.parse(readFileSync(path, "utf8"));
+        expectation.operationId = binding.operationId;
+        writePrivateJson(path, expectation);
+      }
+      const journal = JSON.parse(readFileSync(fixture.journalPath, "utf8"));
+      journal.acceptedBackendTransition = binding;
+      writePrivateJson(fixture.journalPath, journal);
+      const historical = JSON.parse(JSON.stringify({ ...journal, phase: "committed", acceptedBackendTransition: {
+        ...binding, operationId: "0d9fcb3a-1a57-4e0d-9ae4-18ac8b9622c8",
+      } }).replaceAll(ACCEPTED_TRANSITION_JOURNAL_ID, "0a5a1d2e-7c3b-4f61-9d48-2b6c8e1f0a93"));
+      writePrivateJson(join(dirname(fixture.journalPath), `${historical.id}.json`), historical);
+      assert.doesNotThrow(() => assertTweakersVariantBootstrap({ environment: fixture.environment, resourcesPath: fixture.resourcesPath }));
+      if (!provisional) assert.equal(existsSync(join(fixture.userRoot, "runtime-ready-expectation.json")), false);
+      // Admitting transition metadata must not weaken the materialized generation guard.
+      appendFileSync(join(fixture.userRoot, "runtime", "marker"), "tamper");
+      assert.throws(() => assertTweakersVariantBootstrap({ environment: fixture.environment, resourcesPath: fixture.resourcesPath }), /generation fingerprint mismatch/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test("official supplied-backend journal admits exact bootstrap and retains generation and root guards", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "official-transition-bootstrap-")));
+  try {
+    const fixture = derivedVariantBootstrapFixture(root, 3, true, ACCEPTED_TRANSITION_JOURNAL_ID);
+    const legacy = producedAcceptedTransition(root, fixture);
+    const source = legacy.lane.authority.sourceApp.path;
+    const backendPath = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex" as const;
+    const helperPath = "Contents/Resources/codex-cli/bin/codex-code-mode-host" as const;
+    const seal = {sha256: "1".repeat(64), entries: 4, bytes: "100"};
+    const bare: Omit<OfficialBundledCandidateAuthorityV2, "payloadIdentity"> = {
+      schemaVersion: 2, kind: "official-bundled", transactionId: "official-bootstrap", installerPayloadHash: "2".repeat(64),
+      backend: {sourcePath: join(source, backendPath), sha256: "3".repeat(64), version: "0.162.0-alpha.17.2", architecture: "arm64", certificateSha1: "A".repeat(40)},
+      closure: {kind: "official-bundled", sourceAppRoot: source, resourceRelativePath: "Contents/Resources/codex-cli", resourceTree: seal,
+        backend: {relativePath: backendPath, sha256: "3".repeat(64), certificateSha1: "A".repeat(40)},
+        codeModeHost: {relativePath: helperPath, sha256: "4".repeat(64), certificateSha1: "B".repeat(40)}},
+      nativePackage: {relativePath: "Contents/Resources/codex-cli/codex-package.json", sha256: "5".repeat(64), layoutVersion: 1, version: "0.162.0-alpha.17.2", target: "aarch64-apple-darwin"},
+      runtime: {...legacy.lane.authority.runtime, adapterVersion: "official-bundled-adapter-v1"},
+      sourceApp: {...legacy.lane.authority.sourceApp, treeSeal: seal},
+    };
+    const binding = {operationId: legacy.operationId, lane: {version: 2 as const, resolverProtocol: "official-bundled-v1" as const,
+      identity: legacy.lane.identity, priorRegistrationFingerprint: legacy.lane.priorRegistrationFingerprint,
+      priorResolverBinarySha256: legacy.lane.priorResolverBinarySha256,
+      authority: {...bare, payloadIdentity: createHash("sha256").update(acceptedOfficialBundledPayloadText(bare)).digest("hex")}}};
+    const journal = JSON.parse(readFileSync(fixture.journalPath, "utf8"));
+    writePrivateJson(fixture.journalPath, {...journal, acceptedBackendTransition: binding});
+    assert.doesNotThrow(() => assertTweakersVariantBootstrap({environment: fixture.environment, resourcesPath: fixture.resourcesPath}));
+    writePrivateJson(fixture.journalPath, {...journal, acceptedBackendTransition: {...binding, lane: {...binding.lane,
+      identity: {...binding.lane.identity, target: join(root, "foreign.app")}}}});
+    assert.throws(() => assertTweakersVariantBootstrap({environment: fixture.environment, resourcesPath: fixture.resourcesPath}), /bind its journal/);
+    writePrivateJson(fixture.journalPath, {...journal, acceptedBackendTransition: binding});
+    appendFileSync(join(fixture.userRoot, "runtime", "marker"), "tamper");
+    assert.throws(() => assertTweakersVariantBootstrap({environment: fixture.environment, resourcesPath: fixture.resourcesPath}), /generation fingerprint mismatch/);
+  } finally {rmSync(root, {recursive: true, force: true});}
+});
+
+test("accepted runtime repair schema6 uses exact producer journal projection provisionally and after commit", () => {
+  for (const committed of [false, true]) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "accepted-runtime-repair-projection-")));
+    try {
+      const fixture = derivedVariantBootstrapFixture(root, 3, true, ACCEPTED_TRANSITION_JOURNAL_ID);
+      const configPath = join(fixture.userRoot, "config.json"), originalConfigBytes = readFileSync(configPath);
+      chmodSync(configPath, 0o600);
+      const binding = producedAcceptedTransition(root, fixture);
+      markFixtureProvisionallyPromoted(fixture);
+      const original = JSON.parse(readFileSync(fixture.journalPath, "utf8"));
+      original.entries.find((entry: any) => entry.name === "config.json").desired = fingerprintTweakersVariantGeneration(configPath);
+      original.acceptedBackendTransition = binding;
+      original.activeReceipt.hadDestination = true;
+      original.activeReceipt.previous = fingerprintTweakersVariantGeneration(fixture.stagedActivePath);
+      writePrivateJson(fixture.activePath, original.activeReceipt.expected);
+      writePrivateJson(fixture.journalPath, original);
+      appendFileSync(join(fixture.userRoot, "runtime", "marker"), "repaired-runtime");
+      const repaired = fingerprintTweakersVariantGeneration(join(fixture.userRoot, "runtime"));
+      const repairId = "00000000-0000-4000-8000-000000000003", hash = "a".repeat(64);
+      const childRoot = join(fixture.userRoot, "builds", original.id, "runtime-repair", "accepted", "operations", repairId);
+      mkdirSync(childRoot, { recursive: true, mode: 0o700 });
+      const readyBinding = { repairId, headSha256: hash, intentSha256: hash, authorityReceiptSha256: hash };
+      const effectiveActive = { ...original.activeReceipt.expected, version: 4,
+        runtimeRepair: { repairId, authorityReceiptSha256: hash },
+        entries: original.activeReceipt.expected.entries.map((entry: any) => entry.name === "runtime" ? { ...entry, fingerprint: repaired } : entry) };
+      const source = join(childRoot, "effective-active-receipt.json");
+      writePrivateJson(source, effectiveActive);
+      const desired = fingerprintTweakersVariantGeneration(source);
+      const effectiveJournal = { ...original, phase: "committed",
+        entries: original.entries.map((entry: any) => entry.name === "runtime" ? { ...entry, desired: repaired } : entry),
+        activeReceipt: { ...original.activeReceipt, source, archive: join(childRoot, "prior-active-receipt.json"),
+          failed: join(childRoot, "failed-active-receipt.json"), desired, expected: effectiveActive } };
+      const projection = { head: { operationId: binding.operationId, promotionId: original.id, repairId },
+        intent: { authority: { repairedRuntime: { generation: repaired, evidence: { fingerprint: hash } } } },
+        phase: committed ? "committed" : "challenge:published", runtimeRepair: readyBinding,
+        originalJournal: original, effectiveJournal, effectiveActiveReceipt: effectiveActive, childRoot,
+        originalOperationCompleted: false,
+      } as unknown as AcceptedRuntimeRepairBootstrapProjection;
+      const path = join(fixture.userRoot, "runtime-ready-expectation.json");
+      const expectation = { ...JSON.parse(readFileSync(path, "utf8")), schemaVersion: 6, operationId: binding.operationId,
+        accountsBrokerRoot: binding.lane.identity.brokerRoot, activePromotionReceiptSha256: desired.sha256, runtimeRepair: readyBinding };
+      writePrivateJson(path, expectation);
+      if (committed) { writePrivateJson(fixture.activePath, effectiveActive); rmSync(path); }
+      const options = { environment: fixture.environment, resourcesPath: fixture.resourcesPath, runtimeRepairVerifier: () => projection };
+      assert.equal(assertTweakersVariantBootstrap(options)?.phase, projection.phase);
+      const wrongEffective = structuredClone(projection);
+      // Replace only the projected runtime generation; shared original receipt objects remain valid.
+      (wrongEffective.effectiveJournal as any).entries = (wrongEffective.effectiveJournal as any).entries.map((entry: any) =>
+        entry.name === "runtime" ? { ...entry, desired: { ...entry.desired, sha256: "b".repeat(64) } } : entry);
+      assert.throws(() => assertTweakersVariantBootstrap({ ...options, runtimeRepairVerifier: () => wrongEffective }), /projection changed/);
+      if (!committed) {
+        writePrivateJson(path, { ...expectation, runtimeRepair: { ...readyBinding, headSha256: "b".repeat(64) } });
+        assert.throws(() => assertTweakersVariantBootstrap(options), /readiness challenge changed/);
+        writePrivateJson(path, expectation);
+      }
+      writePrivateJson(join(fixture.userRoot, "config.json"), { tweaker: { autoUpdate: false }, tweaks: { "com.example.tweak": { enabled: false } } });
+      assert.throws(() => assertTweakersVariantBootstrap(options), /generation changed/);
+      if (committed) {
+        projection.originalOperationCompleted = true;
+        assert.equal(assertTweakersVariantBootstrap(options)?.phase, "committed");
+        writePrivateJson(join(fixture.userRoot, "config.json"), { tweaks: { "com.example.tweak": { enabled: "forged" } } });
+        assert.throws(() => assertTweakersVariantBootstrap(options), /toggle is malformed/);
+        writePrivateJson(join(fixture.userRoot, "config.json"), { tweaks: { "com.example.tweak": { enabled: true } } });
+      } else {
+        projection.originalOperationCompleted = true;
+        assert.throws(() => assertTweakersVariantBootstrap(options), /generation changed/);
+        projection.originalOperationCompleted = false;
+        // Restore its exact original fixture bytes before the independent tweak check.
+        writeFileSync(configPath, originalConfigBytes);
+      }
+      appendFileSync(join(fixture.userRoot, "tweaks", "marker"), "tamper");
+      assert.throws(() => assertTweakersVariantBootstrap(options), /generation changed/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test("accepted backend bootstrap rejects present null and malformed known nested authority even with recomputed payload hashes", () => {
+  const root = mkdtempSync(join(tmpdir(), "accepted-transition-malformed-"));
+  try {
+    const fixture = derivedVariantBootstrapFixture(root);
+    const binding = producedAcceptedTransition(root, fixture);
+    const original = JSON.parse(readFileSync(fixture.journalPath, "utf8"));
+    const rehash = (mutate: (b: AcceptedBackendTransitionJournalBindingV1) => void) => (b: AcceptedBackendTransitionJournalBindingV1): unknown => {
+      mutate(b);b.lane.authority.payloadIdentity = combinedPayloadIdentity(b.lane.authority);return b;
+    };
+    const mutations: Array<[string, (b: AcceptedBackendTransitionJournalBindingV1) => unknown]> = [
+      ["present null", () => null],
+      ["unknown binding key", b => ({ ...b, unexpected: true })],
+      ["unknown lane key", b => ({ ...b, lane: { ...b.lane, unexpected: true } })],
+      ["lane version", b => ({ ...b, lane: { ...b.lane, version: 2 } })],
+      ["non UUID operation", b => ({ ...b, operationId: "runtime-proof" })],
+      ["noncanonical identity", b => ({ ...b, lane: { ...b.lane, identity: { ...b.lane.identity, brokerRoot: "/tmp/../broker" } } })],
+      ["unknown receipt key", rehash(b => { Object.assign(b.lane.authority.acceptedBuildReceipt, { unexpected: true }); })],
+      ["unknown signature key", rehash(b => { Object.assign(b.lane.authority.backend.signature, { unexpected: true }); })],
+      ["unknown helper key", rehash(b => { Object.assign(b.lane.authority.closure.codeModeHost, { unexpected: true }); })],
+      ["unknown runtime key", rehash(b => { Object.assign(b.lane.authority.runtime, { unexpected: true }); })],
+      ["unknown source app key", rehash(b => { Object.assign(b.lane.authority.sourceApp, { unexpected: true }); })],
+      ["unknown test evidence key", rehash(b => { Object.assign(b.lane.authority.acceptedBuildReceipt.testEvidence[0]!, { status: "passed" }); })],
+      ["wrong helper architecture", rehash(b => { Object.assign(b.lane.authority.closure.codeModeHost, { architecture: "x64" }); })],
+      ["noncanonical receipt path", rehash(b => { b.lane.authority.acceptedBuildReceipt.path = "/tmp/../accepted-build.json"; })],
+      ["traversal resource", rehash(b => { b.lane.authority.closure.resources = [{ relativePath: "../resource", sourcePath: "/tmp/resource", sha256: "a".repeat(64) }]; })],
+      ["unchanged backend", b => ({ ...b, lane: { ...b.lane, priorResolverBinarySha256: b.lane.authority.backend.sha256 } })],
+      ["invalid upstream", rehash(b => { b.lane.authority.acceptedBuildReceipt.upstream.tag = "rust-v0.1.0"; })],
+      ["payload tamper", b => { b.lane.authority.runtime.fileCount++;return b; }],
+    ];
+    for (const [label, mutate] of mutations) {
+      writePrivateJson(fixture.journalPath, { ...original, acceptedBackendTransition: mutate(structuredClone(binding)) });
+      assert.throws(() => assertTweakersVariantBootstrap({ environment: fixture.environment, resourcesPath: fixture.resourcesPath }), /accepted backend transition|Accepted backend transition/, label);
+    }
+    writePrivateJson(fixture.journalPath, { ...original, acceptedBackendTransition: binding, unknownJournalField: true });
+    assert.throws(() => assertTweakersVariantBootstrap({ environment: fixture.environment, resourcesPath: fixture.resourcesPath }), /invalid promotion journal schema/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("accepted backend provisional bootstrap binds journal identity and the current operation and broker", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "accepted-transition-cross-binding-")));
+  try {
+    const fixture = derivedVariantBootstrapFixture(root, 3, true, ACCEPTED_TRANSITION_JOURNAL_ID);
+    const binding = producedAcceptedTransition(root, fixture);
+    markFixtureProvisionallyPromoted(fixture);
+    const expectationPath = join(fixture.userRoot, "runtime-ready-expectation.json");
+    const expectation = JSON.parse(readFileSync(expectationPath, "utf8"));
+    expectation.operationId = binding.operationId;writePrivateJson(expectationPath, expectation);
+    const original = JSON.parse(readFileSync(fixture.journalPath, "utf8"));
+    for (const field of ["target", "userRoot"] as const) {
+      const changed = structuredClone(binding);changed.lane.identity[field] += "-other";
+      writePrivateJson(fixture.journalPath, { ...original, acceptedBackendTransition: changed });
+      assert.throws(() => assertTweakersVariantBootstrap({ environment: fixture.environment, resourcesPath: fixture.resourcesPath }), /does not bind its journal/);
+    }
+    for (const changed of [
+      { ...binding, operationId: "0d9fcb3a-1a57-4e0d-9ae4-18ac8b9622c8" },
+      { ...binding, lane: { ...binding.lane, identity: { ...binding.lane.identity, brokerRoot: binding.lane.identity.brokerRoot + "-other" } } },
+    ]) {
+      writePrivateJson(fixture.journalPath, { ...original, acceptedBackendTransition: changed });
+      assert.throws(() => assertTweakersVariantBootstrap({ environment: fixture.environment, resourcesPath: fixture.resourcesPath }), /does not bind its runtime-ready expectation/);
+    }
+    writePrivateJson(fixture.journalPath, { ...original, acceptedBackendTransition: binding });
+    expectation.promotionId = "other-promotion";writePrivateJson(expectationPath, expectation);
+    assert.throws(() => assertTweakersVariantBootstrap({ environment: fixture.environment, resourcesPath: fixture.resourcesPath }), /does not bind the pending promotion/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

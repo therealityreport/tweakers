@@ -182,6 +182,11 @@ test("installation is idempotent and fails open without the signed Node", () => 
   assert.equal(childProcess.spawn, originalSpawn);
 });
 
+type MutableFakeChild = EventEmitter & Omit<ChildProcess, "exitCode" | "signalCode"> & {
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+};
+
 test("the Node child_process export can be installed and restored", () => {
   const childProcess = childProcessModule as unknown as MutableChildProcessModule;
   const originalSpawn = childProcess.spawn;
@@ -201,7 +206,7 @@ test("the Node child_process export can be installed and restored", () => {
 });
 
 test("tracked app-server parents terminate before promotion health can pass", async () => {
-  const child = new EventEmitter() as EventEmitter & ChildProcess;
+  const child = new EventEmitter() as MutableFakeChild;
   Object.assign(child, {
     exitCode: null,
     signalCode: null,
@@ -238,7 +243,7 @@ test("tracked app-server parents terminate before promotion health can pass", as
 });
 
 test("tracked app-server cleanup reports a child that cannot be signaled", async () => {
-  const child = new EventEmitter() as EventEmitter & ChildProcess;
+  const child = new EventEmitter() as MutableFakeChild;
   Object.assign(child, {
     exitCode: null,
     signalCode: null,
@@ -271,7 +276,7 @@ test("tracked app-server cleanup reports a child that cannot be signaled", async
 
 test("tracked app-server cleanup observes wrapper-owned escalation without sending SIGKILL", async () => {
   const signals: NodeJS.Signals[] = [];
-  const child = new EventEmitter() as EventEmitter & ChildProcess;
+  const child = new EventEmitter() as MutableFakeChild;
   Object.assign(child, {
     exitCode: null,
     signalCode: null,
@@ -307,7 +312,7 @@ test("tracked app-server cleanup observes wrapper-owned escalation without sendi
 });
 
 test("cleanup permanently rejects late app-server spawns and drains the tracked set", async () => {
-  const child = new EventEmitter() as EventEmitter & ChildProcess;
+  const child = new EventEmitter() as MutableFakeChild;
   Object.assign(child, {
     exitCode: null,
     signalCode: null,

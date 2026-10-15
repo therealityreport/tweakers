@@ -567,6 +567,7 @@ test("changed asar stat falls through to the normal repair path", async () => {
         signingAvailable: () => true,
         reconcileCliShims: () => assert.fail("unblocked watcher repair must not reconcile public CLI shims"),
         install: async (options) => {
+          if (!options) throw new Error("Expected watcher repair install options");
           installs += 1;
           delegatedReconcile = options.reconcileCliShims;
         },

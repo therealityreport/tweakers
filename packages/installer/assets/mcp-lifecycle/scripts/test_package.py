@@ -22,6 +22,15 @@ from typing import Any
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+# A direct Python invocation must join the same verified ancestor lease as npm.
+if __name__ == "__main__":
+    checkout = PACKAGE_ROOT.parents[1]
+    ownership = subprocess.run(["node", str(checkout / "scripts/owned-entrypoint.mjs"), "--verify-parent"], check=False)
+    if ownership.returncode == 3:
+        os.execvp("node", ["node", str(checkout / "scripts/local-work.mjs"), "command", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+    if ownership.returncode != 0:
+        raise RuntimeError("Cannot verify Tweakers test operation ownership")
+
 MANIFEST_PATH = PACKAGE_ROOT / "manifest.json"
 FROZEN_HOME = "/Users/thomashulihan"
 EXPECTED_SCENARIOS = {
@@ -95,6 +104,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             "detached_wrapper": "automatic",
             "exact_standalone_app_server": "automatic",
             "standalone_orphan": "observation_only",
+            "tweakers_keyboard_monitor": "registered_owner_exit",
             "claude_idle": "observation_only",
         },
     }
@@ -167,8 +177,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         fail("launchd labels must be exact and unique")
 
     tests = manifest.get("tests")
-    if not isinstance(tests, dict) or tests.get("baseline_count") != 85:
-        fail("manifest must declare the 85-test baseline")
+    if not isinstance(tests, dict) or tests.get("baseline_count") != 93:
+        fail("manifest must declare the 93-test baseline")
     fixture = PACKAGE_ROOT / checked_relative(str(tests.get("fixtures", "")), label="fixture")
     fixture_payload = json.loads(fixture.read_text(encoding="utf-8"))
     scenarios = fixture_payload.get("scenarios") if isinstance(fixture_payload, dict) else None
@@ -311,7 +321,7 @@ def main() -> int:
     compile_python_assets(manifest)
     validate_plists_if_available(manifest)
     run_baseline(manifest)
-    print("mcp-lifecycle package validation passed (85 baseline tests; no live writes)")
+    print("mcp-lifecycle package validation passed (87 baseline tests; no live writes)")
     return 0
 
 

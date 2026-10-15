@@ -30,7 +30,8 @@ Modal, and Supabase connections. Its compatibility test demonstrates that:
    state;
 3. Projects must expose the narrow read-only `profiles.read` operation.
 
-From the enclosing `revi` directory, run:
+In the archived `revi` workspace that retains the original `diagnostics/`
+fixtures, run:
 
 ```sh
 node --test diagnostics/thread-summary-profiles/thread-summary-profiles.compat.test.cjs
@@ -72,4 +73,3 @@ Run the current regression suite from this repository:
 ```sh
 node --test tweaks/co.tweakers.thread-summary-profiles/test/profiles-contract.test.cjs
 ```
-

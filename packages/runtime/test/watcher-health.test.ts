@@ -14,6 +14,7 @@ import {
   parseLaunchdLoadedCommand,
   publishWatcherHealthSnapshot,
   readRuntimeFingerprintEvidence,
+  readRuntimeFingerprintEvidenceAsync,
 } from "../src/watcher-health";
 
 const FIXTURE_FINGERPRINT = "8ae9a8787f4db77dd61d6c23087b8941b303d3cf2f75dcc1864a169f9604c179";
@@ -278,6 +279,22 @@ test("runtime fingerprint evidence includes the verified digest and file count",
   });
 });
 
+test("async runtime fingerprint coalesces reads and invalidates an edited file", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-fingerprint-"));
+  try {
+    const runtime = join(root, "runtime");
+    writeValidRuntime(runtime);
+    const [first, concurrent] = await Promise.all([
+      readRuntimeFingerprintEvidenceAsync(runtime),
+      readRuntimeFingerprintEvidenceAsync(runtime),
+    ]);
+    assert.deepEqual(first, { fingerprint: FIXTURE_FINGERPRINT, fileCount: 1 });
+    assert.deepEqual(concurrent, first);
+    writeFileSync(join(runtime, "main.js"), "tampered\n");
+    assert.equal(await readRuntimeFingerprintEvidenceAsync(runtime), null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("watcher runtime health verifies generated, managed, and active bytes before comparison", () => {
   withTempDir((root) => {
     const sourceRoot = join(root, "source");
@@ -350,7 +367,7 @@ test("watcher registry probes are hermetic through injected home and launchd sea
     }
     const generatedAt = Date.now() / 1_000;
     writeFileSync(join(lifecycle, "codex-mcp-lifecycle-status.json"), JSON.stringify({
-      schema_version: 2,
+      schema_version: 3,
       generated_at: generatedAt,
       cleanup_policy_version: "strict-detached-v3",
       job: { ok: true },
@@ -377,7 +394,7 @@ test("watcher registry probes are hermetic through injected home and launchd sea
     const guard = health.watchers.find((watcher) => watcher.id === "mcp-pressure-guard");
 
     assert.equal(reaper?.status, "ok");
-    assert.equal(reaper?.statusSchemaVersion, 2);
+    assert.equal(reaper?.statusSchemaVersion, 3);
     assert.equal(guard?.status, "ok");
     assert.equal(guard?.authority, "observation-and-notification-only");
     assert.deepEqual(seenLabels.sort(), [
@@ -419,6 +436,7 @@ test("runtime health requires Guard v3 when enabled and treats disabled plus unl
     }).watchers.find((watcher) => watcher.id === "mcp-pressure-guard");
     assert.equal(enabledLegacy?.status, "error");
     assert.equal(enabledLegacy?.legacyStatusSchemaVersion, 1);
+    assert.match(enabledLegacy?.error ?? "", /lacks the v3 observation-only authority contract/);
 
     const disabledUnloaded = getWatcherHealth(root, {
       homeDirectory: home,

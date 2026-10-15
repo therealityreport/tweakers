@@ -245,13 +245,13 @@ test("candidate authentication proof is private, contained, and removed after th
 });
 
 test("candidate health process receives only the contained Codex home opt-in", () => {
-  let observed: SpawnSyncOptions | null = null;
+  const observed: SpawnSyncOptions[] = [];
   let probeRoot = "";
   const userRoot = mkdtempSync(join(tmpdir(), "tweakers-candidate-launch-"));
   const candidateCodexHome = join(userRoot, "codex-home");
   mkdirSync(candidateCodexHome, { mode: 0o700 });
   const fakeSpawn = ((_command: string, _args: readonly string[], options: SpawnSyncOptions) => {
-    observed = options;
+    observed.push(options);
     probeRoot = options.env?.HOME ?? "";
     return { status: 0 } as ReturnType<typeof spawnSync>;
   }) as typeof spawnSync;
@@ -260,11 +260,11 @@ test("candidate health process receives only the contained Codex home opt-in", (
       candidateCodexHome,
       spawn: fakeSpawn,
     });
-    assert.equal(observed?.env?.TWEAKERS_CANDIDATE_MCP_RECONCILIATION, "1");
-    assert.equal(observed?.env?.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN, "1");
-    assert.equal(observed?.env?.HOME, probeRoot);
-    assert.equal(observed?.env?.CODEX_HOME, join(probeRoot, "codex-home"));
-    assert.equal(observed?.env?.TMPDIR, join(probeRoot, "tmp"));
+    assert.equal(observed[0]?.env?.TWEAKERS_CANDIDATE_MCP_RECONCILIATION, "1");
+    assert.equal(observed[0]?.env?.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN, "1");
+    assert.equal(observed[0]?.env?.HOME, probeRoot);
+    assert.equal(observed[0]?.env?.CODEX_HOME, join(probeRoot, "codex-home"));
+    assert.equal(observed[0]?.env?.TMPDIR, join(probeRoot, "tmp"));
     assert.equal(existsSync(probeRoot), false);
   } finally {
     rmSync(userRoot, { recursive: true, force: true });

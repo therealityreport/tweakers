@@ -41,6 +41,21 @@ test("production manager bundle is standalone and exposes only fixed manager act
     assert.equal(typeof imported.prepareNativeHistoryActivationContext, "function",
       "authorized activation preparation must survive bundle tree shaking");
     assert.equal(typeof imported.armNativeHistoryActivationLaunchAgent, "function");
+    assert.equal(typeof imported.reserveClosedIndependentTweakersCutover, "function",
+      "baseline maintenance must reuse the sealed production cutover guard");
+    assert.equal(typeof imported.prepareManagedAccountContinuityPrelaunch, "function",
+      "baseline maintenance must retain the sealed account continuity preflight");
+    assert.equal(typeof imported.prepareDeferredTweakersVariantRefresh, "function",
+      "baseline maintenance promotion must execute with sealed runtime assets");
+    await assert.rejects(() => imported.prepareDeferredTweakersVariantRefresh({}),
+      /requires a manager operation ID/);
+    assert.equal(typeof imported.withLocalOperation, "function",
+      "sealed promotion and its operator must share operation ownership");
+    const operationRoot = join(root, "operator-ownership");
+    const ownedResult = await imported.withLocalOperation("sealed operator regression", () =>
+      imported.withLocalOperation("nested sealed refresh regression", async () => "same owner", operationRoot), operationRoot);
+    assert.equal(ownedResult, "same owner");
+    assert.equal(JSON.parse(readFileSync(join(operationRoot, "operation.json"), "utf8")).state, "completed");
     assert.throws(() => imported.prepareNativeHistoryActivationContext({
       operationId: REQUEST_ID, approvedAt: "not-an-approval-time",
     }), /approval time must be RFC3339/);
@@ -66,6 +81,17 @@ test("production manager bundle is standalone and exposes only fixed manager act
       ["refresh.injected", "refresh.independent"],
     );
     assert.equal(existsSync(environment.TWEAKER_HOME), false, "status must not create the missing user root");
+    const operatorOnly = invoke(outfile, ["reserveClosedIndependentTweakersCutover", "--request-id", REQUEST_ID, "--json"], environment);
+    assert.equal(operatorOnly.status, 64);
+    assert.equal((JSON.parse(operatorOnly.stdout) as { error: { code: string } }).error.code, "unsupported_action",
+      "the operator export must not add a public launcher command");
+    const deferredOperatorOnly = invoke(outfile, ["prepareDeferredTweakersVariantRefresh", "--request-id", REQUEST_ID, "--json"], environment);
+    assert.equal(deferredOperatorOnly.status, 64);
+    assert.equal((JSON.parse(deferredOperatorOnly.stdout) as { error: { code: string } }).error.code, "unsupported_action",
+      "sealed deferred refresh must remain unavailable as a public launcher command");
+    const ownershipOperatorOnly = invoke(outfile, ["withLocalOperation", "--request-id", REQUEST_ID, "--json"], environment);
+    assert.equal(ownershipOperatorOnly.status, 64);
+    assert.equal((JSON.parse(ownershipOperatorOnly.stdout) as { error: { code: string } }).error.code, "unsupported_action");
 
     for (const argv of [
       ["prepare", "--request-id", REQUEST_ID, "--json"],

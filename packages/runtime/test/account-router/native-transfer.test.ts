@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   inspectNativeTransferCompatibilityV2,
+  NATIVE_CATALOG_MAX_THREADS_V1,
   NativeTransferCoordinatorV1,
   Sqlite3NativeCatalogDbV1,
   probeNativeTransferCapabilityV1,
@@ -285,7 +286,7 @@ test("co-located native account homes support idle secondary locks and catalog r
   await coordinator.probeCapability();
   const inode = lstatSync(join(f.sourceHome, "thread-writer-locks")).ino;
   assert.equal(coordinator.convertIdleSecondaryWriterLockDirectory(ACCOUNT_B, { offlinePreflight: () => true }).state, "ready");
-  assert.deepEqual(await coordinator.reconcileCatalog({ project: false }), { state: "ready", scanned: 1, projected: 0, collisions: 0 });
+  assert.deepEqual(await coordinator.reconcileCatalog({ project: false }), { state: "ready", scanned: 1, projected: 0, collisions: 0, capacity: { threads: 1, max: NATIVE_CATALOG_MAX_THREADS_V1 } });
   assert.equal(lstatSync(join(f.sourceHome, "thread-writer-locks")).ino, inode);
   assert.equal(lstatSync(f.sourceHome).mode & 0o777, 0o755);
   assert.throws(() => new NativeTransferCoordinatorV1({ ...options, accounts: [options.accounts[0]!,
@@ -319,7 +320,7 @@ test("legacy rows preserve their mode while catalog projection creates an exact 
   const value = fixture("legacy");
   await ready(value);
   const reconciled = await value.coordinator.reconcileCatalog();
-  assert.deepEqual(reconciled, { state: "ready", scanned: 1, projected: 1, collisions: 0 });
+  assert.deepEqual(reconciled, { state: "ready", scanned: 1, projected: 1, collisions: 0, capacity: { threads: 1, max: NATIVE_CATALOG_MAX_THREADS_V1 } });
   const targetPath = join(value.targetHome, "sessions", "2026", "09", "05", "rollout-2026-09-05-" + THREAD_ID + ".jsonl");
   const sourceIdentity = lstatSync(value.sourceRollout);
   const targetIdentity = lstatSync(targetPath);
@@ -355,7 +356,7 @@ test("native mode-0755 session trees and mode-0644 rollouts preserve catalog pro
 
   await ready(value);
   assert.deepEqual(await value.coordinator.reconcileCatalog(), {
-    state: "ready", scanned: 1, projected: 1, collisions: 0,
+    state: "ready", scanned: 1, projected: 1, collisions: 0, capacity: { threads: 1, max: NATIVE_CATALOG_MAX_THREADS_V1 },
   });
   const targetPath = join(value.targetHome, "sessions", "2026", "09", "05", "rollout-2026-09-05-" + THREAD_ID + ".jsonl");
   const source = lstatSync(value.sourceRollout);
@@ -436,7 +437,7 @@ test("provenance-only scans work before lock provisioning while a nonempty journ
   const value = fixture();
   assert.equal((await value.coordinator.probeCapability()).state, "ready");
   assert.deepEqual(await value.coordinator.reconcileCatalog({ project: false }), {
-    state: "ready", scanned: 1, projected: 0, collisions: 0,
+    state: "ready", scanned: 1, projected: 0, collisions: 0, capacity: { threads: 1, max: NATIVE_CATALOG_MAX_THREADS_V1 },
   });
   const initial = readCommittedNativeThreadInventoryV1({ stateRoot: value.stateRoot });
   assert.equal(initial.state, "ready");
@@ -444,6 +445,62 @@ test("provenance-only scans work before lock provisioning while a nonempty journ
   assert.deepEqual(readCommittedNativeThreadInventoryV1({ stateRoot: value.stateRoot }), {
     state: "unavailable", reason: "journal_ambiguous",
   });
+});
+
+test("catalog reconciliation commits a batch of new threads once and rejects an invalid scan atomically", async () => {
+  const f = fixture();
+  try {
+    await f.coordinator.probeCapability();
+    const rows = f.db.rows.get(join(f.sourceSqlite, "state_5.sqlite"))!;
+    for (let index = 0; index < 64; index += 1) {
+      const id = `batch-thread-${String(index).padStart(3, "0")}`;
+      const path = f.sourceRollout.replace(THREAD_ID, id);
+      privateFile(path, "fixture rollout\n");
+      const row = nativeRow(path, "legacy");
+      rows.set(id, { ...row, threadId: id, values: { ...row.values, id } });
+    }
+    const catalog = f.coordinator as unknown as { persist: (document: unknown) => void };
+    const persist = catalog.persist.bind(catalog);
+    let commits = 0;
+    catalog.persist = (document) => { commits += 1; persist(document); };
+    assert.deepEqual(await f.coordinator.reconcileCatalog({ project: false }), {
+      state: "ready", scanned: 65, projected: 0, collisions: 0,
+      capacity: { threads: 65, max: NATIVE_CATALOG_MAX_THREADS_V1 },
+    });
+    assert.equal(commits, 1, "one full-document journal and snapshot commit covers the batch");
+    assert.equal(readCommittedNativeThreadInventoryV1({ stateRoot: f.stateRoot }).state, "ready");
+
+    const invalidId = "batch-invalid";
+    const invalidPath = f.sourceRollout.replace(THREAD_ID, invalidId);
+    const invalidRow = nativeRow(invalidPath, "legacy");
+    rows.set(invalidId, { ...invalidRow, threadId: invalidId, values: { ...invalidRow.values, id: "mismatched-id" } });
+    assert.deepEqual(await f.coordinator.reconcileCatalog({ project: false }), { state: "unavailable", reason: "threads_scan_invalid" });
+    assert.equal(commits, 1, "an invalid batch member cannot commit any new receipt");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("catalog capacity reports observed thread count when the scan exceeds the limit", async () => {
+  const f = fixture();
+  try {
+    await f.coordinator.probeCapability();
+    f.db.scanEligibleRows = async (dbPath, after) => {
+      if (dbPath !== join(f.sourceSqlite, "state_5.sqlite")) return { rows: [], nextCursor: null };
+      const start = after ? Number(after.threadId.slice("capacity-thread-".length)) + 1 : 0;
+      const end = Math.min(start + 256, NATIVE_CATALOG_MAX_THREADS_V1 + 1);
+      const rows: NativeThreadRowV1[] = [];
+      for (let index = start; index < end; index += 1) {
+        const id = `capacity-thread-${String(index).padStart(5, "0")}`;
+        const row = nativeRow(f.sourceRollout, "legacy");
+        rows.push({ ...row, threadId: id, values: { ...row.values, id } });
+      }
+      return { rows, nextCursor: end <= NATIVE_CATALOG_MAX_THREADS_V1
+        ? { updatedAtMs: 1, threadId: rows.at(-1)!.threadId } : null };
+    };
+    assert.deepEqual(await f.coordinator.reconcileCatalog({ project: false }), {
+      state: "unavailable", reason: "threads_catalog_capacity",
+      capacity: { threads: NATIVE_CATALOG_MAX_THREADS_V1 + 1, max: NATIVE_CATALOG_MAX_THREADS_V1 },
+    });
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("unverifiable catalog rows share an asynchronous census without reusing it for writes", { timeout: 5_000 }, async () => {
@@ -481,7 +538,7 @@ test("unverifiable catalog rows share an asynchronous census without reusing it 
       release();
       const result = await pending;
       assert.equal(batchCalls, 1);
-      assert.deepEqual(result, { state: outcome === "clear" ? "collision" : "ready", scanned: 34, projected: 0, collisions: outcome === "clear" ? 33 : 0 });
+      assert.deepEqual(result, { state: outcome === "clear" ? "collision" : "ready", scanned: 34, projected: 0, collisions: outcome === "clear" ? 33 : 0, capacity: { threads: 1, max: NATIVE_CATALOG_MAX_THREADS_V1 } });
       assert.equal(f.coordinator.ownerForThread("unavailable-thread-0"), null, "unverified rows never gain an owner");
       const transfer = await f.coordinator.prepareSameThreadTransfer({ operationId: `batch-${outcome}`, threadId: THREAD_ID,
         sourceAccountId: ACCOUNT_A, targetAccountId: ACCOUNT_B });
@@ -522,7 +579,7 @@ test("runtime probe rejects unknown inputs and requires an observed private writ
     command: "/fixture/codex",
     args: ["-c", "features.code_mode_host=true", "app-server", "-c", 'mcp_servers.codex_app={url="http://private-app-socket"}'],
     cwd: process.cwd(), timeoutMs: 2_000,
-    spawn: ((command, args, options) => {
+    spawn: ((command: string, args: readonly string[], options?: Parameters<typeof spawn>[2]) => {
       spawns += 1;
       assert.equal(command, "/fixture/codex");
       assert.deepEqual(args, ["app-server"], "the capability probe never reuses desktop overrides");
@@ -531,8 +588,8 @@ test("runtime probe rejects unknown inputs and requires an observed private writ
       assert.deepEqual(Object.keys(env).sort(), ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "SSL_CERT_FILE", "SSL_CERT_DIR"]
         .filter(key => typeof process.env[key] === "string")
         .concat(["HOME", "TMPDIR", "TMP", "TEMP", "CODEX_HOME", "CODEX_SQLITE_HOME", "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"]).sort());
-      return spawn(process.execPath, ["-e", readyProgram, "app-server"], options);
-    }) as typeof spawn,
+      return spawn(process.execPath, ["-e", readyProgram, "app-server"], options ?? {});
+    }) as unknown as typeof spawn,
   }), { state: "ready", writerLockProtocol: "shared_thread_writer_locks_v1", paginatedHistory: true });
   assert.equal(spawns, 1);
 });

@@ -427,7 +427,7 @@ function openBridgedProjectMenu(doc, request, context, handlers = {}) {
   const colorIcon = doc.createElement("span");
   colorIcon.className = "size-4 shrink-0 rounded-full ring-[0.5px] ring-border";
   colorIcon.style?.setProperty?.("background-color", context.project.color);
-  const colorTrigger = ownedProjectMenuItem(doc, "Project color", null, openColor, { icon: colorIcon, submenu: true });
+  const colorTrigger = ownedProjectMenuItem(doc, "Edit color / boldness", null, openColor, { icon: colorIcon, submenu: true });
   colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
   colorTrigger.setAttribute("aria-haspopup", "menu");
   colorTrigger[PROJECT_MENU_OPEN_SUBMENU] = openColor;
@@ -505,7 +505,7 @@ function interceptNativeProjectMenu(doc, nativeMenu, context, handlers = {}) {
     await handlers.saveAppearance?.(context.project.id, { taskSort });
     close();
   });
-  const colorTrigger = ownedProjectMenuItem(doc, "Project color", template, openColor, { submenu: true });
+  const colorTrigger = ownedProjectMenuItem(doc, "Edit color / boldness", template, openColor, { submenu: true });
   colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
   add(colorTrigger);
   const sortTrigger = ownedProjectMenuItem(doc, "Sort", template, openSort, { submenu: true });
@@ -655,7 +655,7 @@ function openProjectSettingsSubmenu(doc, nativeMenu, anchor, context, handlers =
     await handlers.saveAppearance?.(context.project.id, { taskSort });
     dispose();
   });
-  const colorTrigger = ownedProjectMenuItem(doc, "Project color", anchor, openColor, { submenu: true });
+  const colorTrigger = ownedProjectMenuItem(doc, "Edit color / boldness", anchor, openColor, { submenu: true });
   colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
   colorTrigger.setAttribute("aria-haspopup", "menu");
   const sortTrigger = ownedProjectMenuItem(doc, "Task sorting", anchor, openSort, { submenu: true });
@@ -785,26 +785,41 @@ function openNativeProjectEditDialog(project) {
     const container = closestProjectContainer(row) || row;
     const menuButton = [...(container?.querySelectorAll?.('button, [role="button"]') || [])]
       .find((node) => node !== row && (/more|menu|options/i.test(String(node.getAttribute?.("aria-label") || node.getAttribute?.("title") || "")) || !String(node.textContent || "").trim()));
-    if (!menuButton) { window.alert("Open this project's menu in the sidebar and choose Edit project."); return; }
+    if (!menuButton) return false;
     const clickEdit = () => {
       const item = [...document.querySelectorAll?.('[role="menuitem"], [role="menu"] button') || []]
-        .find((node) => /^Edit project$/i.test(String(node.textContent || "").replace(/\s+/g, " ").trim()));
+        .find((node) => /^Edit(?: project)?$/i.test(String(node.textContent || "").replace(/\s+/g, " ").trim()));
       if (!item) return false;
       item.click?.();
       return true;
     };
     menuButton.click?.();
-    if (clickEdit()) return;
+    if (clickEdit()) return true;
     const observer = new MutationObserver(() => { if (clickEdit()) observer.disconnect(); });
     observer.observe(document.body, { childList: true, subtree: true });
     window.setTimeout(() => observer.disconnect(), 1500);
+    return true;
   };
   const settingsMarker = document.querySelector?.("[data-settings-panel-slug]");
   let shell = settingsMarker;
   while (shell?.parentElement && !shell.querySelector?.('button[aria-label="Close"]')) shell = shell.parentElement;
   const close = shell?.querySelector?.('button[aria-label="Close"]');
-  if (close) { close.click?.(); window.setTimeout(finish, 50); }
-  else finish();
+  const home = settingsMarker && [...document.querySelectorAll?.('button, [role="button"]') || []]
+    .find((node) => /^Home$/i.test(String(node.getAttribute?.("aria-label") || node.textContent || "").trim()));
+  const navigate = close || home;
+  if (navigate) {
+    let timer;
+    const observer = new MutationObserver(() => {
+      if (finish()) { observer.disconnect(); window.clearTimeout(timer); }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    timer = window.setTimeout(() => {
+      observer.disconnect();
+      window.alert("Open this project's menu in the sidebar and choose Edit.");
+    }, 5000);
+    navigate.click?.();
+    if (finish()) { observer.disconnect(); window.clearTimeout(timer); }
+  } else if (!finish()) window.alert("Open this project's menu in the sidebar and choose Edit.");
 }
 
 function installProjectColorControls(api, getState, saveAppearance) {
@@ -950,22 +965,25 @@ function installProjectColorControls(api, getState, saveAppearance) {
 function resolveProjectContext(api, state, target) {
   if (!state?.nodes || !(target instanceof Element)) return null;
   const projects = state.nodes.filter((node) => node.type === "project").sort((a, b) => b.name.length - a.name.length);
-  const targetContainer = target.closest?.('[role="listitem"]');
+  const nonProjectIds = new Set(state.nodes.filter((node) => node.type !== "project").map((node) => node.id));
+  const targetContainer = target.closest?.('[data-app-action-sidebar-project-row]') || target.closest?.('[role="listitem"]');
   for (const match of api.react?.host?.query?.("projects") || []) {
     const element = match.element;
     if (!(element instanceof HTMLElement)) continue;
     const container = element.closest?.('[role="listitem"]') || element;
     if (!(element === target || element.contains(target) || target.contains?.(element) || (targetContainer && targetContainer === container))) continue;
     const identity = element.getAttribute?.("data-app-action-sidebar-project-id") || element.getAttribute?.("data-workspace-path") || element.getAttribute?.("data-project-path");
+    if (identity && nonProjectIds.has(identity)) return null;
     const project = unambiguousProjectForNativeIdentity(projects, projectLabelForRow(element), identity);
     if (project) return { project, element, container, source: "semantic" };
   }
   if (!(targetContainer instanceof HTMLElement)) return null;
-  const projectAction = targetContainer.querySelector?.("[data-app-action-sidebar-project-id]");
+  const projectAction = targetContainer.hasAttribute?.("data-app-action-sidebar-project-id") ? targetContainer : targetContainer.querySelector?.("[data-app-action-sidebar-project-id]");
   const donorRowShape = targetContainer.classList?.contains?.("group/cwd") || projectAction instanceof HTMLElement;
   if (!donorRowShape) return null;
   const label = projectLabelForRow(projectAction instanceof HTMLElement ? projectAction : targetContainer);
   const identity = projectAction?.getAttribute?.("data-app-action-sidebar-project-id") || targetContainer.getAttribute?.("data-workspace-path") || targetContainer.getAttribute?.("data-project-path");
+  if (identity && nonProjectIds.has(identity)) return null;
   const project = unambiguousProjectForNativeIdentity(projects, label, identity);
   if (!project) return null;
   return { project, element: projectAction instanceof HTMLElement ? projectAction : targetContainer, container: targetContainer, source: "live-row" };
@@ -1436,7 +1454,7 @@ function installProjectTaskControls(api, getState, saveProject) {
   };
 }
 
-function applyNativeProjectColors(api, state) {
+function applyNativeProjectColors(api, state, { layout = true } = {}) {
   if (!state?.nodes) return;
   clearNativeProjectColors();
   ensureProjectColorStyle();
@@ -1464,7 +1482,7 @@ function applyNativeProjectColors(api, state) {
     applyCollapsedProjectActiveCount(api, container, header, project);
   }
   applyPinnedProjectColors(api, projects);
-  applyUniformNativeRowSpacing();
+  if (layout) applyUniformNativeRowSpacing();
 }
 
 function collectProjectIdentities(value, out, depth = 0) {
@@ -1500,7 +1518,11 @@ function closestThreadRow(node) {
 }
 
 function visibleSectionHeading(doc, label) {
-  return [...(doc.querySelectorAll?.("h1, h2, h3, div, span") || [])]
+  const navigation = [...(doc.querySelectorAll?.("nav, aside, [role=\"navigation\"]") || [])];
+  const headings = navigation.length
+    ? navigation.flatMap((scope) => [...(scope.querySelectorAll?.("h1, h2, h3, div, span") || [])])
+    : [...(doc.querySelectorAll?.("h1, h2, h3, div, span") || [])];
+  return headings
     .filter((node) => String(node.textContent || "").replace(/\s+/g, " ").trim() === label)
     .map((node) => ({ node, rect: node.getBoundingClientRect?.() }))
     .filter(({ rect }) => rect && Number.isFinite(rect.top) && (rect.height === undefined || rect.height > 0))
@@ -1632,13 +1654,37 @@ function applyCollapsedProjectActiveCount(api, group, header, project) {
   host.setAttribute("data-tweaker-project-active-count", String(count > 99 ? "99+" : count));
 }
 
-function measureNativeProjectRowGap(groups) {
+function createProjectLayoutPass() {
+  const rects = new Map();
+  const writes = [];
+  return {
+    rect(node) {
+      if (!rects.has(node)) rects.set(node, node?.getBoundingClientRect?.());
+      return rects.get(node);
+    },
+    style(node, name, value) {
+      writes.push(() => {
+        if (node?.style?.getPropertyValue?.(name) === value) return;
+        if (value) node?.style?.setProperty?.(name, value);
+        else node?.style?.removeProperty?.(name);
+      });
+    },
+    attribute(node, name, value) {
+      writes.push(() => {
+        if (node?.getAttribute?.(name) !== value) node?.setAttribute?.(name, value);
+      });
+    },
+    commit() { for (const write of writes) write(); },
+  };
+}
+
+function measureNativeProjectRowGap(groups, pass = createProjectLayoutPass()) {
   const gaps = [];
   const nodes = [...groups].filter((node) => node?.getBoundingClientRect && node.parentElement);
   for (let index = 1; index < nodes.length; index += 1) {
     if (nodes[index - 1].parentElement !== nodes[index].parentElement) continue;
-    const previous = nodes[index - 1].getBoundingClientRect();
-    const current = nodes[index].getBoundingClientRect();
+    const previous = pass.rect(nodes[index - 1]);
+    const current = pass.rect(nodes[index]);
     const gap = current.top - previous.bottom;
     if (Number.isFinite(gap) && gap > 0 && gap <= 32) gaps.push(gap);
   }
@@ -1652,10 +1698,10 @@ function median(values) {
   return sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
 }
 
-function visibleProjectTaskRows(group) {
+function visibleProjectTaskRows(group, pass = createProjectLayoutPass()) {
   return [...(group?.querySelectorAll?.("[data-tweaker-project-color-task]") || [])]
     .filter((row) => {
-      const rect = row.getBoundingClientRect?.();
+      const rect = pass.rect(row);
       return rect && rect.width > 0 && rect.height > 0;
     });
 }
@@ -1669,16 +1715,16 @@ function projectNavigationForNode(node) {
   return null;
 }
 
-function nativeProjectsHeadingInset(group, navigationRect, headerRect) {
+function nativeProjectsHeadingInset(group, navigationRect, headerRect, pass) {
   const documentRef = group?.ownerDocument || (typeof document === "object" ? document : null);
   if (!documentRef?.querySelectorAll) return 0;
   const navigationRight = Number.isFinite(navigationRect.right)
     ? navigationRect.right
     : navigationRect.left + navigationRect.width;
   const headerTop = Number.isFinite(headerRect.top) ? headerRect.top : Number.POSITIVE_INFINITY;
-  const candidates = [...documentRef.querySelectorAll("h1, h2, h3, div, span")]
+  const candidates = [...((projectNavigationForNode(group) || group.parentElement || group).querySelectorAll?.("h1, h2, h3, div, span") || [])]
     .filter((node) => String(node.textContent || "").replace(/\s+/g, " ").trim() === "Projects")
-    .map((node) => node.getBoundingClientRect?.())
+    .map((node) => pass.rect(node))
     .filter((rect) => rect && Number.isFinite(rect.left) && rect.left >= navigationRect.left && rect.left < navigationRight)
     .filter((rect) => (rect.height === undefined || rect.height > 0) && (!Number.isFinite(rect.top) || rect.top <= headerTop))
     .map((rect) => ({
@@ -1690,35 +1736,37 @@ function nativeProjectsHeadingInset(group, navigationRect, headerRect) {
   return candidates[0]?.inset || 0;
 }
 
-function measureNativeProjectRowEndInset(group, header) {
+function measureNativeProjectRowEndInset(group, header, pass = createProjectLayoutPass()) {
   const navigation = projectNavigationForNode(group);
-  const navigationRect = navigation?.getBoundingClientRect?.();
-  const headerRect = header?.getBoundingClientRect?.();
+  const navigationRect = pass.rect(navigation);
+  const headerRect = pass.rect(header);
   if (!navigationRect || !headerRect) return 0;
   const navigationWidth = Number.isFinite(navigationRect.width)
     ? navigationRect.width
     : navigationRect.right - navigationRect.left;
   const headerInset = headerRect.left - navigationRect.left;
-  const inset = headerInset > 0 ? headerInset : nativeProjectsHeadingInset(group, navigationRect, headerRect);
+  const inset = headerInset > 0 ? headerInset : nativeProjectsHeadingInset(group, navigationRect, headerRect, pass);
   if (!Number.isFinite(navigationWidth) || navigationWidth <= 0 || !Number.isFinite(inset) || inset <= 0) return 0;
   return Math.min(inset, MAX_PROJECT_ROW_END_INSET, navigationWidth / 4);
 }
 
-function applyProjectGroupEndInset(group, header) {
-  const inset = measureNativeProjectRowEndInset(group, header);
-  if (inset > 0) group.style?.setProperty?.("--tweaker-project-row-end-inset", `${inset}px`);
-  else group.style?.removeProperty?.("--tweaker-project-row-end-inset");
+function applyProjectGroupEndInset(group, header, pass = null) {
+  const ownPass = !pass;
+  pass ||= createProjectLayoutPass();
+  const inset = measureNativeProjectRowEndInset(group, header, pass);
+  pass.style(group, "--tweaker-project-row-end-inset", inset > 0 ? `${inset}px` : "");
+  if (ownPass) pass.commit();
   return inset;
 }
 
-function measureNativeProjectRowGeometry(groups) {
-  const collapsed = groups.filter((group) => visibleProjectTaskRows(group).length === 0);
+function measureNativeProjectRowGeometry(groups, pass = createProjectLayoutPass()) {
+  const collapsed = groups.filter((group) => visibleProjectTaskRows(group, pass).length === 0);
   const references = collapsed.length >= 2 ? collapsed : groups;
   const headers = references.map((group) => group.querySelector?.("[data-tweaker-project-color-row]"))
     .filter((row) => row?.getBoundingClientRect)
-    .map((row) => row.getBoundingClientRect())
+    .map((row) => pass.rect(row))
     .filter((rect) => rect.width > 0 && rect.height > 0);
-  let gap = measureNativeProjectRowGap(collapsed.length >= 2 ? collapsed : groups);
+  let gap = measureNativeProjectRowGap(collapsed.length >= 2 ? collapsed : groups, pass);
   if (gap === null && references[0]?.parentElement && typeof getComputedStyle === "function") {
     const computed = getComputedStyle(references[0].parentElement);
     const value = Number.parseFloat(computed.rowGap || computed.gap);
@@ -1731,38 +1779,115 @@ function measureNativeProjectRowGeometry(groups) {
   };
 }
 
-function applyProjectTaskGeometry(group, header, geometry) {
-  const headerRect = header?.getBoundingClientRect?.();
+function applyProjectTaskGeometry(group, header, geometry, pass = null) {
+  const ownPass = !pass;
+  pass ||= createProjectLayoutPass();
+  const headerRect = pass.rect(header);
   if (!headerRect || headerRect.width <= 0 || headerRect.height <= 0) return;
   const rows = [...(group.querySelectorAll?.("[data-tweaker-project-color-task], [data-tweaker-project-show-more]") || [])];
   for (const row of rows) {
-    const rect = row.getBoundingClientRect?.();
-    const offset = rect && rect.width > 0 ? headerRect.left - rect.left : 0;
-    row.style?.setProperty?.("--tweaker-project-native-row-block-size", `${geometry.blockSize || headerRect.height}px`);
-    row.style?.setProperty?.("--tweaker-project-native-row-inline-size", `${geometry.inlineSize || headerRect.width}px`);
-    row.style?.setProperty?.("--tweaker-project-native-row-offset", `${offset}px`);
+    const rect = pass.rect(row);
+    const previousOffset = Number.parseFloat(row.style?.getPropertyValue?.("--tweaker-project-native-row-offset")) || 0;
+    const offset = rect && rect.width > 0 ? previousOffset + headerRect.left - rect.left : 0;
+    pass.style(row, "--tweaker-project-native-row-block-size", `${geometry.blockSize || headerRect.height}px`);
+    pass.style(row, "--tweaker-project-native-row-inline-size", `${geometry.inlineSize || headerRect.width}px`);
+    pass.style(row, "--tweaker-project-native-row-offset", `${offset}px`);
   }
   const lists = [...(group.querySelectorAll?.('[role="list"]') || [])];
-  for (const list of lists) list.setAttribute?.("data-tweaker-project-spacing-list", "true");
+  for (const list of lists) pass.attribute(list, "data-tweaker-project-spacing-list", "true");
   if (!lists.length) {
-    for (const row of rows) row.setAttribute?.("data-tweaker-project-fallback-spacing", "true");
+    for (const row of rows) pass.attribute(row, "data-tweaker-project-fallback-spacing", "true");
   }
+  if (ownPass) pass.commit();
 }
 
 function applyUniformNativeRowSpacing() {
+  const pass = createProjectLayoutPass();
+  let insetChanged = false;
   const groups = [...(document.querySelectorAll?.("[data-tweaker-project-color-group]") || [])]
-    .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    .sort((a, b) => pass.rect(a).top - pass.rect(b).top);
   for (const group of groups) {
     const header = group.querySelector?.("[data-tweaker-project-color-row]");
-    applyProjectGroupEndInset(group, header);
+    const before = group.style?.getPropertyValue?.("--tweaker-project-row-end-inset") || "";
+    const inset = applyProjectGroupEndInset(group, header, pass);
+    insetChanged ||= before !== (inset > 0 ? `${inset}px` : "");
   }
-  const geometry = measureNativeProjectRowGeometry(groups);
+  const geometry = measureNativeProjectRowGeometry(groups, pass);
   const gapValue = geometry.gap === null ? "var(--spacing-px, 1px)" : `${geometry.gap}px`;
-  document.documentElement?.style?.setProperty?.("--tweaker-project-native-row-gap", gapValue);
+  pass.style(document.documentElement, "--tweaker-project-native-row-gap", gapValue);
   for (const group of groups) {
     const header = group.querySelector?.("[data-tweaker-project-color-row]");
-    applyProjectTaskGeometry(group, header, geometry);
+    applyProjectTaskGeometry(group, header, geometry, pass);
   }
+  pass.commit();
+  return insetChanged;
+}
+
+// Host notifications include our own attribute writes. Compare only native
+// sidebar state, including node identity, before doing any layout work.
+function createProjectSidebarUpdater(api, getState) {
+  let disposed = false;
+  let frame = null;
+  let force = false;
+  let layoutOnly = false;
+  let previous = null;
+  let nextId = 0;
+  const ids = new WeakMap();
+  const identity = (node) => {
+    if (!ids.has(node)) ids.set(node, ++nextId);
+    return ids.get(node);
+  };
+  const snapshot = () => {
+    const rows = new Set((api.react?.host?.query?.("projects") || []).map((match) => match.element).filter(Boolean));
+    for (const row of document.querySelectorAll?.('[data-app-action-sidebar-project-id], [data-app-action-sidebar-thread-pinned="true"], [data-tweaker-project-color-row]') || []) rows.add(row);
+    const parts = [document.documentElement?.className || "", document.documentElement?.style?.fontSize || "", rows.size];
+    for (const row of rows) {
+      parts.push(identity(row), identity(row.parentElement || row), row.childElementCount || 0,
+        row.getAttribute?.("data-app-action-sidebar-project-id") || "",
+        row.getAttribute?.("data-workspace-path") || "",
+        row.getAttribute?.("aria-expanded") || "",
+        row.getAttribute?.("aria-selected") || "",
+        row.getAttribute?.("data-state") || "",
+        String(projectLabelForRow(row) || "").slice(0, 160));
+    }
+    return parts.join("\u001f");
+  };
+  const schedule = (changed = false, geometry = false) => {
+    if (disposed) return;
+    force ||= changed;
+    layoutOnly ||= geometry;
+    if (frame !== null) return;
+    frame = requestAnimationFrame(() => {
+      frame = null;
+      if (disposed) return;
+      const current = snapshot();
+      const appearance = force || current !== previous;
+      const measure = appearance || layoutOnly;
+      force = layoutOnly = false;
+      if (appearance) applyNativeProjectColors(api, getState(), { layout: false });
+      const insetChanged = measure && applyUniformNativeRowSpacing();
+      previous = current;
+      resize.sync();
+      if (insetChanged) schedule(false, true);
+    });
+  };
+  const resize = installProjectSidebarResizeObserver(() => schedule(false, true));
+  const onResize = () => schedule(false, true);
+  window.addEventListener?.("resize", onResize);
+  window.visualViewport?.addEventListener?.("resize", onResize);
+  document.fonts?.addEventListener?.("loadingdone", onResize);
+  return {
+    schedule,
+    dispose() {
+      disposed = true;
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = null;
+      resize.dispose();
+      window.removeEventListener?.("resize", onResize);
+      window.visualViewport?.removeEventListener?.("resize", onResize);
+      document.fonts?.removeEventListener?.("loadingdone", onResize);
+    },
+  };
 }
 
 function installProjectSidebarResizeObserver(onResize) {
@@ -1778,8 +1903,15 @@ function installProjectSidebarResizeObserver(onResize) {
     scheduledWithAnimationFrame = false;
     if (!disposed) onResize();
   };
-  const observer = new ResizeObserver(() => {
-    if (disposed || scheduled !== null) return;
+  const sizes = new WeakMap();
+  const observer = new ResizeObserver((entries) => {
+    const changed = !entries || entries.map((entry) => {
+      const size = `${entry.contentRect?.width}:${entry.contentRect?.height}`;
+      if (sizes.get(entry.target) === size) return false;
+      sizes.set(entry.target, size);
+      return true;
+    }).some(Boolean);
+    if (!changed || disposed || scheduled !== null) return;
     if (typeof requestAnimationFrame === "function") {
       scheduledWithAnimationFrame = true;
       scheduled = requestAnimationFrame(run);
@@ -1794,6 +1926,8 @@ function installProjectSidebarResizeObserver(onResize) {
       for (const group of document.querySelectorAll?.("[data-tweaker-project-color-group]") || []) {
         const navigation = projectNavigationForNode(group);
         if (navigation) next.add(navigation);
+        const header = group.querySelector?.("[data-tweaker-project-color-row]");
+        if (header) next.add(header);
       }
       for (const navigation of observed) {
         if (!next.has(navigation)) observer.unobserve?.(navigation);
@@ -1864,6 +1998,7 @@ function closestProjectContainer(row) {
   let cursor = row;
   let listItem = null;
   while (cursor) {
+    if (cursor.hasAttribute?.("data-app-action-sidebar-project-row")) return cursor;
     if (cursor.classList?.contains?.("group/cwd")) return cursor;
     if (!listItem && cursor.getAttribute?.("role") === "listitem") listItem = cursor;
     if (cursor.tagName === "NAV" || cursor.tagName === "ASIDE" || cursor.getAttribute?.("role") === "navigation") return listItem;
@@ -1966,7 +2101,7 @@ function hasNativeSelectionAttribute(element) {
 }
 
 function projectLabelForRow(row) {
-  return (row?.getAttribute?.("data-project-name") || row?.getAttribute?.("aria-label") || row?.getAttribute?.("title") || row?.textContent || "").replace(/\s+/g, " ").trim();
+  return (row?.getAttribute?.("data-app-action-sidebar-project-label") || row?.getAttribute?.("data-project-name") || row?.getAttribute?.("aria-label") || row?.getAttribute?.("title") || row?.textContent || "").replace(/\s+/g, " ").trim();
 }
 
 function projectColorForeground(color) {
@@ -2086,7 +2221,10 @@ module.exports = {
   measureNativeProjectRowEndInset,
   applyProjectGroupEndInset,
   applyProjectTaskGeometry,
+  createProjectLayoutPass,
+  applyUniformNativeRowSpacing,
   installProjectSidebarResizeObserver,
+  createProjectSidebarUpdater,
   nativeProjectMatches,
   projectColorForeground,
   clearNativeProjectColors,

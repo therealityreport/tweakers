@@ -140,22 +140,45 @@ function currentProjectContext(root = document) {
 }
 
 function refreshPolicy(state) {
+  if (state.disposed) return;
   const project = currentProjectContext();
   const signature = project ? `${project.id || ""}\0${project.workspacePath}` : null;
-  if (!project || state.policyPending || signature === state.policyContext) return;
+  if (!project) {
+    state.policyRequest = (state.policyRequest || 0) + 1;
+    state.policyPending = false;
+    state.policyContext = null;
+    state.policy = { ...DEFAULT_POLICY, enabled: false, exception: "project-unavailable" };
+    cleanupPanels(state);
+    return;
+  }
+  if (signature === state.policyContext) return;
+  const request = state.policyRequest = (state.policyRequest || 0) + 1;
   state.policyPending = true;
   state.policyContext = signature;
   state.policy = { ...DEFAULT_POLICY, enabled: false, exception: "pending-main-snapshot" };
+  cleanupPanels(state);
+  const current = () => {
+    if (state.disposed || request !== state.policyRequest) return false;
+    const projectNow = currentProjectContext();
+    const signatureNow = projectNow ? `${projectNow.id || ""}\0${projectNow.workspacePath}` : null;
+    if (signatureNow === signature) return true;
+    // Navigation can precede the next host-observer notification. Recheck the
+    // route at delivery as well, before accepting this project's policy.
+    refreshPolicy(state);
+    return false;
+  };
   state.api.ipc.invoke(POLICY_CHANNEL, { action: "get", project }).then((snapshot) => {
+    if (!current()) return;
     state.policy = normalizePolicySnapshot(snapshot) || { ...DEFAULT_POLICY, enabled: false, exception: "policy-unavailable" };
     if (state.policy.enabled) scan(state); else cleanupPanels(state);
   }).catch((error) => {
+    if (!current()) return;
     state.policy = { ...DEFAULT_POLICY, enabled: false, exception: "policy-unavailable" };
     // Clear the cached context so a transient failure does NOT permanently
     // disable follow-ups — the next mutation retries this project's policy.
     state.policyContext = null;
     state.api?.log?.debug?.("followup policy fetch failed", String(error));
-  }).finally(() => { state.policyPending = false; });
+  }).finally(() => { if (request === state.policyRequest) state.policyPending = false; });
 }
 
 function normalizePayload(value) {
@@ -425,8 +448,9 @@ function cleanupPanels(state) {
 }
 
 function scheduleScan(state, records) {
-  if (state.disposed || state.pending != null) return;
+  if (state.disposed) return;
   refreshPolicy(state);
+  if (state.pending != null) return;
   const roots = new Set();
   for (const record of records || []) {
     let node = record.target;
@@ -438,6 +462,9 @@ function scheduleScan(state, records) {
   }
   state.pending = (window.setTimeout || setTimeout)(() => {
     state.pending = null;
+    // The active project may change while this scan is waiting, even before
+    // another host notification. Never render with the queued route's policy.
+    refreshPolicy(state);
     scan(state, roots.size ? Array.from(roots) : undefined);
   }, 50);
 }

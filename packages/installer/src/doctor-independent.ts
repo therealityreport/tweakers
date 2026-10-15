@@ -1,3 +1,7 @@
+import { readSubmittedDoctorUpdateJob, readDoctorUpstreamCurrency } from "./doctor-updates.js";
+import { resolveBundledCodexBackend } from "./platform.js";
+import { readLocalArtifactSnapshot } from "./local-artifacts.js";
+import { readLocalOperation, withLocalOperation, hasInheritedLocalOperation } from "./local-operation.js";
 import { doctorImplementationScopes, sameDoctorCandidateImplementation } from "./doctor-implementation.js";
 import { readDoctorAdoption } from "./doctor-adoption.js";
 import { spawn } from "node:child_process";
@@ -15,6 +19,7 @@ import { inspectAccountRouter, inspectIndependentTweakersLiveHealth } from "./ac
 import { packagedRuntimeAssetsRoot } from "./commands/install.js";
 import { readRuntimeFingerprintEvidence } from "./runtime-fingerprint.js";
 import { ManagerOperationStore } from "./manager-operation-store.js";
+import { independentRefreshHasProvenRetryableFailure } from "./manager-status.js";
 import { doctorDigest, doctorDirectory, readDoctorPrivateJson, readDoctorUpdateJob } from "./doctor-store.js";
 
 export const DOCTOR_APP = "/Applications/Tweakers.app";
@@ -42,7 +47,7 @@ export function loadDoctorAuthPort(): {
 }
 export function doctorBundleIdentity(appPath: string): string {
   const info = readPlist(join(appPath, "Contents", "Info.plist"));
-  const backend = lstatSync(join(appPath, "Contents", "Resources", "codex"));
+  const backend = lstatSync(resolveBundledCodexBackend(appPath));
   const asar = lstatSync(join(appPath, "Contents", "Resources", "app.asar"));
   return doctorDigest({ appPath, info, asar: readHeaderHash(join(appPath, "Contents", "Resources", "app.asar")).headerHash,
     asarStat: { ino: asar.ino, dev: asar.dev, size: asar.size, ctimeMs: asar.ctimeMs, mtimeMs: asar.mtimeMs },
@@ -81,6 +86,14 @@ export function readDoctorIndependentInputs(root = canonicalTweakersManagerRoot(
     nativeVersion, nativeBuild, originalAsarHash: state.originalAsarHash, nativeIdentity,
     installedIdentity: doctorBundleIdentity(DOCTOR_APP), runtimeFingerprint: runtime.fingerprint };
 }
+/**
+ * The "installed" projection describes only the submitted job. A newer scan
+ * replaces the current candidate; its verified result must stay installable
+ * rather than inherit the previous job's completion.
+ */
+export function submittedInstallationDescribesCurrentCandidate(submittedJobId: string, currentCandidateId: string | null): boolean {
+  return currentCandidateId !== null && submittedJobId === currentCandidateId;
+}
 const blankUpdate = (): DoctorReportV1["update"] => ({ state: "not_checked", phase: "idle", candidateId: null,
   sourceFingerprint: null, tweakersFingerprint: null, candidateFingerprint: null, reviewFingerprint: null, progress: "No update review yet.", usage: null, handoff: null });
 export interface DoctorInspectionDependencies {
@@ -90,6 +103,13 @@ export interface DoctorInspectionDependencies {
   liveHealth?: typeof inspectIndependentTweakersLiveHealth;
 }
 export async function inspectIndependentDoctor(root = canonicalTweakersManagerRoot(), deps: DoctorInspectionDependencies = {}): Promise<DoctorReportV1> {
+  if(readLocalOperation()?.state === "running" && !hasInheritedLocalOperation())return inspectIndependentDoctorOwned(root,deps,true);
+  try {return await withLocalOperation("doctor status verification",()=>inspectIndependentDoctorOwned(root,deps,false),undefined,undefined,{wait:false});}
+  catch(error){if(readLocalOperation()?.state==="running"&&!hasInheritedLocalOperation())return inspectIndependentDoctorOwned(root,deps,true);throw error;}
+}
+async function inspectIndependentDoctorOwned(root:string,deps:DoctorInspectionDependencies,resourceBusy:boolean):Promise<DoctorReportV1> {
+  let scopes:ReturnType<typeof doctorImplementationScopes>|undefined;
+  const currentScopes=()=>scopes??=doctorImplementationScopes();
   const findings: DoctorFindingV1[] = [];
   const add = (id: string, stage: DoctorFindingV1["stage"], reason: string, title: string, detail: string, severity: DoctorFindingV1["severity"] = "error") => findings.push({ id, stage, severity, reason, title, detail, evidence: [] });
   let input: DoctorIndependentInputs | null = null, storage: DoctorStorageStatus | null = null;
@@ -126,8 +146,18 @@ export async function inspectIndependentDoctor(root = canonicalTweakersManagerRo
         const baselineChanged = job.baselineIdentity
           ? job.baselineIdentity !== doctorDigest({ version: input.version, build: input.build, originalAsarHash: input.originalAsarHash })
           : job.installedIdentity !== input.installedIdentity;
-        const stale = (job.workflowVersion !== 2 && job.nativeIdentity !== input.nativeIdentity) || baselineChanged;
-        const customizationChanged = !sameDoctorCandidateImplementation(job.implementationScopes, doctorImplementationScopes()) || job.installedIdentity !== input.installedIdentity;
+        // A finished "no update needed" check carries no saved upstream changes.
+        // It stays valid across a Tweakers reinstall until native becomes newer.
+        const nativeNewer = !!input.nativeBuild && /^\d+$/.test(input.nativeBuild) && /^\d+$/.test(input.build)
+          && BigInt(input.nativeBuild) > BigInt(input.build);
+        const upToDateCheck = job.result.phase === "current" && !job.candidatePackage && !job.candidateReceipt;
+        if (upToDateCheck && !nativeNewer) {
+          update.phase = "current";
+          if (update.execution) update.execution = { ...update.execution, status: "ready", recoverable: false };
+        }
+        const stale = (job.workflowVersion !== 2 && job.nativeIdentity !== input.nativeIdentity) || (baselineChanged && !(upToDateCheck && !nativeNewer))
+          || (upToDateCheck && nativeNewer);
+        const customizationChanged = !(upToDateCheck && !nativeNewer) && !resourceBusy && !sameDoctorCandidateImplementation(job.implementationScopes, currentScopes()) || job.installedIdentity !== input.installedIdentity;
         if (!stale && customizationChanged) {
           update.state = "review_required"; update.phase = "revalidation_required";
           if (update.execution) update.execution = { ...update.execution, status: "action_required", recoverable: true };
@@ -148,30 +178,53 @@ export async function inspectIndependentDoctor(root = canonicalTweakersManagerRo
           add("independent.update.stale", "compatibility", "stale_evidence", "Update review needs refreshing", update.progress, "warning");
         } else {
           findings.push(...job.findings);
-          if ((update.state === "review_required" || update.state === "fixes_required") && !job.findings.some(finding => finding.stage === "compatibility")) {
+          if (!(upToDateCheck && !nativeNewer) && (update.state === "review_required" || update.state === "fixes_required") && !job.findings.some(finding => finding.stage === "compatibility")) {
             add("independent.update.unresolved", "compatibility", "incomplete_review", "Update compatibility is unresolved",
               update.progress || "This saved review has no detailed findings. Scan again to collect complete evidence and compatibility checks.", "warning");
           }
         }
       }
-    } catch { update.state = "review_required"; update.progress = "Saved update evidence is invalid. Scan again."; }
+    } catch (error) {
+      update.state = "review_required"; update.phase = "revalidation_required";
+      if (update.execution) update.execution = { ...update.execution, status: "action_required", recoverable: true };
+      update.progress = `Update verification could not complete: ${error instanceof Error ? error.message : "Saved update evidence could not be read."}`;
+      add("independent.update.verification", "compatibility", "verification_unavailable", "Update verification needs attention", update.progress, "warning");
+    }
+  }
+  // The installed path can briefly disappear during an atomic promotion. Keep
+  // the saved job identity so the operation projection below continues polling
+  // until startup is verified instead of reverting to an idle "not checked" UI.
+  if (!input) {
+    try {
+      const job = readDoctorUpdateJob(root);
+      if (job) update = { ...job.result, state: "review_required", phase: "target_unavailable",
+        progress: "The installed app is temporarily unavailable. Checking the update operation…" };
+    } catch { /* An unreadable job cannot establish installation progress. */ }
   }
   const repairEnabled = !!input && storage?.state === "repairable" && broker !== "available" && broker !== "incompatible";
   let updateEnabled = false;
   const installationBlockers: string[] = [];
   if (input && update.state === "compatible" && update.phase === "candidate_verified" && update.candidateFingerprint) {
-    try { (await import("./doctor-approval.js")).verifyDoctorCandidate(root, undefined, false); updateEnabled = true; }
-    catch (error) { update.state = "review_required"; update.phase = "stale"; update.progress = "Candidate or compatibility evidence changed. Scan again."; installationBlockers.push(error instanceof Error ? error.message : update.progress); }
+    if (resourceBusy) {
+      update.state = "checking"; update.phase = "verification_queued";
+      update.progress = "Waiting for the current local operation to finish, then verifying the retained candidate. Reload status to continue.";
+      if (update.execution) update.execution = {...update.execution, status: "running", recoverable: true};
+      installationBlockers.push(update.progress);
+    } else {
+      try { (await import("./doctor-approval.js")).verifyDoctorCandidate(root, undefined, false); updateEnabled = true; }
+      catch (error) { update.state = "review_required"; update.phase = "stale"; update.progress = "Candidate or compatibility evidence changed. Scan again."; installationBlockers.push(error instanceof Error ? error.message : update.progress); }
+    }
   }
   try {
-    const submitted = readDoctorPrivateJson(join(doctorDirectory(root), "update-operation.json")) as { operationId?: string; jobId?: string } | null;
-    if (submitted?.jobId === update.candidateId && submitted?.operationId) {
+    const submitted = readSubmittedDoctorUpdateJob(root);
+    if (submitted) {
       const operation = new ManagerOperationStore(root).read(submitted.operationId);
       if (operation?.phase === "prepared" || operation?.phase === "consumed") {
         updateEnabled = false; update.state = "checking"; update.phase = "updating"; update.progress = "The manager is applying the approved candidate and verifying startup.";
         installationBlockers.push(update.progress);
-      } else if (operation?.phase === "completed" && operation.actionId === "refresh.independent" && input && health === "healthy") {
-        const installedJob = readDoctorUpdateJob(root);
+      } else if (operation?.phase === "completed" && operation.actionId === "refresh.independent" && input && health === "healthy"
+        && submittedInstallationDescribesCurrentCandidate(submitted.jobId, update.candidateId)) {
+        const installedJob = submitted.job;
         const active = readDoctorPrivateJson(join(input.variantRoot, "transactions", "variant-promotion", "active.json"));
         const { fingerprintVariantGeneration } = await import("./commands/create-variant.js");
         const observed = { app: fingerprintVariantGeneration(DOCTOR_APP), runtime: fingerprintVariantGeneration(input.runtimeRoot) };
@@ -181,7 +234,8 @@ export async function inspectIndependentDoctor(root = canonicalTweakersManagerRo
           installationBlockers.splice(0, installationBlockers.length, "This candidate is already installed.");
           for (let i = findings.length - 1; i >= 0; i--) if (["independent.update.stale", "independent.update.revalidation", "independent.update.unresolved"].includes(findings[i]!.id)) findings.splice(i, 1);
         }
-      } else if (operation?.phase === "failed" || operation?.phase === "recovery-required") {
+      } else if ((operation?.phase === "failed" || operation?.phase === "recovery-required")
+        && !independentRefreshHasProvenRetryableFailure(operation, root)) {
         updateEnabled = false; update.state = "review_required"; update.phase = "promotion_failed";
         update.progress = operation.error ? `Installation stopped: ${operation.error}` : "The update did not complete. Inspect manager recovery findings before retrying.";
         installationBlockers.push(update.progress);
@@ -203,26 +257,37 @@ export async function inspectIndependentDoctor(root = canonicalTweakersManagerRo
         configuredEffort: entry.metadata?.configuredEffort ?? null, stage: entry.metadata?.stage ?? null })) };
     } catch { /* Missing or invalid detailed usage is not reported as zero. */ }
   }
-  const previewJob = readDoctorUpdateJob(root);
-  const previewEnabled = !!adoption && adoption.state !== "superseded" && !!previewJob?.sourcePath && !!previewJob?.baselinePath && sameDoctorCandidateImplementation(previewJob.implementationScopes, doctorImplementationScopes()) && update.state !== "checking";
+  const previewBlocker = "Separate executable previews are disabled by the one-desktop/two-copy policy. Live checks run during the guarded update.";
   updateEnabled = updateEnabled && adoption?.state === "ready";
   const adoptionEnabled = !!adoption && adoption.state !== "superseded" && update.phase !== "updating" && update.state !== "checking";
+  const capacity = readLocalArtifactSnapshot(root);
+  const operation = readLocalOperation(join(root, "local-operation"));
+  const localResourceFinding: DoctorFindingV1 = { id: "independent.local-resources", stage: "candidate", severity: capacity && (capacity.occupied > 2 || capacity.blockers.length) ? "warning" : "info",
+    reason: "local_resource_limits", title: "Local build capacity", detail: `${capacity ? `${capacity.occupied}/2 build slots occupied at ${capacity.sampledAt}.` : "Artifact inventory has not been recorded."} Admission requires a fresh inventory. ${operation?.state === "running" ? `Active operation: ${operation.kind} (${operation.id}).` : "No active local operation."} ${capacity?.blockers.join("; ") ?? ""}`,
+    evidence: capacity?.paths ?? [] };
+  findings.push(localResourceFinding);
+  let upstreamCurrency: DoctorReportV1["upstreamCurrency"];
+  try { upstreamCurrency = readDoctorUpstreamCurrency(root) ?? undefined; } catch { /* Unreadable currency is unknown, never installation success. */ }
   const report: DoctorReportV1 = { schemaVersion: 1, workflowVersion: 2, kind: "tweakers-independent-doctor", generatedAt: new Date().toISOString(), fingerprint: "",
     target: { kind: "independent", appPath: DOCTOR_APP, version: input?.version ?? null, build: input?.build ?? null,
       runtimeRoot: input?.runtimeRoot ?? null, brokerRoot: input?.brokerRoot ?? null, nativeAppPath: DOCTOR_NATIVE_APP,
       nativeVersion: input?.nativeVersion ?? null, nativeBuild: input?.nativeBuild ?? null },
-    health: { state: health, broker }, update, adoption, findings, actions: [
+    health: { state: health, broker }, update, upstreamCurrency, adoption, findings, actions: [
       { id: "reconnect", label: `Reconnect ${authentication?.accounts[0]?.label ?? "account"}`, enabled: authentication?.state === "reconnect_required" && broker !== "incompatible", blockers: authentication?.state === "reconnect_required" ? [] : ["No verified account reconnect is available."] },
       { id: "scan", label: "Check for updates", enabled: !!input && !reviewWorkerRunning && update.state !== "checking" && update.phase !== "updating", blockers: input ? reviewWorkerRunning || update.state === "checking" || update.phase === "updating" ? ["An update check or installation is already running. Reload status to see its progress."] : [] : ["Verify the independent installation first."] },
       { id: "repair", label: "Repair storage binding", enabled: repairEnabled, blockers: repairEnabled ? [] : [storage?.state === "repairable" ? "The Accounts broker must be idle before metadata repair." : "No verified metadata-only repair is available."] },
       { id: "retry", label: "Retry Tweakers", enabled: !!input && storage?.state === "ready", blockers: storage?.state === "ready" ? [] : ["Resolve storage preflight before retrying."] },
-      { id: "update", label: "Install verified update", enabled: updateEnabled, blockers: updateEnabled ? [] : [...new Set([...(adoption?.blockers ?? []), ...(installationBlockers.length ? installationBlockers : ["Compatibility and candidate verification must also pass."])])] },
+      { id: "update", label: "Install verified update", enabled: updateEnabled, blockers: updateEnabled ? [] : [...new Set([...(adoption?.blockers ?? []), ...(installationBlockers.length ? installationBlockers : [update.progress || "Compatibility and candidate verification must also pass."])])] },
       { id: "decide", label: "Optional update changes", enabled: adoptionEnabled, blockers: adoptionEnabled ? [] : ["Wait for a current change report."] },
-      { id: "preview_before", label: "Preview current version", enabled: previewEnabled, blockers: previewEnabled ? [] : ["Verify the candidate and retained source before previewing."] },
-      { id: "preview_after", label: "Preview update", enabled: previewEnabled, blockers: previewEnabled ? [] : ["Verify the candidate and retained source before previewing."] },
+      { id: "preview_before", label: "Preview current version", enabled: false, blockers: [previewBlocker] },
+      { id: "preview_after", label: "Preview update", enabled: false, blockers: [previewBlocker] },
       { id: "observe", label: "Record manual comparison", enabled: adoptionEnabled, blockers: adoptionEnabled ? [] : ["Wait for a current change report."] },
     ] };
-  report.fingerprint = doctorDigest({ input, storage, authentication, health: report.health, update, adoption, findings, actions: report.actions });
+  // Status inspection itself acquires a new operation ID. That observational
+  // resource detail must not invalidate the next action on unchanged inputs.
+  // Action availability and execution still perform fresh admission checks.
+  report.fingerprint = doctorDigest({ input, storage, authentication, health: report.health, update, adoption,
+    findings: findings.filter(finding => finding !== localResourceFinding), actions: report.actions });
   return report;
 }
 
@@ -251,8 +316,11 @@ export function parseDoctorAction(value: unknown): DoctorActionRequestV1 {
 }
 export function openIndependentDoctorWindow(managerLauncher: string, section?: TweakersManagerSection): void {
   if (section !== undefined && !isTweakersManagerSection(section)) throw new Error("Invalid Manager section");
-  const helper = join(packagedRuntimeAssetsRoot(), "native", "Tweakers Doctor.app", "Contents", "MacOS", "Tweakers Doctor");
-  if (!existsSync(helper) || lstatSync(helper).isSymbolicLink()) throw new Error("Standalone Doctor is not packaged");
+  const native = join(packagedRuntimeAssetsRoot(), "native");
+  const current = join(native, "Tweakers Manager.app", "Contents", "MacOS", "Tweakers Manager");
+  // Runtimes packaged before the rename ship the same app under its old name.
+  const helper = existsSync(current) ? current : join(native, "Tweakers Doctor.app", "Contents", "MacOS", "Tweakers Doctor");
+  if (!existsSync(helper) || lstatSync(helper).isSymbolicLink()) throw new Error("Tweakers Manager is not packaged");
   const child = spawn(helper, [managerLauncher, ...(section ? ["--section", section] : [])], { detached: true, stdio: "ignore", env: { HOME: targetUserHome(), PATH: "/usr/bin:/bin:/usr/sbin:/sbin" } });
   child.unref();
 }

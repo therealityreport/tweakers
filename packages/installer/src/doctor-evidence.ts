@@ -1,3 +1,5 @@
+import { BUNDLED_CODEX_BACKEND_PATHS, resolveBundledCodexBackend } from "./platform.js";
+import { doctorSourceFile, hasDoctorBaseline, readDoctorBaseline } from "./doctor-baseline.js";
 import asar from "@electron/asar";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -59,11 +61,12 @@ export interface DoctorSourceEvidence {
   schemaVersion: 1;
   kind: "tweakers-doctor-source-evidence";
   collectorVersion?: number;
+  baselineFingerprint?: string;
   appPath: string;
   version: string | null;
   build: string | null;
   backend: {
-    path: "Contents/Resources/codex";
+    path: typeof BUNDLED_CODEX_BACKEND_PATHS[number];
     version: string | null;
     sha256: DoctorSourceSha256 | null;
   };
@@ -155,6 +158,7 @@ export interface DoctorSourceComparison {
 
 interface DoctorCommandResult {
   status: number | null;
+  signal?: string | null;
   stdout?: string;
   stderr?: string;
   error?: { message?: string };
@@ -205,7 +209,8 @@ export async function collectDoctorSourceEvidence(
 
   const unresolvedEvidence: string[] = [];
   const info = readBundleVersion(appRoot, unresolvedEvidence);
-  const shippedFiles = collectTreeInventory(appRoot, unresolvedEvidence, "app");
+  const baseline = hasDoctorBaseline(appRoot) ? readDoctorBaseline(appRoot) : null;
+  const shippedFiles = baseline?.originalFiles ?? collectTreeInventory(appRoot, unresolvedEvidence, "app");
   // Reuse only complete, locally retained evidence after rehashing the entire app
   // inventory and generated schemas. Missing or changed bytes regenerate output.
   try {
@@ -216,7 +221,7 @@ export async function collectDoctorSourceEvidence(
       const problems: string[] = [];
       const schemaFiles = collectTreeInventory(schemaRoot, problems, "schema", true);
       const schemaProblem = schemaInventoryProblem(schemaRoot, schemaFiles, problems);
-      if (cached.complete && cached.appPath === appRoot
+      if (cached.complete && cached.baselineFingerprint === baseline?.fingerprint && cached.appPath === appRoot
         && cached.version === info.version && cached.build === info.build && !unresolvedEvidence.length
         && cached.schemas.state === "complete" && cached.schemas.problem === null && schemaProblem === null
         && canonicalJson(cached.shippedFiles) === canonicalJson(shippedFiles)
@@ -226,8 +231,11 @@ export async function collectDoctorSourceEvidence(
     }
   } catch { /* Recover by rebuilding disposable evidence; never bless a partial cache. */ }
 
-  const backendRelativePath = "Contents/Resources/codex" as const;
-  const backendPath = join(appRoot, ...backendRelativePath.split("/"));
+  const backendRelativePath = BUNDLED_CODEX_BACKEND_PATHS.find(path => baseline
+    ? baseline.files.some(file => file.path === path)
+    : existsSync(join(appRoot, path))) ?? BUNDLED_CODEX_BACKEND_PATHS[0];
+  let backendPath = doctorSourceFile(appRoot, backendRelativePath);
+  if (!baseline && existsSync(backendPath)) backendPath = resolveBundledCodexBackend(appRoot);
   let backendSha256: DoctorSourceSha256 | null = null;
   let backendVersion: string | null = null;
   if (isRegularFile(backendPath)) {
@@ -244,11 +252,11 @@ export async function collectDoctorSourceEvidence(
       unresolvedEvidence.push(`backend-version-unavailable:${commandProblem(versionResult)}`);
     }
   } else {
-    unresolvedEvidence.push("backend-missing:Contents/Resources/codex");
+    unresolvedEvidence.push(`backend-missing:${backendRelativePath}`);
   }
 
   const asarRelativePath = "Contents/Resources/app.asar" as const;
-  const asarPath = join(appRoot, ...asarRelativePath.split("/"));
+  const asarPath = doctorSourceFile(appRoot, asarRelativePath);
   let asarSha256: DoctorSourceSha256 | null = null;
   let asarMembers: DoctorSourceAsarMemberEvidence[] = [];
   if (isRegularFile(asarPath)) {
@@ -270,6 +278,7 @@ export async function collectDoctorSourceEvidence(
     schemaVersion: 1 as const,
     kind: "tweakers-doctor-source-evidence" as const,
     collectorVersion: DOCTOR_SOURCE_COLLECTOR_VERSION,
+    ...(baseline ? {baselineFingerprint:baseline.fingerprint} : {}),
     appPath: appRoot,
     version: info.version,
     build: info.build,
@@ -726,7 +735,7 @@ function unresolved(reason: string): Pick<DoctorSourceChange, "relevance" | "are
 }
 
 function readBundleVersion(appRoot: string, problems: string[]): { version: string | null; build: string | null } {
-  const path = join(appRoot, "Contents", "Info.plist");
+  const path = doctorSourceFile(appRoot, "Contents/Info.plist");
   try {
     const raw = readFileSync(path);
     let parsed: Record<string, unknown>;
@@ -781,6 +790,7 @@ function fingerprintPayload(payload: Omit<DoctorSourceEvidence, "fingerprint">):
   return {
     schemaVersion: payload.schemaVersion,
     kind: payload.kind,
+    ...(payload.baselineFingerprint ? {baselineFingerprint:payload.baselineFingerprint} : {}),
     version: payload.version,
     build: payload.build,
     backend: payload.backend,
@@ -923,7 +933,7 @@ function nonEmptyString(value: unknown): string | null {
 }
 
 function commandProblem(result: DoctorCommandResult): string {
-  return result.error?.message ?? result.stderr?.trim() ?? result.stdout?.trim() ?? `exit ${result.status ?? "unknown"}`;
+  return result.error?.message || result.stderr?.trim() || result.stdout?.trim() || (result.signal ? `terminated by ${result.signal}` : `exit ${result.status ?? "unknown"}`);
 }
 
 function slashPath(path: string): string { return path.split(sep).join("/"); }

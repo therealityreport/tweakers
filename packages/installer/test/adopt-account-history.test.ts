@@ -75,7 +75,7 @@ test("CLI formatter exposes only redacted evidence fields", () => {
     legacyOwnerOpaqueAccountId: `ar_${"a".repeat(43)}`,
     sourcePath: "/synthetic/legacy/codex/auth.json",
     threadId: "01a05546-cf93-7383-96ed-dc76ce3d1b3c",
-  } as HistoryAdoptionResult & Record<string, string>;
+  } as unknown as HistoryAdoptionResult & Record<string, string>;
   const output = JSON.stringify(formatAdoptAccountHistoryResult(withPrivateExtras));
 
   assert.doesNotMatch(output, /ar_[A-Za-z0-9_-]+/);

@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+import { transpileModule } from "typescript";
 
 const mainSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/main.ts"), "utf8");
 const promotionHealthSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/promotion-health.ts"), "utf8");
@@ -11,6 +13,18 @@ const promotionPolicySource = readFileSync(join(dirname(fileURLToPath(import.met
 const preloadSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/preload/index.ts"), "utf8");
 const originalHealthPreloadSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/promotion-health-preload.ts"), "utf8");
 const rendererMountSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/preload/promotion-renderer-mount.ts"), "utf8");
+
+test("ordinary preload starts tweak services only in native app UI documents", () => {
+  const from = preloadSource.indexOf("function isTweakerUiDocument(");
+  const to = preloadSource.indexOf("async function boot()", from);
+  assert.ok(from >= 0 && to > from);
+  const { outputText } = transpileModule(preloadSource.slice(from, to), {});
+  const accepts = runInNewContext(outputText + ";isTweakerUiDocument", { URL });
+  for (const url of ["app://-/index.html", "app://-/index.html?initialRoute=%2Fthread%2Fexample", "app://-/detached-window.html?initialRoute=%2Fdetached-window"]) assert.equal(accepts(url), true, url);
+  for (const url of ["about:blank?toUrl=checkout", "https://chatgpt.com/api/auth/session", "https://chatgpt.com/?source=codex-embedded-checkout", "codex-sandbox://example/", "app://-/index.html?initialRoute=%2Favatar-overlay", "app://other/index.html", "app://user@-/index.html", "invalid"]) assert.equal(accepts(url), false, url);
+  const boot = preloadSource.slice(to, preloadSource.indexOf("function subscribeReload", to));
+  assert.ok(boot.indexOf("if (!isTweakerUiDocument(location.href)) return;") < boot.indexOf("startDesktopUpdateIndicator()"));
+});
 
 function sourceBlock(start: string, end: string): string {
   const first = mainSource.indexOf(start);
@@ -65,7 +79,8 @@ test("derived runtime health is bound to the exact Tweakers bundle and never nor
   assert.doesNotMatch(capture, /setZoomFactor\([^1]/);
 
   const receipt = sourceBlock("function tryWriteRuntimeReadyReceipt", "function currentProcessStartToken");
-  assert.match(receipt, /schemaVersion: 5/);
+  assert.match(receipt, /\.\.\.acceptedRuntimeRepairReadinessFields\(expectation\)/);
+  assert.doesNotMatch(receipt, /schemaVersion: \d/);
   assert.match(receipt, /brokerAuthorityExpectation: brokerAuthority/);
   assert.match(receipt, /sameRuntimeReadyBrokerAuthorityExpectation/);
   assert.match(receipt, /scheduleIndependentTweakersLiveHealthCapture/);
@@ -394,11 +409,11 @@ test("original-main health mode retains cleanup and sandbox safeguards", () => {
     "captured windows must be destroyed before activation interceptors are restored",
   );
 
-  const ready = sourceBlock("app.whenReady().then", "if (!healthCheckOnly) {\n  app.on(\"session-created\"");
+  const ready = sourceBlock("app.whenReady().then(() => {", "if (!healthCheckOnly) {\n  app.on(\"session-created\"");
   assert.match(ready, /originalMainPromotionProbe\?\.registerSession\(session\.defaultSession/);
   assert.match(ready, /healthOriginalMain\s*\? await originalMainPromotionProbe!\.run\(\)/);
   assert.ok(
-    mainSource.indexOf("const originalMainPromotionProbe =") < mainSource.indexOf("app.whenReady().then"),
+    mainSource.indexOf("const originalMainPromotionProbe =") < mainSource.indexOf("app.whenReady().then(() => {"),
     "the original-main controller and its ready listener must be created before the whenReady fallback",
   );
   assert.match(mainSource, /healthOriginalMain && process\.platform === "darwin" && !codexAppServerParent\.installed/);
@@ -524,11 +539,11 @@ test("original-main health mode observes Codex's hidden real window without owni
     "captured windows must be destroyed before activation interceptors are restored",
   );
 
-  const ready = sourceBlock("app.whenReady().then", "if (!healthCheckOnly) {\n  app.on(\"session-created\"");
+  const ready = sourceBlock("app.whenReady().then(() => {", "if (!healthCheckOnly) {\n  app.on(\"session-created\"");
   assert.match(ready, /originalMainPromotionProbe\?\.registerSession\(session\.defaultSession/);
   assert.match(ready, /healthOriginalMain\s*\? await originalMainPromotionProbe!\.run\(\)/);
   assert.ok(
-    mainSource.indexOf("const originalMainPromotionProbe =") < mainSource.indexOf("app.whenReady().then"),
+    mainSource.indexOf("const originalMainPromotionProbe =") < mainSource.indexOf("app.whenReady().then(() => {"),
     "the original-main controller and its ready listener must be created before the whenReady fallback",
   );
   assert.match(mainSource, /healthOriginalMain && process\.platform === "darwin" && !codexAppServerParent\.installed/);

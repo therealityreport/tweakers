@@ -1,3 +1,4 @@
+import { doctorSourceFile } from "./doctor-baseline.js";
 import { randomUUID } from "node:crypto";
 import { parse } from "acorn";
 import { changeReportFingerprint } from "./doctor-adoption.js";
@@ -899,7 +900,7 @@ function readRetainedSource(
     let bytes: Buffer;
     if (artifact === "asar_member") {
       const root = resolve(evidence.appPath);
-      const archive = resolve(root, evidence.asar.path);
+      const archive = doctorSourceFile(root, evidence.asar.path);
       if (!archive.startsWith(`${root}${sep}`) || path.split("/").some(part => !part || part === "." || part === "..")) return null;
       const stat = lstatSync(archive);
       if (!stat.isFile() || stat.isSymbolicLink()) return null;
@@ -908,7 +909,7 @@ function readRetainedSource(
     } else if (artifact === "shipped_file" || artifact === "schema") {
       if (artifact === "schema" && !evidence.schemas.root) return null;
       const root = resolve(artifact === "schema" ? evidence.schemas.root! : evidence.appPath);
-      const absolute = resolve(root, path);
+      const absolute = artifact === "schema" ? resolve(root,path) : doctorSourceFile(root,path);
       if (!absolute.startsWith(`${root}${sep}`) || realpathSync(root) !== root
         || realpathSync(absolute) !== absolute) return null;
       const stat = lstatSync(absolute);

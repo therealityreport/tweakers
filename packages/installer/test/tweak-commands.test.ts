@@ -536,6 +536,10 @@ test("managed runtime can be staged to an isolated destination with deterministi
     symlinkSync("../missing-package", join(source, "node_modules", "broken-link"));
     writeFileSync(join(live, "sentinel.txt"), "live runtime remains untouched\n");
 
+    mkdirSync(join(source, "node_modules/electron/dist/Electron.app"), { recursive: true });
+    writeFileSync(join(source, "node_modules/electron/index.d.ts"), "declarations");
+    mkdirSync(join(source, "packages/installer/assets/managed-runtime"), { recursive: true });
+    writeFileSync(join(source, "packages/installer/assets/managed-runtime/obsolete"), "recursive output");
     const result = stageManagedRuntime(source, staged, {
       provenance: {
         kind: "development-bootstrap",
@@ -545,6 +549,9 @@ test("managed runtime can be staged to an isolated destination with deterministi
     });
 
     assert.equal(result, staged);
+    assert.equal(existsSync(join(staged, "node_modules/electron/dist")), false);
+    assert.equal(readFileSync(join(staged, "node_modules/electron/index.d.ts"), "utf8"), "declarations");
+    assert.equal(existsSync(join(staged, "packages/installer/assets/managed-runtime")), false);
     assert.equal(readFileSync(join(staged, "packages", "installer", "dist", "cli.js"), "utf8"), "candidate\n");
     assert.equal(existsSync(join(staged, ".git")), false);
     assert.equal(existsSync(join(staged, "local-notes.txt")), false);

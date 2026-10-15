@@ -13,7 +13,7 @@ test("host surfaces expose the approved semantic renderer seam", () => {
     assert.match(source, new RegExp(`"${kind}"`));
   }
   assert.match(sdk, /host: HostUiApi/);
-  assert.match(host, /host: hostUiApi/);
+  assert.match(host, /host: \{ \.\.\.hostUiApi, observe: \(kinds, listener\) => resources\.add\(hostUiApi\.observe\(kinds, listener\)\)/);
 });
 
 test("all Tweakers share one coalesced mutation observer", () => {
@@ -136,10 +136,10 @@ test("Accounts native bridge discards a response after that surface changes sele
   });
   bridge.setCompatibility({ compatible: true, hookSetSha256: hookHash });
   assert.equal(bridge.transport.initialize({ version: 1, hookSetSha256: hookHash }), true);
-  bridge.api.select("mcp", accountOne);
-  const pending = bridge.transport.request("mcp", "mcpServerStatus/list", {}, bridge.transport.snapshot("mcp"));
+  bridge.api.select("usage", accountOne);
+  const pending = bridge.transport.request("usage", "usage.analytics.read", { kind: "plan-history", days: 7 }, bridge.transport.snapshot("usage"));
   await Promise.resolve();
-  bridge.api.select("mcp", accountTwo);
+  bridge.api.select("usage", accountTwo);
   release();
   await assert.rejects(pending, /stale-native-selection/);
   bridge.dispose();

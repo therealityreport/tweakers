@@ -27,6 +27,7 @@ const METHOD_SURFACES: Readonly<Record<string, readonly NativeRequestSurfaceV1[]
   "skills/list": ["plugins"],
   "browser.sync": ["plugins"], "browser.install": ["plugins"], "browser.uninstall": ["plugins"],
   "usage.credits.read": ["usage"], "usage.credits.consume": ["usage"],
+  "usage.analytics.read": ["usage"],
 });
 
 export function parseNativeRequestV1(value: unknown): NativeRequestV1 | null {
@@ -125,6 +126,146 @@ export async function requestNativeUsageCreditsV1(
     credentials.accessToken = "";
     credentials.accountId = "";
   }
+}
+
+export type UsageAnalyticsParamsV1 =
+  | { kind: "thread-usage"; preferred_source?: "query_v1"; threads: Array<{ thread_id: string; created_at: string | null; descendant_thread_ids: string[] }> }
+  | { kind: "plan-history"; days: 7 }
+  | { kind: "daily-history"; start_date: string; end_date: string }
+  | { kind: "credit-events" };
+
+type UsageAnalyticsResultV1 = {
+  status: "full" | "partial" | "unsupported" | "authentication-error" | "transient-error";
+  source: "query_v2" | "query_v1" | "plan_limit_history" | "daily_token_usage_breakdown" | "credit_usage_events" | null;
+  value: unknown | null;
+};
+
+/**
+ * Read-only, account-bound Analytics transport. HTTP status is data here:
+ * renderer compatibility code must distinguish an unshipped endpoint from a
+ * stale login or a retryable provider failure without ever receiving tokens.
+ */
+export async function requestNativeUsageAnalyticsV1(
+  codexHome: string,
+  params: UsageAnalyticsParamsV1,
+): Promise<UsageAnalyticsResultV1> {
+  const credentials = readChatGptCredentials(join(codexHome, "auth.json"));
+  if (!credentials) return { status: "authentication-error", source: null, value: null };
+  const request = async (path: string, body?: unknown): Promise<{ status: number; value: unknown | null }> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    timer.unref();
+    try {
+      const response = await fetch(`https://chatgpt.com/backend-api${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        redirect: "manual",
+        signal: controller.signal,
+        headers: {
+          authorization: `Bearer ${credentials.accessToken}`,
+          ...(credentials.accountId ? { "chatgpt-account-id": credentials.accountId } : {}),
+          "OAI-Product-Sku": "CODEX",
+          accept: "application/json",
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+        return { status: response.status || 503, value: null };
+      }
+      const declared = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > NATIVE_REQUEST_USAGE_MAX_RESULT_BYTES) throw new Error("native analytics response too large");
+      const bytes = await readBoundedHttpResponse(response, NATIVE_REQUEST_USAGE_MAX_RESULT_BYTES);
+      let value: unknown | null = null;
+      if (bytes.byteLength > 0) {
+        try { value = JSON.parse(new TextDecoder().decode(bytes)) as unknown; } catch { value = null; }
+      }
+      return { status: response.status, value };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const outcome = (status: number): UsageAnalyticsResultV1["status"] => status === 404 ? "unsupported"
+    : status === 401 || status === 403 ? "authentication-error" : "transient-error";
+  try {
+    if (params.kind === "plan-history") {
+      const response = await request(`/wham/usage/plan_limit_history?days=${params.days}`);
+      if (response.status === 200 && isBoundedNativeResultV1(response.value, "usage")) {
+        return { status: "full", source: "plan_limit_history", value: response.value };
+      }
+      return { status: outcome(response.status), source: "plan_limit_history", value: null };
+    }
+    if (params.kind === "daily-history" || params.kind === "credit-events") {
+      const source = params.kind === "daily-history" ? "daily_token_usage_breakdown" : "credit_usage_events";
+      const path = params.kind === "daily-history"
+        ? `/wham/usage/daily-token-usage-breakdown?start_date=${params.start_date}&end_date=${params.end_date}&group_by=day`
+        : "/wham/usage/credit-usage-events";
+      const response = await request(path);
+      if (response.status === 200 && isBoundedNativeResultV1(response.value, "usage")) {
+        return { status: "full", source, value: response.value };
+      }
+      return { status: outcome(response.status), source, value: null };
+    }
+    if (params.preferred_source !== "query_v1") {
+      const v2 = await request("/wham/usage/thread_usage/query_v2", { threads: params.threads });
+      if (v2.status === 200 && isBoundedNativeResultV1(v2.value, "usage")) {
+        return { status: "full", source: "query_v2", value: v2.value };
+      }
+      if (v2.status !== 404) return { status: outcome(v2.status), source: "query_v2", value: null };
+    }
+    let legacyAttempts = 0;
+    const requestLegacy = async (threadIds: string[]): Promise<{ status: number; value: unknown | null }> => {
+      if (legacyAttempts >= 8) return { status: 503, value: null };
+      legacyAttempts += 1;
+      const response = await request("/wham/usage/thread_usage/query", { thread_ids: threadIds });
+      if (response.status !== 503) return response;
+      if (threadIds.length <= 1) return { status: 503, value: null };
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(400, 50 * 2 ** Math.min(legacyAttempts, 3))));
+      const middle = Math.ceil(threadIds.length / 2);
+      const left = await requestLegacy(threadIds.slice(0, middle));
+      if (left.status !== 200) return left;
+      const right = await requestLegacy(threadIds.slice(middle));
+      if (right.status !== 200) return right;
+      const leftThreads = isPlainRecord(left.value) && Array.isArray(left.value.threads) ? left.value.threads : [];
+      const rightThreads = isPlainRecord(right.value) && Array.isArray(right.value.threads) ? right.value.threads : [];
+      return { status: 200, value: { threads: [...leftThreads, ...rightThreads] } };
+    };
+    const v1 = await requestLegacy(params.threads.map((thread) => thread.thread_id));
+    if (v1.status === 200 && isPlainRecord(v1.value) && Array.isArray(v1.value.threads)) {
+      const threads = v1.value.threads.flatMap((thread): Record<string, unknown>[] => {
+        if (!isPlainRecord(thread) || typeof thread.thread_id !== "string") return [];
+        const credits = finiteMicros(thread.estimated_usage_credits_micros);
+        const groups = Array.isArray(thread.groups) ? thread.groups.flatMap((group): Record<string, unknown>[] => {
+          if (!isPlainRecord(group)) return [];
+          return [{
+            ...group,
+            five_hour_limit_percent: null,
+            weekly_limit_percent: null,
+            balance_usage_credits: finiteMicros(group.estimated_usage_credits_micros),
+          }];
+        }) : [];
+        return [{
+          thread_id: thread.thread_id,
+          data_status: "partial",
+          five_hour_limit_percent: null,
+          weekly_limit_percent: null,
+          balance_usage_credits: credits,
+          groups,
+        }];
+      });
+      const value = { threads, data_as_of: null, tweakers_status: "partial", tweakers_source: "query_v1" };
+      if (!isBoundedNativeResultV1(value, "usage")) throw new Error("native analytics response too large");
+      return { status: "partial", source: "query_v1", value };
+    }
+    return { status: outcome(v1.status), source: "query_v1", value: null };
+  } finally {
+    credentials.accessToken = "";
+    credentials.accountId = "";
+  }
+}
+
+function finiteMicros(value: unknown): number | null {
+  const micros = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(micros) && micros >= 0 ? micros / 1_000_000 : null;
 }
 
 export async function requestNativeHttpV1(
@@ -261,6 +402,7 @@ function validateMethodParams(surface: NativeRequestSurfaceV1, method: string, v
       || (value.creditId !== undefined && value.creditId !== null && !safeCreditId(value.creditId))) return null;
     return { ...(value.creditId !== undefined ? { creditId: value.creditId } : {}), redeemRequestId: value.redeemRequestId };
   }
+  if (method === "usage.analytics.read") return validateUsageAnalyticsParams(value);
   if (method === "app/list") {
     if (keys.some((key) => key !== "cursor" && key !== "limit" && key !== "forceRefetch" && key !== "threadId")) return null;
     if (value.cursor !== undefined && value.cursor !== null && !safeCursor(value.cursor)) return null;
@@ -310,6 +452,11 @@ interface NativeHttpTargetV1 {
   path: string;
   query: Readonly<Record<string, string | boolean>>;
   body?: Record<string, unknown>;
+}
+
+/** The broker must route plugin control reads through its installed authority. */
+export function parseNativePluginHttpTargetV1(value: Record<string, unknown>): NativeHttpTargetV1 | null {
+  return nativeHttpTarget("plugins", value);
 }
 
 function nativeHttpTarget(surface: NativeRequestSurfaceV1, value: Record<string, unknown>): NativeHttpTargetV1 | null {
@@ -401,6 +548,47 @@ function nativeHttpTarget(surface: NativeRequestSurfaceV1, value: Record<string,
 
 function exactPathId(value: Record<string, unknown>, key: string): string | null {
   return exactKeys(value, [key]) && safeIdentifier(value[key], 512) ? value[key] : null;
+}
+
+function validateUsageAnalyticsParams(value: Record<string, unknown>): Record<string, unknown> | null {
+  if (value.kind === "plan-history") {
+    return exactKeys(value, ["days", "kind"]) && value.days === 7 ? { kind: "plan-history", days: 7 } : null;
+  }
+  if (value.kind === "credit-events") return exactKeys(value, ["kind"]) ? { kind: "credit-events" } : null;
+  if (value.kind === "daily-history") {
+    if (!exactKeys(value, ["end_date", "kind", "start_date"])) return null;
+    const day = (candidate: unknown): number | null => {
+      if (typeof candidate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(candidate)) return null;
+      const timestamp = Date.parse(`${candidate}T00:00:00.000Z`);
+      return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === candidate ? timestamp : null;
+    };
+    const start = day(value.start_date), end = day(value.end_date);
+    return start !== null && end !== null && end >= start && end - start < 30 * 86_400_000
+      ? { kind: "daily-history", start_date: value.start_date, end_date: value.end_date } : null;
+  }
+  if (value.kind !== "thread-usage" || !exactKeys(value, value.preferred_source === undefined ? ["kind", "threads"] : ["kind", "preferred_source", "threads"])
+    || value.preferred_source !== undefined && value.preferred_source !== "query_v1"
+    || !Array.isArray(value.threads) || value.threads.length < 1 || value.threads.length > 100) return null;
+  let totalIds = 0;
+  const seen = new Set<string>();
+  const threads: Array<{ thread_id: string; created_at: string | null; descendant_thread_ids: string[] }> = [];
+  for (const raw of value.threads) {
+    if (!isPlainRecord(raw) || !exactKeys(raw, ["created_at", "descendant_thread_ids", "thread_id"])
+      || !safeIdentifier(raw.thread_id, 512) || seen.has(raw.thread_id)
+      || raw.created_at !== null && (!safeIdentifier(raw.created_at, 64) || !Number.isFinite(Date.parse(raw.created_at)))
+      || !Array.isArray(raw.descendant_thread_ids) || raw.descendant_thread_ids.length > 1_000) return null;
+    const descendants: string[] = [];
+    seen.add(raw.thread_id);
+    for (const id of raw.descendant_thread_ids) {
+      if (!safeIdentifier(id, 512) || seen.has(id)) return null;
+      seen.add(id);
+      descendants.push(id);
+    }
+    totalIds += 1 + descendants.length;
+    if (totalIds > 1_000) return null;
+    threads.push({ thread_id: raw.thread_id, created_at: raw.created_at as string | null, descendant_thread_ids: descendants });
+  }
+  return { kind: "thread-usage", ...(value.preferred_source === "query_v1" ? { preferred_source: "query_v1" } : {}), threads };
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {

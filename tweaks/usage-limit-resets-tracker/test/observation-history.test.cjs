@@ -26,7 +26,14 @@ test("unknown stored schema has an explicit Unknown display state", () => {
   assert.match(source, /Unknown usage history schema/);
 });
 
-test("Accounts context is bounded, selected by opaque ID, and never retains account identity or secrets", () => {
+test("Analytics renders local reset observations as a separate non-provider section", () => {
+  assert.match(source, /Observed resets on this Mac/);
+  assert.match(source, /local counter transitions, not provider plan-usage history/);
+  assert.match(source, /data-tweakers-analytics-observed-resets/);
+  assert.doesNotMatch(helpers.renderAnalyticsObservedResets.toString(), /five_hour_limit_percent|weekly_limit_percent|basisPoints/);
+});
+
+test("Accounts context accepts masked subscription labels without retaining unmasked identity or secrets", () => {
   const primaryAccountId = brokerAccountId("primary");
   const context = helpers.normalizeAccountsContext({
     version: 1,
@@ -63,6 +70,16 @@ test("Accounts context is bounded, selected by opaque ID, and never retains acco
     version: 1,
     accounts: [{ accountId: brokerAccountId("unsafe-label"), label: "private@example.test", quota: { remainingPercent: 1 } }],
   }), null);
+  const masked = helpers.normalizeAccountsContext({
+    version: 1,
+    selectedAccountId: primaryAccountId,
+    accounts: [
+      { accountId: primaryAccountId, label: "c•••••@thereality.report", quota: { remainingPercent: 43 } },
+      { accountId: brokerAccountId("secondary"), label: "a•••••@thereality.report", quota: { remainingPercent: 5 } },
+    ],
+  });
+  assert.deepEqual(masked?.accounts.map((account) => account.label), ["c•••••@thereality.report", "a•••••@thereality.report"]);
+  assert.equal(masked?.selectedAccountId, primaryAccountId);
   assert.equal(helpers.normalizeAccountsContext({
     version: 1,
     accounts: [{ accountId: "chatgpt-provider-account-12345678", label: "Primary", quota: { remainingPercent: 1 } }],
@@ -103,6 +120,37 @@ test("native Usage selector excludes sidebar matches and requires a concrete dia
     closest(selector) { return selector.includes("sidebar") ? sidebar : null; },
   };
   assert.equal(helpers.nativeUsageSelectorTarget([{ kind: "usage", confidence: "high", element: sidebar }]), null);
+});
+
+test("native Usage selector uses the reviewed Analytics slot only with its route marker", () => {
+  const slot = {
+    isConnected: true,
+    append() {},
+    querySelector() { return null; },
+    closest() { return null; },
+  };
+  const history = { isConnected: true, closest() { return null; } };
+  const previousDocument = global.document;
+  let contexts = [history];
+  let slots = [slot];
+  global.document = {
+    querySelectorAll(selector) {
+      return selector === "[data-tweakers-usage-account]" ? contexts
+        : selector === '[data-tweakers-native-surface="usage"]' ? slots : [];
+    },
+  };
+  try {
+    assert.equal(helpers.nativeUsageSelectorTarget([]), slot);
+    contexts = [];
+    assert.equal(helpers.nativeUsageSelectorTarget([]), null);
+    contexts = [history];
+    slots = [slot, { ...slot }];
+    assert.equal(helpers.nativeUsageSelectorTarget([]), null);
+    slots = [{ ...slot, closest() { return {}; } }];
+    assert.equal(helpers.nativeUsageSelectorTarget([]), null);
+  } finally {
+    global.document = previousDocument;
+  }
 });
 
 // Loop fix: an observation that only advances observedAt (same counters) must
@@ -209,4 +257,117 @@ test("version-one history migrates and keeps prior events with unknown cause", (
   assert.equal(migrated.schemaVersion, helpers.SCHEMA_VERSION);
   assert.equal(migrated.history[0].cause, "unknown");
   assert.deepEqual(migrated.resetCredits.items, []);
+});
+
+// Minimal element fixture models the reviewed native sibling-card structure.
+function usageElement(tag, text = "", attrs = {}, children = []) {
+  const node = {
+    tagName: tag.toUpperCase(), children, parentElement: null, dataset: {},
+    get textContent() { return text + children.map(child => child.textContent).join(""); },
+    getAttribute(name) { return Object.hasOwn(attrs, name) ? String(attrs[name]) : null; },
+    matches(selector) {
+      return selector.split(/,\s*/).some(part => {
+        if (/^[a-z]+$/.test(part)) return part.toUpperCase() === this.tagName;
+        if (part.startsWith("progress[aria-label=")) return this.tagName === "PROGRESS" && part.includes(`"${attrs["aria-label"]}"`);
+        if (part === '[role="progressbar"]') return attrs.role === "progressbar";
+        if (part === "[aria-label*='usage' i]") return /usage/i.test(attrs["aria-label"] || "");
+        const attr = /^\[([^=\]]+)(?:="([^"]+)")?\]$/.exec(part);
+        return !!attr && Object.hasOwn(attrs, attr[1]) && (attr[2] === undefined || String(attrs[attr[1]]) === attr[2]);
+      });
+    },
+    closest(selector) { for (let current = this; current; current = current.parentElement) if (current.matches(selector)) return current; return null; },
+    querySelectorAll(selector) { return children.flatMap(child => [...(child.matches(selector) ? [child] : []), ...child.querySelectorAll(selector)]); },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
+  };
+  for (const child of children) child.parentElement = node;
+  return node;
+}
+function nativeUsageCard({ label = "Weekly limit", value = "100", displayed = "100% left", attrs = {} } = {}) {
+  const progress = usageElement("progress", "", { max: "100", value, "aria-label": "Usage remaining", ...attrs });
+  const card = usageElement("div", "", {}, [
+    usageElement("div", label),
+    usageElement("div", "", {}, [usageElement("div", "", {}, [progress]), usageElement("span", displayed), usageElement("span", "Resets in 6d 18h")]),
+  ]);
+  return { card, progress };
+}
+
+test("unavailable quota is unknown while explicit zero remains depleted", () => {
+  for (const value of [null, undefined, "", "  ", false, true, [], {}, NaN, Infinity]) {
+    const quota = helpers.safeAccountContextQuota({ remainingPercent: value });
+    assert.equal(quota.remainingPercent, null, String(value));
+    assert.equal(quota.depleted, false, String(value));
+  }
+  assert.equal(helpers.safeAccountContextQuota({ remainingPercent: "0" }).depleted, true);
+  assert.equal(helpers.safeAccountContextQuota({ remainingPercent: 0 }).remainingPercent, 0);
+  assert.equal(helpers.safeAccountContextQuota({ remainingPercent: "42" }).remainingPercent, 42);
+  assert.equal(helpers.observationFromElement(usageElement("div", "Loading usage")), null);
+});
+
+test("native sibling card records displayed percentage with unknown relative reset", () => {
+  const { card, progress } = nativeUsageCard();
+  const observation = helpers.nativeProgressObservation(progress);
+  assert.equal(observation.key, "native-unattributed:weekly");
+  assert.equal(observation.remaining, 100);
+  assert.equal(observation.limit, 100);
+  assert.equal(observation.resetAt, null);
+  assert.match(observation.label, /subscription unknown/);
+  assert.deepEqual(helpers.collectDisplayedObservations(card).map(o => o.key), [observation.key]);
+});
+
+test("native cards stay separate from each other and adjacent credit balances", () => {
+  const weekly = nativeUsageCard({ value: "70", displayed: "70% left" });
+  const hourly = nativeUsageCard({ label: "5-hour limit", value: "25", displayed: "25% left" });
+  const root = usageElement("div", "", {}, [weekly.card, hourly.card, usageElement("div", "53,257 credits remaining")]);
+  const observations = helpers.collectDisplayedObservations(root);
+  assert.deepEqual(observations.map(o => [o.key, o.remaining]), [["native-unattributed:weekly", 70], ["native-unattributed:five-hour", 25]]);
+  assert.equal(helpers.deduplicateObservations([...observations, ...observations]).length, 2);
+  assert.equal(helpers.deduplicateObservations([observations[0], { ...observations[0], remaining: 0 }]).length, 0);
+});
+
+test("ambiguous, hidden, owned, or conflicting native cards do not produce observations", () => {
+  for (const options of [{ value: "5", displayed: "100% left" }, { value: "101", displayed: "101% left" }, { value: "", displayed: "0% left" }, { displayed: "25% left 100% left" }, { label: "Credits remaining" }, { attrs: { max: "1" } }]) {
+    assert.equal(helpers.nativeProgressObservation(nativeUsageCard(options).progress), null);
+  }
+  for (const attrs of [{ hidden: "" }, { "aria-hidden": "true" }, { "data-tweakers-usage-settings": "true" }, { "data-tweakers-usage-account-selector": "true" }, { "data-tweakers-analytics-observed-resets": "true" }, { "data-tweaker-usage-reset": "weekly" }]) {
+    const { card, progress } = nativeUsageCard(); usageElement("div", "", attrs, [card]);
+    assert.equal(helpers.nativeProgressObservation(progress), null);
+  }
+  const a = nativeUsageCard(), b = nativeUsageCard();
+  const ambiguous = usageElement("div", "", {}, [usageElement("div", "Weekly limit"), a.progress, b.progress, usageElement("span", "100% left")]);
+  assert.equal(helpers.nativeProgressObservation(a.progress), null);
+  assert.equal(ambiguous.children.length, 4);
+});
+
+test("unattributed native account changes update display without inventing reset history", () => {
+  const first = helpers.nativeProgressObservation(nativeUsageCard({ value: "5", displayed: "5% left" }).progress);
+  const second = helpers.nativeProgressObservation(nativeUsageCard().progress);
+  const state = helpers.recordObservation(helpers.emptyState(), first).state;
+  const changed = helpers.recordObservation(state, second);
+  assert.equal(changed.observation.remaining, 100);
+  assert.equal(changed.transition, null);
+  assert.equal(changed.state.history.length, 0);
+  assert.equal(helpers.estimateNextReset(changed.state, second.key).kind, "unknown");
+});
+
+test("hidden and tracker-owned sibling leaves cannot establish native card evidence", () => {
+  for (const attrs of [{ hidden: "" }, { "aria-hidden": "true" }, { "data-tweakers-usage-settings": "true" }, { "data-tweakers-usage-account-selector": "true" }]) {
+    for (const hideLabel of [true, false]) {
+      const progress = usageElement("progress", "", { max: 100, value: 100, "aria-label": "Usage remaining" });
+      usageElement("div", "", {}, [
+        usageElement("div", "Weekly limit", hideLabel ? attrs : {}),
+        progress,
+        usageElement("span", "100% left", hideLabel ? {} : attrs),
+      ]);
+      assert.equal(helpers.nativeProgressObservation(progress), null);
+    }
+  }
+});
+
+test("overlapping semantic roots preserve conflicts until whole-scan deduplication", () => {
+  const a = nativeUsageCard({ value: "10", displayed: "10% left" });
+  const b = nativeUsageCard({ value: "90", displayed: "90% left" });
+  const root = usageElement("div", "", {}, [a.card, b.card]);
+  const observations = [root, a.card].flatMap(node => helpers.collectDisplayedObservations(node));
+  assert.equal(observations.length, 3);
+  assert.deepEqual(helpers.deduplicateObservations(observations), []);
 });

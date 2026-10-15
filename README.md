@@ -91,8 +91,7 @@ It gives you:
 - A public SDK for tweak authors.
 - Native bridge APIs for advanced macOS tweaks.
 
-It does not replace Codex, proxy your account, or run a separate Codex clone.
-It modifies your installed app so it can load local code.
+Tweakers supports an injected app mode and an independent `/Applications/Tweakers.app`. The independent app uses isolated state and Electron profile paths while leaving the official app untouched.
 
 ## How It Works
 
@@ -142,13 +141,19 @@ Tweak development commands:
 | `tweaker create-tweak ./my-tweak` | Create a new tweak folder. |
 | `tweaker validate-tweak ./my-tweak` | Validate a tweak manifest and entry file. |
 | `tweaker dev ./my-tweak` | Link a local tweak into Tweaker for development. |
-| `tweaker dev-sync` | Validate, build, and publish one safe development snapshot. |
-| `tweaker dev-sync --watch` | Watch the checkout and publish only successful validated builds. |
+| `tweaker dev-sync` | Validate, build, and publish one safe development snapshot (overlay installs only). |
+| `tweaker dev-sync --watch` | Watch the checkout and publish only successful validated builds (overlay installs only). |
+| `tweaker dev-sync --commit` | Quit Tweakers first; validate, build, and promote the tweaks as a new committed generation of the independent Tweakers app. |
 
 `dev-sync` never fetches, merges, or changes Git branches. It stages the complete
 built tweak set before changing the live snapshot, pauses runtime reloads during
 promotion, and emits one reload marker after the snapshot is complete. A failed
 validation or build leaves the last working snapshot in place.
+
+The independent `/Applications/Tweakers.app` verifies its tweak tree against a
+committed generation receipt on every launch, so plain `dev-sync` refuses to
+hot-publish into it; use `--commit`, which keeps the verified app and runtime
+and retains one rollback copy.
 
 Source checkout commands:
 
@@ -272,9 +277,11 @@ fallback limits, draft retention, recovery behavior, and candidate checklist.
 
 ## Bundled Tweak Namespace
 
-Tweaks maintained in this repository use privacy-safe `co.tweakers.*`
-identifiers and matching `tweaks/co.tweakers.*` source folders. These stable
-public identifiers describe the Tweakers project, not an individual maintainer.
+Tweaks maintained in this repository use stable `co.tweakers.*` identifiers.
+Canonical source folders are under `tweaks/`; some retain short folder names
+such as `followup` and `user-questions`. Use the catalog's `source.path` to
+find each owner. These stable public identifiers describe the Tweakers project,
+not an individual maintainer.
 
 Third-party tweak authors should choose their own stable reverse-DNS namespace
 rather than reusing `co.tweakers`.
@@ -478,3 +485,9 @@ Accept individual changes or **Accept explained** changes in bulk; unknown entri
 **Install reviewed update** becomes available only after compatibility, candidate verification and adoption decisions pass. Clicking it authorizes the exact candidate and decision revision; the manager rechecks both before promotion, then requires fresh startup readiness. Changed inputs invalidate approval. New upstream versions supersede old jobs automatically; interrupted reviews reuse durable checkpoints. Reports and decisions live in the private Doctor job directory, separately from disposable staging. The native Codex application stays untouched.
 
 **Repair storage binding** is available only for a verified metadata repair while the broker is idle. It preserves original signed account bindings, credentials, and conversation data, and records persistent volume identity in a separate signed generation. Legacy device-only records cannot prove the previous volume UUID; Doctor states that limit before repair. **Retry Tweakers** starts the independent app after storage preflight passes.
+
+### Local verification resources
+
+Tests use two workers by default. Set `TWEAKERS_TEST_WORKERS` to an integer from 1 through 8 for an explicit bounded override (for example, `TWEAKERS_TEST_WORKERS=4 npm test`). Builds and generated-output mutation remain serialized. `npm run sync:tweaks -- --check` is read-only and requires stable generated inputs; it reports an active operation or a concurrent change instead of taking the writer lease.
+
+Ordinary dependency restoration uses `npm ci`, followed by one explicit `npm run build`. Use Node 22.13 or newer in the Node 22 line, or Node 24 or newer. The optional developer CLI is available through `npm run dev:codex -- <arguments>`; it is excluded from the packaged managed runtime.

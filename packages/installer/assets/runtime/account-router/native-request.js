@@ -6,7 +6,9 @@ exports.parseNativeBrowserChildRequestV1 = parseNativeBrowserChildRequestV1;
 exports.isNativeRequestSurfaceV1 = isNativeRequestSurfaceV1;
 exports.isBoundedNativeResultV1 = isBoundedNativeResultV1;
 exports.requestNativeUsageCreditsV1 = requestNativeUsageCreditsV1;
+exports.requestNativeUsageAnalyticsV1 = requestNativeUsageAnalyticsV1;
 exports.requestNativeHttpV1 = requestNativeHttpV1;
+exports.parseNativePluginHttpTargetV1 = parseNativePluginHttpTargetV1;
 const types_1 = require("./types");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
@@ -26,6 +28,7 @@ const METHOD_SURFACES = Object.freeze({
     "skills/list": ["plugins"],
     "browser.sync": ["plugins"], "browser.install": ["plugins"], "browser.uninstall": ["plugins"],
     "usage.credits.read": ["usage"], "usage.credits.consume": ["usage"],
+    "usage.analytics.read": ["usage"],
 });
 function parseNativeRequestV1(value) {
     if (!(0, types_1.isPlainRecord)(value) || Object.keys(value).sort().join("\0") !== "method\0params\0surface"
@@ -123,6 +126,147 @@ async function requestNativeUsageCreditsV1(codexHome, method, params) {
         credentials.accessToken = "";
         credentials.accountId = "";
     }
+}
+/**
+ * Read-only, account-bound Analytics transport. HTTP status is data here:
+ * renderer compatibility code must distinguish an unshipped endpoint from a
+ * stale login or a retryable provider failure without ever receiving tokens.
+ */
+async function requestNativeUsageAnalyticsV1(codexHome, params) {
+    const credentials = readChatGptCredentials((0, node_path_1.join)(codexHome, "auth.json"));
+    if (!credentials)
+        return { status: "authentication-error", source: null, value: null };
+    const request = async (path, body) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15_000);
+        timer.unref();
+        try {
+            const response = await fetch(`https://chatgpt.com/backend-api${path}`, {
+                method: body === undefined ? "GET" : "POST",
+                redirect: "manual",
+                signal: controller.signal,
+                headers: {
+                    authorization: `Bearer ${credentials.accessToken}`,
+                    ...(credentials.accountId ? { "chatgpt-account-id": credentials.accountId } : {}),
+                    "OAI-Product-Sku": "CODEX",
+                    accept: "application/json",
+                    ...(body === undefined ? {} : { "content-type": "application/json" }),
+                },
+                body: body === undefined ? undefined : JSON.stringify(body),
+            });
+            if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+                return { status: response.status || 503, value: null };
+            }
+            const declared = Number(response.headers.get("content-length"));
+            if (Number.isFinite(declared) && declared > exports.NATIVE_REQUEST_USAGE_MAX_RESULT_BYTES)
+                throw new Error("native analytics response too large");
+            const bytes = await readBoundedHttpResponse(response, exports.NATIVE_REQUEST_USAGE_MAX_RESULT_BYTES);
+            let value = null;
+            if (bytes.byteLength > 0) {
+                try {
+                    value = JSON.parse(new TextDecoder().decode(bytes));
+                }
+                catch {
+                    value = null;
+                }
+            }
+            return { status: response.status, value };
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    };
+    const outcome = (status) => status === 404 ? "unsupported"
+        : status === 401 || status === 403 ? "authentication-error" : "transient-error";
+    try {
+        if (params.kind === "plan-history") {
+            const response = await request(`/wham/usage/plan_limit_history?days=${params.days}`);
+            if (response.status === 200 && isBoundedNativeResultV1(response.value, "usage")) {
+                return { status: "full", source: "plan_limit_history", value: response.value };
+            }
+            return { status: outcome(response.status), source: "plan_limit_history", value: null };
+        }
+        if (params.kind === "daily-history" || params.kind === "credit-events") {
+            const source = params.kind === "daily-history" ? "daily_token_usage_breakdown" : "credit_usage_events";
+            const path = params.kind === "daily-history"
+                ? `/wham/usage/daily-token-usage-breakdown?start_date=${params.start_date}&end_date=${params.end_date}&group_by=day`
+                : "/wham/usage/credit-usage-events";
+            const response = await request(path);
+            if (response.status === 200 && isBoundedNativeResultV1(response.value, "usage")) {
+                return { status: "full", source, value: response.value };
+            }
+            return { status: outcome(response.status), source, value: null };
+        }
+        if (params.preferred_source !== "query_v1") {
+            const v2 = await request("/wham/usage/thread_usage/query_v2", { threads: params.threads });
+            if (v2.status === 200 && isBoundedNativeResultV1(v2.value, "usage")) {
+                return { status: "full", source: "query_v2", value: v2.value };
+            }
+            if (v2.status !== 404)
+                return { status: outcome(v2.status), source: "query_v2", value: null };
+        }
+        let legacyAttempts = 0;
+        const requestLegacy = async (threadIds) => {
+            if (legacyAttempts >= 8)
+                return { status: 503, value: null };
+            legacyAttempts += 1;
+            const response = await request("/wham/usage/thread_usage/query", { thread_ids: threadIds });
+            if (response.status !== 503)
+                return response;
+            if (threadIds.length <= 1)
+                return { status: 503, value: null };
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(400, 50 * 2 ** Math.min(legacyAttempts, 3))));
+            const middle = Math.ceil(threadIds.length / 2);
+            const left = await requestLegacy(threadIds.slice(0, middle));
+            if (left.status !== 200)
+                return left;
+            const right = await requestLegacy(threadIds.slice(middle));
+            if (right.status !== 200)
+                return right;
+            const leftThreads = (0, types_1.isPlainRecord)(left.value) && Array.isArray(left.value.threads) ? left.value.threads : [];
+            const rightThreads = (0, types_1.isPlainRecord)(right.value) && Array.isArray(right.value.threads) ? right.value.threads : [];
+            return { status: 200, value: { threads: [...leftThreads, ...rightThreads] } };
+        };
+        const v1 = await requestLegacy(params.threads.map((thread) => thread.thread_id));
+        if (v1.status === 200 && (0, types_1.isPlainRecord)(v1.value) && Array.isArray(v1.value.threads)) {
+            const threads = v1.value.threads.flatMap((thread) => {
+                if (!(0, types_1.isPlainRecord)(thread) || typeof thread.thread_id !== "string")
+                    return [];
+                const credits = finiteMicros(thread.estimated_usage_credits_micros);
+                const groups = Array.isArray(thread.groups) ? thread.groups.flatMap((group) => {
+                    if (!(0, types_1.isPlainRecord)(group))
+                        return [];
+                    return [{
+                            ...group,
+                            five_hour_limit_percent: null,
+                            weekly_limit_percent: null,
+                            balance_usage_credits: finiteMicros(group.estimated_usage_credits_micros),
+                        }];
+                }) : [];
+                return [{
+                        thread_id: thread.thread_id,
+                        data_status: "partial",
+                        five_hour_limit_percent: null,
+                        weekly_limit_percent: null,
+                        balance_usage_credits: credits,
+                        groups,
+                    }];
+            });
+            const value = { threads, data_as_of: null, tweakers_status: "partial", tweakers_source: "query_v1" };
+            if (!isBoundedNativeResultV1(value, "usage"))
+                throw new Error("native analytics response too large");
+            return { status: "partial", source: "query_v1", value };
+        }
+        return { status: outcome(v1.status), source: "query_v1", value: null };
+    }
+    finally {
+        credentials.accessToken = "";
+        credentials.accountId = "";
+    }
+}
+function finiteMicros(value) {
+    const micros = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(micros) && micros >= 0 ? micros / 1_000_000 : null;
 }
 async function requestNativeHttpV1(codexHome, surface, params) {
     const credentials = readChatGptCredentials((0, node_path_1.join)(codexHome, "auth.json"));
@@ -276,6 +420,8 @@ function validateMethodParams(surface, method, value) {
             return null;
         return { ...(value.creditId !== undefined ? { creditId: value.creditId } : {}), redeemRequestId: value.redeemRequestId };
     }
+    if (method === "usage.analytics.read")
+        return validateUsageAnalyticsParams(value);
     if (method === "app/list") {
         if (keys.some((key) => key !== "cursor" && key !== "limit" && key !== "forceRefetch" && key !== "threadId"))
             return null;
@@ -326,6 +472,10 @@ function validateMethodParams(surface, method, value) {
         return keys.join("\0") === "pluginId" && safeIdentifier(value.pluginId, 512) ? { pluginId: value.pluginId } : null;
     }
     return keys.length === 0 ? {} : null;
+}
+/** The broker must route plugin control reads through its installed authority. */
+function parseNativePluginHttpTargetV1(value) {
+    return nativeHttpTarget("plugins", value);
 }
 function nativeHttpTarget(surface, value) {
     if (Object.keys(value).sort().join("\0") !== "options\0path\0verb"
@@ -428,6 +578,53 @@ function nativeHttpTarget(surface, value) {
 }
 function exactPathId(value, key) {
     return exactKeys(value, [key]) && safeIdentifier(value[key], 512) ? value[key] : null;
+}
+function validateUsageAnalyticsParams(value) {
+    if (value.kind === "plan-history") {
+        return exactKeys(value, ["days", "kind"]) && value.days === 7 ? { kind: "plan-history", days: 7 } : null;
+    }
+    if (value.kind === "credit-events")
+        return exactKeys(value, ["kind"]) ? { kind: "credit-events" } : null;
+    if (value.kind === "daily-history") {
+        if (!exactKeys(value, ["end_date", "kind", "start_date"]))
+            return null;
+        const day = (candidate) => {
+            if (typeof candidate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(candidate))
+                return null;
+            const timestamp = Date.parse(`${candidate}T00:00:00.000Z`);
+            return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === candidate ? timestamp : null;
+        };
+        const start = day(value.start_date), end = day(value.end_date);
+        return start !== null && end !== null && end >= start && end - start < 30 * 86_400_000
+            ? { kind: "daily-history", start_date: value.start_date, end_date: value.end_date } : null;
+    }
+    if (value.kind !== "thread-usage" || !exactKeys(value, value.preferred_source === undefined ? ["kind", "threads"] : ["kind", "preferred_source", "threads"])
+        || value.preferred_source !== undefined && value.preferred_source !== "query_v1"
+        || !Array.isArray(value.threads) || value.threads.length < 1 || value.threads.length > 100)
+        return null;
+    let totalIds = 0;
+    const seen = new Set();
+    const threads = [];
+    for (const raw of value.threads) {
+        if (!(0, types_1.isPlainRecord)(raw) || !exactKeys(raw, ["created_at", "descendant_thread_ids", "thread_id"])
+            || !safeIdentifier(raw.thread_id, 512) || seen.has(raw.thread_id)
+            || raw.created_at !== null && (!safeIdentifier(raw.created_at, 64) || !Number.isFinite(Date.parse(raw.created_at)))
+            || !Array.isArray(raw.descendant_thread_ids) || raw.descendant_thread_ids.length > 1_000)
+            return null;
+        const descendants = [];
+        seen.add(raw.thread_id);
+        for (const id of raw.descendant_thread_ids) {
+            if (!safeIdentifier(id, 512) || seen.has(id))
+                return null;
+            seen.add(id);
+            descendants.push(id);
+        }
+        totalIds += 1 + descendants.length;
+        if (totalIds > 1_000)
+            return null;
+        threads.push({ thread_id: raw.thread_id, created_at: raw.created_at, descendant_thread_ids: descendants });
+    }
+    return { kind: "thread-usage", ...(value.preferred_source === "query_v1" ? { preferred_source: "query_v1" } : {}), threads };
 }
 function exactKeys(value, keys) {
     return Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");

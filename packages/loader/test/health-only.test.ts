@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -9,6 +9,8 @@ interface LoaderResult {
   status: number | null;
   stderr: string;
   originalLoaded: boolean;
+  backendBound: boolean;
+  acceptanceBound: boolean;
   liveRuntimeLoaded: boolean;
   healthRuntimeLoaded: boolean;
   recovery: { title: string; message: string } | null;
@@ -16,21 +18,48 @@ interface LoaderResult {
 }
 
 function runLoader(environment: NodeJS.ProcessEnv): LoaderResult {
-  const root = mkdtempSync(join(tmpdir(), "tweakers-loader-health-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-loader-health-")));
   try {
     const app = join(root, "app");
     const liveUser = join(root, "live-user");
     const healthUser = join(root, "health-user");
     mkdirSync(app, { recursive: true });
+    const resources = join(root, "resources");
+    mkdirSync(resources);
+    const cliLayout = environment.TWEAKERS_TEST_NEW_CLI_LAYOUT;
+    const nestedBackend = join(resources, "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex");
+    if (cliLayout) {
+      mkdirSync(join(resources, "codex-cli", "CodexCLI.app", "Contents", "MacOS"), { recursive: true });
+      writeFileSync(nestedBackend, "stock");
+      if (cliLayout === "1") writeFileSync(join(resources, "codex"), "registered");
+      if (cliLayout === "unsafe-flat") symlinkSync(nestedBackend, join(resources, "codex"));
+      if (cliLayout === "unsafe-nested") {
+        const outside = join(root, "outside-backend");
+        writeFileSync(outside, "outside");
+        rmSync(nestedBackend);
+        symlinkSync(outside, nestedBackend);
+      }
+      if (cliLayout === "dangling-nested" || cliLayout === "missing") {
+        rmSync(nestedBackend);
+        if (cliLayout === "dangling-nested") symlinkSync(join(root, "missing-outside-backend"), nestedBackend);
+      }
+    }
+    else writeFileSync(join(resources, "codex"), "registered");
     mkdirSync(join(app, "node_modules", "electron"), { recursive: true });
     mkdirSync(join(liveUser, "runtime"), { recursive: true });
     mkdirSync(join(healthUser, "runtime"), { recursive: true });
+    const acceptanceDirectory = join(liveUser, "acceptance", "12345678-1234-1234-1234-123456789abc");
+    mkdirSync(join(liveUser, "acceptance"), { mode: 0o700 });
+    mkdirSync(acceptanceDirectory, { mode: 0o700 });
+    const acceptancePath = join(acceptanceDirectory, "config.json");
+    writeFileSync(acceptancePath, "{}", { mode: 0o600 });
     cpSync(resolve("packages/loader/loader.cjs"), join(app, "loader.cjs"));
     writeFileSync(join(app, "package.json"), JSON.stringify({
       productName: environment.TWEAKERS_TEST_PRODUCT_NAME ?? "ChatGPT",
       __tweaker: { originalMain: "original.cjs", userRoot: liveUser },
     }));
-    writeFileSync(join(app, "original.cjs"), `require("node:fs").writeFileSync(${JSON.stringify(join(root, "original-loaded"))}, "yes")`);
+    const expectedBackend = cliLayout === "nested" ? nestedBackend : join(resources, "codex");
+    writeFileSync(join(app, "original.cjs"), `require("node:fs").writeFileSync(${JSON.stringify(join(root, "original-loaded"))}, "yes"); const binding=Object.getOwnPropertyDescriptor(globalThis,"__tweakersVerifiedBackendPathV1"); if(process.env.CODEX_CLI_PATH===${JSON.stringify(expectedBackend)} && binding?.value===process.env.CODEX_CLI_PATH && binding.writable===false && binding.configurable===false) require("node:fs").writeFileSync(${JSON.stringify(join(root, "backend-bound"))},"yes");`);
     writeFileSync(join(app, "node_modules", "electron", "index.js"), `
       const fs = require("node:fs");
       module.exports = {
@@ -52,7 +81,9 @@ function runLoader(environment: NodeJS.ProcessEnv): LoaderResult {
       };
     `);
     writeFileSync(join(liveUser, "runtime", "main.js"), `
+      process.resourcesPath = ${JSON.stringify(resources)};
       if (process.env.TWEAKERS_TEST_THROW_LIVE_RUNTIME === "1") throw new Error("live runtime failed");
+      if (process.env.TWEAKERS_ACCEPTANCE_CONFIG_FILE === ${JSON.stringify(acceptancePath)} && process.env.TWEAKERS_USER_ROOT === ${JSON.stringify(liveUser)}) require("node:fs").writeFileSync(${JSON.stringify(join(root, "acceptance-bound"))}, "yes");
       require("node:fs").writeFileSync(${JSON.stringify(join(root, "live-runtime-loaded"))}, "yes");
     `);
     writeFileSync(join(healthUser, "runtime", "main.js"), `
@@ -64,9 +95,18 @@ function runLoader(environment: NodeJS.ProcessEnv): LoaderResult {
     delete env.TWEAKERS_HEALTH_CHECK_ONLY;
     delete env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN;
     delete env.TWEAKERS_HEALTH_USER_ROOT;
+    delete env.TWEAKERS_ACCEPTANCE_CONFIG_FILE;
     delete env.TWEAKERS_TEST_THROW_HEALTH_RUNTIME;
     delete env.TWEAKERS_TEST_THROW_LIVE_RUNTIME;
     Object.assign(env, environment);
+    if (["<acceptance-config>", "<public-acceptance-config>", "<symlink-acceptance-config>"].includes(environment.TWEAKERS_ACCEPTANCE_CONFIG_FILE ?? "")) {
+      env.TWEAKERS_ACCEPTANCE_CONFIG_FILE = acceptancePath;
+      if (environment.TWEAKERS_ACCEPTANCE_CONFIG_FILE === "<public-acceptance-config>") chmodSync(acceptancePath, 0o644);
+      if (environment.TWEAKERS_ACCEPTANCE_CONFIG_FILE === "<symlink-acceptance-config>") {
+        rmSync(acceptancePath);
+        symlinkSync(join(liveUser, "runtime", "main.js"), acceptancePath);
+      }
+    }
     if (environment.TWEAKERS_HEALTH_USER_ROOT === "<health-user>") {
       env.TWEAKERS_HEALTH_USER_ROOT = healthUser;
     } else if (environment.TWEAKERS_HEALTH_USER_ROOT === "<symlink-health-user>") {
@@ -81,6 +121,8 @@ function runLoader(environment: NodeJS.ProcessEnv): LoaderResult {
       status: result.status,
       stderr: result.stderr.toString(),
       originalLoaded: existsSync(join(root, "original-loaded")),
+      backendBound: existsSync(join(root, "backend-bound")),
+      acceptanceBound: existsSync(join(root, "acceptance-bound")),
       liveRuntimeLoaded: existsSync(join(root, "live-runtime-loaded")),
       healthRuntimeLoaded: existsSync(join(root, "health-runtime-loaded")),
       recovery: existsSync(recoveryPath)
@@ -101,6 +143,45 @@ test("normal loader starts the live runtime and original main", () => {
   assert.equal(result.liveRuntimeLoaded, true);
   assert.equal(result.healthRuntimeLoaded, false);
   assert.equal(result.originalLoaded, true);
+});
+
+test("supplied-native nested-only backend reaches original main with an immutable backend binding", () => {
+  const result = runLoader({ TWEAKERS_TEST_PRODUCT_NAME: "Tweakers", TWEAKERS_TEST_NEW_CLI_LAYOUT: "nested" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.originalLoaded, true);
+  assert.equal(result.backendBound, true);
+  assert.equal(result.recovery, null);
+});
+
+test("nested backend binding rejects linked executables instead of starting original main", () => {
+  for (const layout of ["unsafe-flat", "unsafe-nested", "dangling-nested", "missing"]) {
+    const result = runLoader({ TWEAKERS_TEST_PRODUCT_NAME: "Tweakers", TWEAKERS_TEST_NEW_CLI_LAYOUT: layout });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.originalLoaded, false);
+    assert.equal(result.backendBound, false);
+    assert.match(result.stderr, /registered backend is unavailable/);
+  }
+});
+
+test("acceptance settings are bound to packaged user root in one normal Tweakers launch", () => {
+  const result = runLoader({ TWEAKERS_TEST_PRODUCT_NAME: "Tweakers", TWEAKERS_ACCEPTANCE_CONFIG_FILE: "<acceptance-config>", TWEAKERS_USER_ROOT: "/caller-selected-root" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.acceptanceBound, true);
+  assert.equal(result.originalLoaded, true);
+});
+
+test("acceptance override refuses native, health, public, symlink and outside-root launches", () => {
+  for (const environment of [
+    { TWEAKERS_ACCEPTANCE_CONFIG_FILE: "<acceptance-config>" },
+    { TWEAKERS_TEST_PRODUCT_NAME: "Tweakers", TWEAKERS_HEALTH_CHECK_ONLY: "1", TWEAKERS_HEALTH_USER_ROOT: "<health-user>", TWEAKERS_ACCEPTANCE_CONFIG_FILE: "<acceptance-config>" },
+    ...["", "<public-acceptance-config>", "<symlink-acceptance-config>", "/tmp/config.json"].map(path => ({ TWEAKERS_TEST_PRODUCT_NAME: "Tweakers", TWEAKERS_ACCEPTANCE_CONFIG_FILE: path })),
+  ]) {
+    const result = runLoader(environment);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.originalLoaded, false);
+    assert.equal(result.liveRuntimeLoaded, false);
+    assert.equal(result.healthRuntimeLoaded, false);
+  }
 });
 
 test("bare health loader starts the contained runtime without original main", () => {
@@ -193,4 +274,14 @@ test("paired health flags with a symlinked health root fail closed", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.healthRuntimeLoaded, false);
   assert.equal(result.originalLoaded, false);
+});
+
+
+test("current-layout derived startup selects the registered backend before vendor imports", () => {
+  const derived = runLoader({ TWEAKERS_TEST_PRODUCT_NAME: "Tweakers", TWEAKERS_TEST_NEW_CLI_LAYOUT: "1" });
+  assert.equal(derived.status, 0, derived.stderr);
+  assert.equal(derived.backendBound, true);
+  const native = runLoader({ TWEAKERS_TEST_NEW_CLI_LAYOUT: "1" });
+  assert.equal(native.status, 0, native.stderr);
+  assert.equal(native.backendBound, false);
 });

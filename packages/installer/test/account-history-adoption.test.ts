@@ -687,10 +687,10 @@ test("optional alias provenance is canonical, receipt-bound, and never inferred 
       copyOperationId: "offline-copy-fixture-0002",
       sourceOpaqueAccountId: OTHER,
       sourceNativeThreadId: THREAD_B,
-      sourceRolloutSha256: `sha256:${"4".repeat(64)}`,
+      sourceRolloutSha256: `sha256:${"4".repeat(64)}` as const,
       copyOpaqueAccountId: OWNER,
       copyNativeThreadId: THREAD_A,
-      copyRolloutSha256: `sha256:${"5".repeat(64)}`,
+      copyRolloutSha256: `sha256:${"5".repeat(64)}` as const,
     },
   ];
   assert.throws(() => createHistoryAdoptionAliases({

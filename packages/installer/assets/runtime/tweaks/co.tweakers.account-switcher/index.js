@@ -260,7 +260,7 @@ module.exports = {
     createAccountBrokerBridge, normalizeAccountBrokerRequest, normalizeAccountBrokerResponse,
     projectAccountBrokerResult, projectAccountBrokerEvent, accountBrokerFailure, freshBrokerQuotaRemainingPercent, brokerPoolStats, brokerQuotaText, brokerUsageValueText,
     projectProfileSafeStats, projectProfileStatistics, refreshProfileStatistics, profileStatisticsResultFor,
-    brokerProfileActivityCard, profileStatisticsPicker,
+    brokerProfileActivityCard, profileStatisticsPicker, renderAccountsNativeSlots, renderAccountsNativeProfileSlot,
     applyAllAccountQuotaResult, refreshAllBrokerQuotas, accountSurfacesVisible,
     requestAccountsNativeValue, projectAccountsNativeValue, nativeWhamProfile,
     projectNativeUsageWindow, projectNativeUsageWindows, projectNativeUsageStatus, nativePooledQuota,
@@ -4205,6 +4205,15 @@ function startRenderer(api) {
     brokerSequence: 0,
     brokerRequestNonce: 0,
     brokerSubscribed: false,
+    brokerSubscribePending: false,
+    brokerSubscribeTimer: null,
+    brokerSubscribeAttempts: 0,
+    brokerStatus: null,
+    brokerStatusMessage: null,
+    activeTextDialog: null,
+    nativeCompatibilityKey: null,
+    profileRevision: 0,
+    profilePendingRoots: new Set(),
     brokerRoots: new Set(),
     enrollmentTimers: new Map(),
     remoteTimers: new Map(),
@@ -4253,6 +4262,22 @@ function startRenderer(api) {
       request: (surface, method, params, selection) => requestAccountsNativeValue(state, surface, method, params, selection),
     });
     if (typeof disposeNative === "function") state.cleanups.push(disposeNative);
+  }
+  // The native bridge can be revoked after startup (for example when the
+  // ChatGPT wrapper changes). Re-render only when its compatibility changes so
+  // the Accounts page and menu can say that pooled views are off.
+  state.nativeCompatibilityKey = accountsNativeCompatibilityKey(state);
+  if (typeof api.accountsNative?.subscribe === "function") {
+    try {
+      const unsubscribeNative = api.accountsNative.subscribe(() => {
+        if (state.disposed) return;
+        const key = accountsNativeCompatibilityKey(state);
+        if (key === state.nativeCompatibilityKey) return;
+        state.nativeCompatibilityKey = key;
+        refreshBrokerRoots(state);
+      });
+      if (typeof unsubscribeNative === "function") state.cleanups.push(unsubscribeNative);
+    } catch {}
   }
   if (typeof api.ipc?.on === "function") {
     const unsubscribe = api.ipc.on(ACCOUNT_EVENTS_CHANNEL, (event) => handleAccountBrokerEvent(state, event));
@@ -4374,9 +4399,18 @@ async function invokeAccountBroker(state, command, params) {
   }
 }
 
+const BROKER_SUBSCRIBE_RETRY_MAX_MS = 30_000;
+
 async function subscribeToAccountBroker(state) {
-  if (state.disposed || state.brokerSubscribed) return;
-  const response = await invokeAccountBroker(state, "events.subscribe");
+  if (state.disposed || state.brokerSubscribed || state.brokerSubscribePending) return;
+  clearBrokerSubscribeRetry(state);
+  state.brokerSubscribePending = true;
+  let response;
+  try {
+    response = await invokeAccountBroker(state, "events.subscribe");
+  } finally {
+    state.brokerSubscribePending = false;
+  }
   // Hot reload can finish while the subscription round trip is in flight.
   // Explicitly release a late success instead of resurrecting a renderer that
   // has already removed its listeners and page roots.
@@ -4385,6 +4419,35 @@ async function subscribeToAccountBroker(state) {
     return;
   }
   state.brokerSubscribed = response.ok === true;
+  if (state.brokerSubscribed) state.brokerSubscribeAttempts = 0;
+  else scheduleBrokerSubscribeRetry(state);
+}
+
+// Live events are what keep quota, enrollment, and continuation state current.
+// A broker that was briefly unavailable at startup must not leave the renderer
+// permanently unsubscribed, so retry with capped exponential backoff.
+function scheduleBrokerSubscribeRetry(state) {
+  if (state.disposed || state.brokerSubscribed || state.brokerSubscribeTimer) return;
+  const setTimer = globalThis.window?.setTimeout ?? globalThis.setTimeout;
+  if (typeof setTimer !== "function") return;
+  const attempt = Number.isInteger(state.brokerSubscribeAttempts) ? state.brokerSubscribeAttempts : 0;
+  const delay = Math.min(BROKER_SUBSCRIBE_RETRY_MAX_MS, 1_000 * 2 ** Math.min(attempt, 5));
+  state.brokerSubscribeAttempts = attempt + 1;
+  const timer = setTimer(() => {
+    if (state.brokerSubscribeTimer !== timer) return;
+    state.brokerSubscribeTimer = null;
+    void subscribeToAccountBroker(state);
+  }, delay);
+  timer?.unref?.();
+  state.brokerSubscribeTimer = timer;
+}
+
+function clearBrokerSubscribeRetry(state) {
+  const timer = state?.brokerSubscribeTimer;
+  if (!timer) return;
+  state.brokerSubscribeTimer = null;
+  const clearTimer = globalThis.window?.clearTimeout ?? globalThis.clearTimeout;
+  try { clearTimer?.(timer); } catch {}
 }
 
 function handleAccountBrokerEvent(state, event) {
@@ -4395,8 +4458,20 @@ function handleAccountBrokerEvent(state, event) {
   if (ACCOUNT_BROKER_SHARED_HISTORY_INVALIDATION_TYPES.has(projected.type)) {
     return refreshSharedHistory(state);
   }
-  if (projected.type === "profile.updated") state.profile = projected.payload;
-  if (projected.type === "quota.updated" && state.profile) updateBrokerAccountQuota(state.profile, projected.payload.accountId, projected.payload.quota);
+  if (projected.type === "quota.updated") {
+    // The broker echoes every quota.read as quota.updated. The all-accounts
+    // payload has no accountId, and this renderer's own refresh already applies
+    // and renders it, so only re-render when the event actually changes data.
+    if (state.quotaRefreshPromise || !applyBrokerQuotaEvent(state, projected.payload)) return;
+    publishAccountsContext(state);
+    refreshBrokerRoots(state);
+    return;
+  }
+  if (projected.type === "profile.updated") {
+    state.profile = projected.payload;
+    // A pushed profile is newer than any read that is still in flight.
+    state.profileRevision = (state.profileRevision || 0) + 1;
+  }
   if (projected.type === "enabled.changed" && state.profile) updateBrokerAccount(state.profile, projected.payload.account);
   if (projected.type === "resetCredit.updated" && state.profile) updateBrokerAccountQuota(state.profile, projected.payload.accountId, projected.payload.quota);
   if (["profile.updated", "enabled.changed", "connection.updated"].includes(projected.type)) {
@@ -4419,6 +4494,25 @@ function updateBrokerAccount(profile, account) {
   if (!profile?.accounts || !account) return;
   const index = profile.accounts.findIndex((candidate) => candidate.accountId === account.accountId);
   if (index >= 0) profile.accounts[index] = account;
+}
+
+function sameBrokerQuota(left, right) {
+  try { return JSON.stringify(left ?? null) === JSON.stringify(right ?? null); } catch { return false; }
+}
+
+function applyBrokerQuotaEvent(state, payload) {
+  if (!state?.profile?.accounts || !payload) return false;
+  const entries = Array.isArray(payload.accounts)
+    ? payload.accounts
+    : payload.accountId ? [{ accountId: payload.accountId, quota: payload.quota }] : [];
+  let changed = false;
+  for (const entry of entries) {
+    const account = state.profile.accounts.find((candidate) => candidate.accountId === entry?.accountId);
+    if (!account || !entry.quota || sameBrokerQuota(account.quota, entry.quota)) continue;
+    account.quota = entry.quota;
+    changed = true;
+  }
+  return changed;
 }
 
 function updateBrokerAccountQuota(profile, accountId, quota) {
@@ -4465,8 +4559,14 @@ async function refreshAllBrokerQuotas(state, render = true) {
   state.quotaRefreshPromise = (async () => {
     const response = await invokeAccountBroker(state, "quota.read");
     if (state.disposed) return response;
-    if (response.ok) applyAllAccountQuotaResult(state, response.result);
-    if (render) {
+    let changed = false;
+    if (response.ok) {
+      const before = (state.profile?.accounts || []).map((account) => account.quota);
+      applyAllAccountQuotaResult(state, response.result);
+      const after = (state.profile?.accounts || []).map((account) => account.quota);
+      changed = !sameBrokerQuota(before, after);
+    }
+    if (render && changed) {
       publishAccountsContext(state);
       rerenderBrokerRoots(state);
     }
@@ -4484,14 +4584,39 @@ function accountSurfacesVisible(state) {
   );
 }
 
+function beginBrokerProfileRead(state) {
+  state.profileRevision = (Number.isInteger(state.profileRevision) ? state.profileRevision : 0) + 1;
+  return state.profileRevision;
+}
+
 async function refreshBrokerProfile(state, requestedRoot = null) {
+  const revision = beginBrokerProfileRead(state);
+  if (!(state.profilePendingRoots instanceof Set)) state.profilePendingRoots = new Set();
+  if (requestedRoot) state.profilePendingRoots.add(requestedRoot);
   const response = await invokeAccountBroker(state, "profile.read");
-  const roots = requestedRoot ? [requestedRoot] : [...state.brokerRoots];
   if (state.disposed) return response;
+  const current = revision === state.profileRevision;
+  // A newer read (or pushed profile) owns state.profile. Render roots that
+  // asked for this read from whatever is current so none stay on "Loading".
+  const roots = [...new Set([
+    ...(requestedRoot ? [requestedRoot] : [...state.brokerRoots]),
+    ...(current ? state.profilePendingRoots : []),
+  ])];
+  if (current) state.profilePendingRoots.clear();
+  else if (requestedRoot) state.profilePendingRoots.delete(requestedRoot);
+  if (!current && state.profile) {
+    for (const root of roots) if (state.brokerRoots.has(root)) renderBrokerAccountsContents(state, root);
+    return response;
+  }
   if (!response.ok) {
     for (const root of roots) renderBrokerUnavailable(root, response.error?.code, state);
     removeNativeAccountConnectionSurfaces(state);
     return response;
+  }
+  if (!state.brokerSubscribed) {
+    // The broker is reachable again; resubscribe now instead of waiting out backoff.
+    state.brokerSubscribeAttempts = 0;
+    void subscribeToAccountBroker(state);
   }
   state.profile = response.result;
   await refreshBrokerPreferences(state, false);
@@ -4802,27 +4927,43 @@ function refreshSharedHistory(state) {
 function clearSharedHistoryConversationAdapter(state) {
   const cleanup = state?.sharedHistoryAdapterCleanup;
   state.sharedHistoryAdapterCleanup = null;
+  state.sharedHistoryAdapterIdentity = null;
   try { cleanup?.(); } catch {}
 }
 
 async function refreshSharedHistoryConversationAdapter(state) {
   const revision = (state.sharedHistoryAdapterRevision || 0) + 1;
   state.sharedHistoryAdapterRevision = revision;
-  clearSharedHistoryConversationAdapter(state);
   const history = state.sharedHistory;
   const resolveTarget = state?.api?.react?.host?.getSharedHistoryTarget;
-  if (state.disposed || !history || typeof resolveTarget !== "function") return;
+  if (state.disposed || !history || typeof resolveTarget !== "function") {
+    clearSharedHistoryConversationAdapter(state);
+    return;
+  }
   let result;
   try { result = await resolveTarget(); } catch { return; }
-  if (state.disposed || revision !== state.sharedHistoryAdapterRevision || result?.status !== "available") return;
+  if (state.disposed || revision !== state.sharedHistoryAdapterRevision) return;
+  if (result?.status !== "available") { clearSharedHistoryConversationAdapter(state); return; }
   const target = result.target;
-  if (!target?.isCurrent?.() || target.conversationId !== history.conversationId) return;
+  if (!target?.isCurrent?.() || target.conversationId !== history.conversationId) {
+    clearSharedHistoryConversationAdapter(state);
+    return;
+  }
+  const identity = state.sharedHistoryAdapterIdentity;
+  if (identity?.statusRoot === target.statusRoot && identity.composerRoot === target.composerRoot
+    && identity.turnRoots.length === target.assistantTurns.length
+    && identity.turnRoots.every((root, index) => root === target.assistantTurns[index].root)
+    && identity.history === history && identity.turns === state.sharedHistoryTurns
+    && state.sharedHistoryAdapterCleanup) return;
+  clearSharedHistoryConversationAdapter(state);
   const mounted = renderSharedHistoryConversationAdapter(target, history, state.sharedHistoryTurns);
   if (state.disposed || revision !== state.sharedHistoryAdapterRevision || !target.isCurrent?.()) {
     try { mounted?.cleanup?.(); } catch {}
     return;
   }
   state.sharedHistoryAdapterCleanup = typeof mounted?.cleanup === "function" ? mounted.cleanup : null;
+  state.sharedHistoryAdapterIdentity = { statusRoot: target.statusRoot, composerRoot: target.composerRoot,
+    turnRoots: target.assistantTurns.map((turn) => turn.root), history, turns: state.sharedHistoryTurns };
 }
 
 function nativeAccountSettingsSurfaceTarget(kind, matches) {
@@ -5117,7 +5258,11 @@ function renderBrokerUnavailable(root, code, state) {
     heading.textContent = "Restore your saved accounts";
     const instructions = document.createElement("p");
     instructions.textContent = "Ask Codex to prepare shared account activation and verify your saved sign-ins. After those checks pass, approve the final maintenance restart for ChatGPT and Tweakers. Your account homes and conversation history stay in place.";
-    steps.append(heading, instructions);
+    // Tweaks cannot open Tweakers Manager directly, so name the exact place
+    // where the failing setup check is shown and can be repaired.
+    const doctor = document.createElement("p");
+    doctor.textContent = "To see which setup check is failing, open Tweakers Manager → Doctor.";
+    steps.append(heading, instructions, doctor);
     panel.append(steps);
   } else if (state) {
     const retry = document.createElement("button");
@@ -5195,6 +5340,12 @@ function renderBrokerAccountsContents(state, root) {
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
   state.brokerStatus = status;
+  applyBrokerStatus(state, status);
+  // A new user action supersedes the previous result message. Capture runs
+  // before the action's own handler, which may then set a fresh message.
+  page.addEventListener?.("click", () => clearBrokerStatus(state), true);
+  const nativeBanner = accountsNativeUnavailableBanner(state);
+  if (nativeBanner) page.append(nativeBanner);
   page.append(
     brokerRoutingPreferencesCard(state),
     ...(state.sharedHistory ? [brokerSharedHistoryCard(state)] : []),
@@ -5204,6 +5355,54 @@ function renderBrokerAccountsContents(state, root) {
   if (state.pendingContinuation?.state === "pending") page.append(brokerContinuationCard(state));
   page.append(status);
   root.append(page);
+}
+
+function accountsNativeStatus(state) {
+  const native = state?.api?.accountsNative;
+  if (typeof native?.status !== "function") return null;
+  try {
+    const status = native.status();
+    return status && typeof status === "object" ? status : null;
+  } catch {
+    return { compatible: false, reason: "status-unavailable" };
+  }
+}
+
+function accountsNativeCompatibilityKey(state) {
+  const status = accountsNativeStatus(state);
+  if (!status) return "absent";
+  return status.compatible === false ? `off:${typeof status.reason === "string" ? status.reason : ""}` : "on";
+}
+
+function accountsNativeReasonText(reason) {
+  if (reason === "native-wrapper-changed") return "the ChatGPT app changed after Accounts started";
+  if (reason === "native-wrapper-initialization-rejected") return "this ChatGPT build did not pass the Accounts check";
+  if (reason === "native-wrapper-uninitialized") return "the Accounts integration has not started";
+  if (reason === "native-hooks-unverified") return "this ChatGPT build has not been verified";
+  if (reason === "disposed") return "the Accounts integration was shut down";
+  if (reason === "status-unavailable") return "its status could not be read";
+  if (typeof reason !== "string" || !reason.trim()) return "compatibility unavailable";
+  const text = reason.trim().replace(/[.\s]+$/, "").slice(0, 120);
+  return /^[a-z0-9-]+$/.test(text) ? text.replace(/-/g, " ") : text;
+}
+
+function accountsNativeUnavailableMessage(state) {
+  const status = accountsNativeStatus(state);
+  if (!status || status.compatible !== false) return null;
+  return `Pooled Accounts views are off for this ChatGPT build (${accountsNativeReasonText(status.reason)}). Routing still works.`;
+}
+
+function accountsNativeUnavailableBanner(state, compact = false) {
+  const message = accountsNativeUnavailableMessage(state);
+  if (!message) return null;
+  const banner = document.createElement("div");
+  banner.className = compact
+    ? "px-2 py-1.5 text-xs text-token-text-secondary"
+    : "border-token-border rounded-lg border p-3 text-sm text-token-text-secondary";
+  banner.setAttribute("role", "status");
+  if (banner.dataset) banner.dataset.tweakersAccountsNativeBanner = "true";
+  banner.textContent = message;
+  return banner;
 }
 
 function brokerAggregateCard(state, accounts) {
@@ -5316,17 +5515,39 @@ function brokerRoutingPreferencesCard(state) {
     mode.append(option);
   }
   mode.value = state.preferences.failoverMode;
+  mode.disabled = state.preferencesPending === true;
   mode.addEventListener("change", async () => {
     mode.disabled = true;
     await updateBrokerPreferences(state, { failoverMode: mode.value });
+    mode.value = state.preferences.failoverMode;
     mode.disabled = false;
   });
   modeRow.append(modeCopy, mode);
   const catalogRow = document.createElement("label");
-  catalogRow.className = "flex items-start gap-3 text-sm";
-  const catalog = document.createElement("input");
-  catalog.type = "checkbox";
-  catalog.checked = state.preferences.unifiedCatalogEnabled;
+  catalogRow.className = "flex items-center justify-between gap-3 text-sm";
+  const catalog = document.createElement("button");
+  catalog.type = "button";
+  catalog.className = "inline-flex shrink-0 items-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border";
+  catalog.setAttribute("role", "switch");
+  const pill = document.createElement("span");
+  pill.className = "relative inline-flex shrink-0 items-center rounded-full transition-colors duration-200 ease-out";
+  Object.assign(pill.style, { width: "32px", height: "20px" });
+  const knob = document.createElement("span");
+  knob.className = "rounded-full shadow-sm transition-transform duration-200 ease-out";
+  Object.assign(knob.style, { width: "16px", height: "16px", backgroundColor: "var(--gray-0)" });
+  pill.append(knob);
+  catalog.append(pill);
+  const applySharing = () => {
+    const on = state.preferences.unifiedCatalogEnabled === true;
+    catalog.setAttribute("aria-checked", String(on));
+    catalog.setAttribute("aria-busy", String(state.preferencesPending === true));
+    catalog.disabled = state.preferencesPending === true;
+    pill.style.backgroundColor = on ? "var(--color-token-charts-blue, var(--color-token-text-link-foreground))"
+      : "color-mix(in srgb, var(--color-token-foreground) 20%, transparent)";
+    knob.style.transform = on ? "translateX(14px)" : "translateX(2px)";
+    catalog.style.opacity = catalog.disabled ? "0.5" : "1";
+  };
+  applySharing();
   catalog.setAttribute("aria-label", "Share conversations with paired devices");
   const catalogCopy = document.createElement("span");
   catalogCopy.className = "flex min-w-0 flex-col gap-1";
@@ -5337,27 +5558,32 @@ function brokerRoutingPreferencesCard(state) {
   catalogNote.className = "text-token-text-secondary text-xs";
   catalogNote.textContent = "Optional catalog sharing lets a paired device see available conversations. Remote work uses that device’s connected subscription.";
   catalogCopy.append(catalogTitle, catalogNote);
-  catalog.addEventListener("change", async () => {
-    catalog.disabled = true;
-    await updateBrokerPreferences(state, { unifiedCatalogEnabled: catalog.checked === true });
-    catalog.disabled = false;
+  catalog.addEventListener("click", async () => {
+    if (state.preferencesPending || state.disposed) return;
+    const saving = updateBrokerPreferences(state, { unifiedCatalogEnabled: !state.preferences.unifiedCatalogEnabled });
+    applySharing();
+    await saving;
+    if (!state.disposed) applySharing();
   });
-  catalogRow.append(catalog, catalogCopy);
+  catalogRow.append(catalogCopy, catalog);
   body.append(modeRow, catalogRow);
   card.append(body);
   return card;
 }
 
 async function updateBrokerPreferences(state, patch) {
-  const response = await invokeAccountBroker(state, "preferences.update", patch);
-  if (state.disposed) return;
-  if (!response.ok) {
-    statusBrokerFailure(state, response.error?.code);
-    rerenderBrokerRoots(state);
-    return;
-  }
-  state.preferences = response.result;
+  if (state.preferencesPending || state.disposed) return;
+  state.preferencesPending = true;
   rerenderBrokerRoots(state);
+  try {
+    const response = await invokeAccountBroker(state, "preferences.update", patch);
+    if (state.disposed) return;
+    if (!response.ok) statusBrokerFailure(state, response.error?.code);
+    else state.preferences = response.result;
+  } finally {
+    state.preferencesPending = false;
+    rerenderBrokerRoots(state);
+  }
 }
 
 function rerenderBrokerRoots(state) {
@@ -5394,11 +5620,12 @@ function brokerAccountPoolCard(state, accounts) {
     const expanded = state.expandedBrokerAccountId === account.accountId;
     const row = document.createElement("button");
     row.type = "button";
-    row.className = "hover:bg-token-foreground/5 flex w-full flex-wrap items-center justify-between gap-4 p-3 text-left";
+    row.className = "hover:bg-token-foreground/5 flex w-full items-center justify-between gap-3 p-3 text-left";
+    Object.assign(row.style, { borderTop: "0.5px solid var(--color-token-border)", minWidth: "0" });
     row.setAttribute("aria-expanded", String(expanded));
     row.setAttribute("aria-label", `${expanded ? "Hide" : "Show"} account details for ${account.label}`);
     const identity = document.createElement("span");
-    identity.className = "flex min-w-0 items-center gap-3";
+    identity.className = "flex min-w-0 flex-1 items-center gap-3";
     const copy = document.createElement("span");
     copy.className = "flex min-w-0 flex-col gap-1";
     const title = document.createElement("span");
@@ -5406,16 +5633,22 @@ function brokerAccountPoolCard(state, accounts) {
     title.textContent = account.label;
     const identityText = document.createElement("span");
     identityText.className = "text-token-text-secondary truncate text-xs";
-    identityText.textContent = [account.email !== account.label ? account.email : null, account.plan].filter(Boolean).join(" · ") || "Masked identity and plan unavailable";
+    identityText.textContent = [account.email ? (account.email !== account.label ? account.email : null) : "Masked identity unavailable", account.plan || "Plan unavailable"].filter(Boolean).join(" · ");
     const quota = document.createElement("span");
     quota.className = "text-token-text-secondary truncate text-xs";
     quota.textContent = `${brokerQuotaText(account.quota)} · ${account.assignedTaskCount} assigned ${account.assignedTaskCount === 1 ? "task" : "tasks"}${account.currentTaskOwner ? " · current task owner" : ""}`;
     copy.append(title, identityText, quota);
     identity.append(brokerAccountAvatar(account), copy);
     const status = document.createElement("span");
-    status.className = "text-token-text-secondary shrink-0 text-xs";
-    status.textContent = `${brokerAccountStatusLabel(account)} · ${expanded ? "Hide details" : "Show details"}`;
-    row.append(identity, status);
+    status.className = "text-token-text-secondary text-xs";
+    Object.assign(status.style, { maxWidth: "35%", overflowWrap: "anywhere" });
+    status.textContent = brokerAccountStatusLabel(account);
+    const chevron = document.createElement("span");
+    chevron.setAttribute("aria-hidden", "true");
+    Object.assign(chevron.style, { width: "6px", height: "6px", flexShrink: "0",
+      borderRight: "1.5px solid var(--color-token-text-secondary)", borderBottom: "1.5px solid var(--color-token-text-secondary)",
+      transform: expanded ? "rotate(225deg)" : "rotate(45deg)" });
+    row.append(identity, status, chevron);
     row.addEventListener("click", () => {
       const next = state.expandedBrokerAccountId === account.accountId ? null : account.accountId;
       state.expandedBrokerAccountId = next;
@@ -5431,7 +5664,8 @@ function brokerAccountPoolCard(state, accounts) {
 
 function brokerAccountDisclosure(state, account) {
   const details = document.createElement("div");
-  details.className = "border-token-border flex flex-col gap-3 border-t p-3";
+  details.className = "flex flex-col gap-3 p-3";
+  details.style.borderTop = "0.5px solid var(--color-token-border)";
   if (account.continuityState === "deferred") {
     const notice = document.createElement("p");
     notice.className = "text-token-text-secondary text-xs";
@@ -5463,9 +5697,10 @@ function brokerAccountDisclosure(state, account) {
   rename.className = "text-token-text-secondary text-sm underline underline-offset-2";
   rename.textContent = "Rename";
   rename.addEventListener("click", async () => {
-    const next = globalThis.window?.prompt?.(`Name for ${account.label}`, account.label);
-    if (next === null || next === undefined) return;
+    const next = await requestAccountText(state, { title: `Rename ${account.label}`, value: account.label, confirmLabel: "Rename" });
+    if (next === null || next === undefined || state.disposed) return;
     const response = await invokeAccountBroker(state, "profile.update", { accountId: account.accountId, label: String(next).trim() });
+    if (state.disposed) return;
     if (!response.ok) { statusBrokerFailure(state, response.error?.code); return; }
     updateBrokerAccount(state.profile, response.result.account);
     setBrokerStatus(state, `${response.result.account.label} was renamed.`);
@@ -5487,20 +5722,73 @@ function brokerAccountDisclosure(state, account) {
     refreshBrokerRoots(state);
   });
   actions.append(copyEmail, rename, enabled);
-  if (account.status === "reauth_required" || account.status === "unavailable") {
+  if (account.status === "reauth_required" || account.quota?.errorCode === "authentication") {
     const reconnect = document.createElement("button");
     reconnect.type = "button";
     reconnect.className = "text-token-text-secondary text-sm underline underline-offset-2";
-    reconnect.textContent = "Reconnect";
+    reconnect.textContent = "Sign in again";
     reconnect.addEventListener("click", () => void startBrokerEnrollment(state, "reconnect.start", account.accountId));
     actions.append(reconnect);
+  } else if (account.status === "unavailable" || account.quota?.refreshState === "error") {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "text-token-text-secondary text-sm underline underline-offset-2";
+    retry.textContent = "Retry";
+    retry.disabled = state.accountRetries?.has(account.accountId) === true;
+    retry.addEventListener("click", async () => {
+      if (retry.disabled || state.disposed) return;
+      if (!(state.accountRetries instanceof Set)) state.accountRetries = new Set();
+      state.accountRetries.add(account.accountId);
+      retry.disabled = true;
+      rerenderBrokerRoots(state);
+      try {
+        const response = await invokeAccountBroker(state, "quota.read", { accountId: account.accountId });
+        if (state.disposed) return;
+        if (!response.ok) statusBrokerFailure(state, response.error?.code);
+        await refreshBrokerProfile(state);
+      } finally {
+        state.accountRetries.delete(account.accountId);
+        retry.disabled = false;
+        rerenderBrokerRoots(state);
+      }
+    });
+    actions.append(retry);
   }
   details.append(actions, brokerRemoteControls(state, account));
   return details;
 }
 
-function setBrokerStatus(state, message) {
-  if (state?.brokerStatus) state.brokerStatus.textContent = message;
+const BROKER_STATUS_TTL_MS = 8_000;
+
+// The Accounts page re-renders on profile, quota, and event updates, which
+// recreates the status element. Keep the latest message in renderer state so a
+// re-render within its lifetime shows it again instead of silently wiping it.
+function setBrokerStatus(state, message, kind = "info") {
+  if (!state) return;
+  const text = typeof message === "string" ? message : "";
+  state.brokerStatusMessage = text ? { text, kind: kind === "error" ? "error" : "info", at: Date.now() } : null;
+  applyBrokerStatus(state, state.brokerStatus);
+}
+
+function currentBrokerStatusMessage(state) {
+  const message = state?.brokerStatusMessage;
+  if (!message) return null;
+  if (!Number.isFinite(message.at) || Date.now() - message.at > BROKER_STATUS_TTL_MS) {
+    state.brokerStatusMessage = null;
+    return null;
+  }
+  return message;
+}
+
+function applyBrokerStatus(state, element) {
+  if (!element) return;
+  const message = currentBrokerStatusMessage(state);
+  element.textContent = message?.text || "";
+  if (element.dataset) element.dataset.tweakersStatusKind = message?.kind || "";
+}
+
+function clearBrokerStatus(state) {
+  if (state) state.brokerStatusMessage = null;
 }
 
 async function writeBrokerClipboard(text) {
@@ -5747,12 +6035,13 @@ function brokerEnrollmentStatusCard(state) {
   copy.className = "flex min-w-0 flex-col gap-1";
   const title = document.createElement("div");
   title.className = "text-sm text-token-text-primary";
-  title.textContent = enrollment.state === "waiting" ? "Finish device-code sign-in" : enrollment.state === "complete" ? "Subscription added" : "Device-code sign-in";
+  title.textContent = enrollment.state === "waiting" ? "Finish device-code sign-in" : enrollment.state === "complete" ? enrollment.kind === "reconnect" ? "Subscription reconnected" : "Subscription added" : "Device-code sign-in";
   const detail = document.createElement("div");
   detail.className = "text-sm text-token-text-secondary";
   detail.textContent = enrollment.state === "waiting" && enrollment.userCode
     ? `Enter code ${enrollment.userCode}${enrollment.expiresAt ? ` before ${new Date(enrollment.expiresAt).toLocaleTimeString()}` : ""}.`
-    : enrollment.state === "expired" ? "The code expired. Start again when you are ready."
+    : enrollment.state === "complete" ? "Sign-in is complete."
+      : enrollment.state === "expired" ? "The code expired. Start again when you are ready."
       : enrollment.state === "failed" ? "The sign-in could not be completed. Nothing else was changed."
         : enrollment.state === "cancelled" ? "The sign-in was cancelled."
           : "Preparing secure device-code sign-in…";
@@ -5985,7 +6274,7 @@ function brokerContinuationCard(state) {
       button.disabled = false;
       if (!response.ok) { statusBrokerFailure(state, response.error?.code); return; }
       state.pendingContinuation = response.result.continuation;
-      state.brokerStatus.textContent = response.result.continuation.state === "confirmed" ? "The account action was confirmed." : "The account action was cancelled.";
+      setBrokerStatus(state, response.result.continuation.state === "confirmed" ? "The account action was confirmed." : "The account action was cancelled.");
       refreshBrokerRoots(state);
     });
     actions.append(button);
@@ -6139,7 +6428,7 @@ function brokerAccountAvatar(account, size = 32) {
   image.alt = "";
   image.referrerPolicy = "no-referrer";
   image.className = "h-8 w-8 shrink-0 rounded-full object-cover";
-  Object.assign(image.style, { width: `${size}px`, height: `${size}px` });
+  Object.assign(image.style, { width: `${size}px`, height: `${size}px`, borderRadius: "50%", objectFit: "cover", flexShrink: "0" });
   image.addEventListener("error", () => image.replaceWith(fallback));
   return image;
 }
@@ -6229,7 +6518,7 @@ function enabledLifecycleMessage(account, lifecycle) {
 }
 
 function statusBrokerFailure(state, code) {
-  if (state?.brokerStatus) state.brokerStatus.textContent = accountBrokerDisplayMessage(code);
+  setBrokerStatus(state, accountBrokerDisplayMessage(code), "error");
 }
 
 async function startBrokerEnrollment(state, command, accountId = null) {
@@ -6340,10 +6629,13 @@ async function requestAccountsNativeValue(state, surface, method, params, select
   }
   const accountId = safeBrokerAccountId(selection.accountId);
   if (surface === "profile" && method === "profile.statistics") {
+    if (Object.keys(params).join("\0") !== "native" || !isRecord(params.native) || !isRecord(params.native.profile)) {
+      throw new Error("invalid-native-request");
+    }
     const requested = accountId || "pooled";
     const response = await invokeAccountBroker(state, "profile.statistics", { selection: requested });
     if (!response.ok) throw new Error(response.error?.code || "broker_unavailable");
-    return nativeWhamProfile(state, response.result, accountId);
+    return nativeWhamProfile(state, response.result, accountId, params.native);
   }
   if (surface === "usage" && method === "usage.status") {
     if (Object.keys(params).join("\0") !== "native") throw new Error("invalid-native-request");
@@ -6361,6 +6653,17 @@ async function requestAccountsNativeValue(state, surface, method, params, select
 
 function projectAccountsNativeValue(state, surface, kind, input) {
   if (surface !== "usage") return input;
+  if (kind === "history-context") {
+    const selected = (state?.profile?.accounts || []).find((account) => account.accountId === state.usageSelectionId)
+      || (state?.profile?.accounts || []).find((account) => account.accountId === state.selectedAccountId);
+    if (!selected) return null;
+    return {
+      accountId: selected.accountId,
+      label: selected.label,
+      remainingPercent: freshBrokerQuotaRemainingPercent(selected.quota),
+      resetAt: selected.quota?.freshness === "fresh" ? selected.quota.resetAt : null,
+    };
+  }
   if (kind === "windows") return projectNativeUsageWindows(state, input);
   if (kind === "depleted-message") {
     const accounts = state?.profile?.accounts || [];
@@ -6388,12 +6691,10 @@ function nativePoolHasIncompleteDepletion(state) {
   return remaining.some((value) => value === 0) && remaining.some((value) => value === null);
 }
 
-function nativeWhamProfile(state, result, accountId) {
+function nativeWhamProfile(state, result, accountId, native) {
+  if (!isRecord(native) || !isRecord(native.profile)) throw new Error("invalid-native-request");
   const stats = result?.stats;
   if (!stats) throw new Error("profile_statistics_unavailable");
-  const account = accountId
-    ? state.profile?.accounts?.find((candidate) => candidate.accountId === accountId)
-    : state.profile?.accounts?.find((candidate) => candidate.currentTaskOwner) || state.profile?.accounts?.[0];
   const bucket = (value) => value.map((entry) => ({ start_date: entry.startDate, tokens: entry.tokens }));
   const invocations = stats.topInvocations.map((entry) => ({
     type: entry.type,
@@ -6405,12 +6706,10 @@ function nativeWhamProfile(state, result, accountId) {
   }));
   const observedAt = new Date(result.observedAt).toISOString();
   return {
-    profile: {
-      name: accountId ? account?.label || "Subscription" : "Combined subscriptions",
-      email: accountId ? account?.email || null : null,
-      profile_picture_url: accountId ? account?.avatarUrl || null : null,
-      plan: accountId ? account?.plan || null : null,
-    },
+    ...native,
+    // This is the native signed-in user's profile, independent of the
+    // subscription selected for activity statistics. Never re-project it.
+    profile: native.profile,
     stats: {
       lifetime_tokens: stats.lifetimeTokens,
       peak_daily_tokens: stats.peakDailyTokens,
@@ -6575,11 +6874,22 @@ function restoreNativeUsageResetProjections(state) {
 function installNativeUsageResetModalProjection(state) {
   const Observer = typeof MutationObserver === "function" ? MutationObserver : null;
   if (!Observer || typeof document === "undefined" || !document.documentElement) return;
-  const project = () => { if (!state.disposed) projectNativeUsageResetModal(state, document); };
-  const observer = new Observer(project);
+  let pending = null;
+  const project = () => {
+    pending = null;
+    if (!state.disposed) projectNativeUsageResetModal(state, document);
+  };
+  const observer = new Observer((records) => {
+    const addedDialog = records.some((record) => [...record.addedNodes].some((node) =>
+      node.nodeType === 1 && (node.matches?.('[role="dialog"], [data-state="open"]')
+        || node.querySelector?.('[role="dialog"], [data-state="open"]'))));
+    if (state.disposed || pending !== null || !addedDialog) return;
+    pending = (window.requestAnimationFrame || ((callback) => window.setTimeout(callback, 16)))(project);
+  });
   observer.observe(document.documentElement, { childList: true, subtree: true });
   state.cleanups.push(() => {
     observer.disconnect();
+    if (pending !== null) (window.cancelAnimationFrame || window.clearTimeout)?.(pending);
     restoreNativeUsageResetProjections(state);
   });
   project();
@@ -6647,6 +6957,111 @@ function settingsCard() {
   card.className = "border-token-border flex flex-col divide-y-[0.5px] divide-token-border rounded-lg border";
   if (card.style) card.style.backgroundColor = "var(--color-background-panel, var(--color-token-bg-fog))";
   return card;
+}
+
+const ACCOUNT_TEXT_DIALOG_ATTR = "data-tweakers-account-text-dialog";
+
+// Electron renderers do not implement window.prompt() (it returns null), so
+// every Accounts text entry uses this in-page dialog. It resolves the entered
+// text on Save/Enter and null on Cancel/Escape/backdrop/renderer disposal.
+function requestAccountText(state, options = {}) {
+  if (state?.disposed || typeof document === "undefined" || typeof document.createElement !== "function" || !document.body) {
+    return Promise.resolve(null);
+  }
+  state?.activeTextDialog?.close?.(null);
+  const {
+    title = "", description = "", value = "", placeholder = "", confirmLabel = "Save",
+    allowEmpty = false, maxLength = 64, validate = null,
+  } = options;
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const overlay = document.createElement("div");
+    overlay.setAttribute(ACCOUNT_TEXT_DIALOG_ATTR, "true");
+    overlay.className = "fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4";
+    if (overlay.style) overlay.style.pointerEvents = "auto";
+    const dialog = document.createElement("form");
+    dialog.className = "border-token-border bg-token-bg-primary flex w-full max-w-[420px] flex-col gap-3 rounded-xl border p-4 text-token-text-primary shadow-lg";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    const titleId = `tweakers-account-text-dialog-${Date.now().toString(36)}`;
+    const heading = document.createElement("div");
+    heading.id = titleId;
+    heading.className = "text-base font-medium text-token-text-primary";
+    heading.textContent = title;
+    dialog.setAttribute("aria-labelledby", titleId);
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = typeof value === "string" ? value : "";
+    input.placeholder = placeholder;
+    input.maxLength = maxLength;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.setAttribute("aria-label", title);
+    input.className = "border-token-border bg-token-bg-primary h-token-button-composer w-full rounded-md border px-3 text-sm text-token-text-primary";
+    const error = document.createElement("div");
+    error.className = "text-token-text-secondary text-xs";
+    error.setAttribute("role", "alert");
+    const actions = document.createElement("div");
+    actions.className = "flex justify-end gap-2";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "hover:bg-token-foreground/5 h-token-button-composer rounded-md px-3 text-sm text-token-text-secondary";
+    cancel.textContent = "Cancel";
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary disabled:cursor-not-allowed disabled:opacity-60";
+    save.textContent = confirmLabel;
+    actions.append(cancel, save);
+    dialog.append(heading);
+    if (description) {
+      const detail = document.createElement("div");
+      detail.className = "text-token-text-secondary text-sm";
+      detail.textContent = description;
+      dialog.append(detail);
+    }
+    dialog.append(input, error, actions);
+    overlay.append(dialog);
+
+    let settled = false;
+    const close = (result) => {
+      if (settled) return;
+      settled = true;
+      if (state?.activeTextDialog === handle) state.activeTextDialog = null;
+      overlay.remove();
+      try { if (previousFocus?.isConnected) previousFocus.focus?.(); } catch {}
+      resolve(result);
+    };
+    const handle = { close };
+    const syncSave = () => { save.disabled = !allowEmpty && !input.value.trim(); };
+    const submit = () => {
+      const entered = input.value.trim();
+      if (!allowEmpty && !entered) return;
+      const problem = typeof validate === "function" ? validate(entered) : null;
+      if (problem) { error.textContent = problem; input.focus?.(); return; }
+      close(entered);
+    };
+    input.addEventListener("input", () => { error.textContent = ""; syncSave(); });
+    dialog.addEventListener("submit", (event) => { event.preventDefault?.(); submit(); });
+    cancel.addEventListener("click", () => close(null));
+    overlay.addEventListener("mousedown", (event) => { if (event.target === overlay) close(null); });
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") { event.preventDefault?.(); event.stopPropagation?.(); close(null); return; }
+      if (event.key === "Enter" && event.target === input && !event.isComposing) { event.preventDefault?.(); submit(); return; }
+      if (event.key !== "Tab") return;
+      const focusable = [input, cancel, save].filter((element) => !element.disabled);
+      const index = focusable.indexOf(document.activeElement);
+      const next = event.shiftKey
+        ? focusable[(index <= 0 ? focusable.length : index) - 1]
+        : focusable[(index + 1) % focusable.length];
+      event.preventDefault?.();
+      next?.focus?.();
+    });
+    syncSave();
+    if (state) state.activeTextDialog = handle;
+    document.body.append(overlay);
+    input.focus?.();
+    input.select?.();
+  });
 }
 
 function quotaPoolRemainingPercent(accounts) {
@@ -6726,7 +7141,9 @@ function initials(label) {
 
 function accountAvatar(label) {
   const avatar = document.createElement("div");
-  avatar.className = "bg-token-foreground/10 text-token-text-secondary flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-medium";
+  avatar.className = "text-token-text-secondary flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-medium";
+  if (avatar.style) Object.assign(avatar.style, { width: "32px", height: "32px", borderRadius: "50%", flexShrink: "0",
+    backgroundColor: "color-mix(in srgb, var(--color-token-foreground) 10%, transparent)" });
   avatar.setAttribute("aria-hidden", "true");
   avatar.textContent = initials(label);
   return avatar;
@@ -6848,11 +7265,15 @@ function usernameEditorButton(state, account, identityText) {
   edit.textContent = safeUsername(account?.username) ? "Edit username" : "Add username";
   edit.setAttribute("aria-label", `${edit.textContent} for ${accountDisplayLabel(account)}`);
   edit.addEventListener("click", async () => {
-    const entered = window.prompt(
-      `Username for ${accountDisplayLabel(account)} (without @). Leave blank to remove it.`,
-      safeUsername(account?.username),
-    );
-    if (entered === null) return;
+    const entered = await requestAccountText(state, {
+      title: `Username for ${accountDisplayLabel(account)}`,
+      description: "Enter it without @. Leave blank to remove it.",
+      value: safeUsername(account?.username) || "",
+      allowEmpty: true,
+      validate: (candidate) => candidate && !safeUsername(candidate)
+        ? "Use only letters, numbers, dots, dashes, or underscores for the username." : null,
+    });
+    if (entered === null || state.disposed) return;
     const requested = entered.trim();
     if (requested && !safeUsername(requested)) {
       window.alert("Use only letters, numbers, dots, dashes, or underscores for the username.");
@@ -6933,8 +7354,10 @@ function accountCards(state, accounts, liveStatus, live) {
     const rename = document.createElement("button");
     rename.type = "button"; rename.className = "text-token-text-secondary text-xs underline"; rename.textContent = "Rename";
     rename.addEventListener("click", async () => {
-      const entered = window.prompt(`Name for ${accountDisplayLabel(account)}`, accountDisplayLabel(account));
-      if (entered === null) return;
+      const entered = await requestAccountText(state, {
+        title: `Rename ${accountDisplayLabel(account)}`, value: accountDisplayLabel(account), confirmLabel: "Rename",
+      });
+      if (entered === null || state.disposed) return;
       const result = await state.api.ipc.invoke(IPC, { action: "account-profile-set", ref: account.ref, label: entered.trim() });
       if (result?.ok) { account.displayLabel = result.profile.label; title.textContent = result.profile.label; }
       else alertFailure(state, "The subscription name could not be saved.", result);
@@ -7242,6 +7665,7 @@ function accountRecoveryCard(state, accounts, savedSnapshotCount, liveStatus, st
 function pollAccountEnrollment(state, id, status) {
   if (state.disposed) return;
   state.api.ipc.invoke(IPC, { action: "account-enroll-status", id }).then((result) => {
+    if (state.disposed) return;
     const enrollment = result?.enrollment;
     if (!result?.ok || !enrollment) { status.textContent = "Device-code sign-in could not be checked."; return; }
     if (enrollment.state === "waiting") {
@@ -7263,8 +7687,12 @@ function pollAccountEnrollment(state, id, status) {
     } else {
       status.textContent = "Preparing device-code sign-in…";
     }
-    window.setTimeout(() => pollAccountEnrollment(state, id, status), 1_000);
-  }).catch(() => { status.textContent = "Device-code sign-in could not be checked."; });
+    clearBrokerEnrollmentTimer(state, id);
+    state.enrollmentTimers.set(id, window.setTimeout(() => {
+      state.enrollmentTimers.delete(id);
+      pollAccountEnrollment(state, id, status);
+    }, 1_000));
+  }).catch(() => { if (!state.disposed) status.textContent = "Device-code sign-in could not be checked."; });
 }
 
 function advancedAccountsCard(state, accounts, protection, status, live = null) {
@@ -7379,8 +7807,9 @@ async function injectAccountMenus(state) {
     rerenderBrokerAccountMenu(state);
     if (!state.menuProfileRefreshPromise) {
       state.menuProfileRefreshPromise = (async () => {
+        const revision = beginBrokerProfileRead(state);
         const broker = await invokeAccountBroker(state, "profile.read");
-        if (!state.disposed && broker.ok) {
+        if (!state.disposed && broker.ok && revision === state.profileRevision) {
           state.profile = broker.result;
           if (!broker.result.accounts.some((account) => account.accountId === state.selectedAccountId)) {
             state.selectedAccountId = broker.result.selectedAccountId || broker.result.accounts[0]?.accountId || null;
@@ -7403,8 +7832,9 @@ async function injectAccountMenus(state) {
   let brokerProfile;
   let brokerFailureCode = null;
   try {
+    const revision = beginBrokerProfileRead(state);
     const broker = await invokeAccountBroker(state, "profile.read");
-    if (broker.ok) brokerProfile = broker.result;
+    if (broker.ok) brokerProfile = revision === state.profileRevision || !state.profile ? broker.result : state.profile;
     else {
       brokerFailureCode = broker.error?.code;
       const authority = await accountAuthorityStatus(state);
@@ -7501,6 +7931,8 @@ function brokerAccountMenuRows(state, profile) {
   pooled.textContent = stats.remainingPercent === null ? "Not available" : `${stats.remainingPercent}% pooled`;
   usage.append(copy, pooled);
   panel.append(usage);
+  const nativeBanner = accountsNativeUnavailableBanner(state, true);
+  if (nativeBanner) panel.append(nativeBanner);
   for (const account of accounts) {
     const expanded = state.menuExpandedBrokerAccountId === account.accountId;
     const row = document.createElement("button");
@@ -7695,8 +8127,14 @@ function accountButton(state, account, live = null) {
 }
 
 async function saveCurrentFromMenu(state) {
-  const name = window.prompt("Name this account (letters, numbers, dots, dashes, or underscores)");
-  if (!name) return false;
+  const name = await requestAccountText(state, {
+    title: "Name this account",
+    description: "Use letters, numbers, dots, dashes, or underscores.",
+    confirmLabel: "Save",
+    validate: (candidate) => /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(candidate)
+      ? null : "Start with a letter or number, then use only letters, numbers, dots, dashes, or underscores.",
+  });
+  if (!name || state.disposed) return false;
   try {
     const prepared = await state.api.ipc.invoke(IPC, { action: "prepare-save", name });
     if (!prepared?.ok) { alertFailure(state, "The account could not be saved safely.", prepared); return false; }
@@ -7732,6 +8170,11 @@ function disposeRenderer(state) {
     void invokeAccountBroker(state, "events.unsubscribe");
   }
   state.disposed = true; state.observer?.disconnect();
+  clearBrokerSubscribeRetry(state);
+  state.activeTextDialog?.close?.(null);
+  state.brokerStatusMessage = null;
+  state.brokerStatus = null;
+  state.profilePendingRoots?.clear?.();
   if (state.timer) clearTimeout(state.timer);
   for (const enrollmentId of [...state.enrollmentTimers.keys()]) clearBrokerEnrollmentTimer(state, enrollmentId);
   for (const accountId of [...state.remoteTimers.keys()]) clearRemotePairing(state, accountId);
@@ -7752,6 +8195,7 @@ function disposeRenderer(state) {
     document.querySelectorAll?.("[data-tweakers-account-switcher]").forEach((node) => node.remove());
     document.querySelectorAll?.(`[${ACCOUNT_NATIVE_CONNECTION_SURFACE_ATTR}]`).forEach((node) => node.remove());
     document.querySelectorAll?.("[data-tweakers-account-native-slot-content]").forEach((node) => node.remove());
+    document.querySelectorAll?.(`[${ACCOUNT_TEXT_DIALOG_ATTR}]`).forEach((node) => node.remove());
   }
 }
 
@@ -7827,6 +8271,10 @@ function accountMenuOwnedTarget(targetMenu) {
 
 function renderAccountsNativeSlots(state) {
   if (state?.disposed || !state.profile || typeof document === "undefined") return;
+  if (accountsNativeStatus(state)?.compatible === false) {
+    document.querySelectorAll?.("[data-tweakers-account-native-slot-content]").forEach((node) => node.remove());
+    return;
+  }
   const accounts = state.profile.accounts || [];
   const profileSlot = namedAccountsNativeSlot("profile");
   if (profileSlot) renderAccountsNativeProfileSlot(state, profileSlot, accounts);
@@ -7858,53 +8306,8 @@ function renderAccountsNativeProfileSlot(state, slot, accounts) {
   const row = document.createElement("div");
   row.className = "mb-4";
   Object.assign(row.style, { display: "flex", flexDirection: "column", alignItems: "center", gap: "12px", width: "100%" });
-  const enabledAccounts = accounts.filter((account) => account.enabled);
-  const visibleAccounts = selected === "pooled"
-    ? enabledAccounts
-    : accounts.filter((account) => account.accountId === selected);
-  const avatarStack = document.createElement("div");
-  Object.assign(avatarStack.style, { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "80px" });
-  avatarStack.setAttribute("aria-label", selected === "pooled"
-    ? `${enabledAccounts.length} enabled subscriptions`
-    : "Selected subscription profile");
-  visibleAccounts.forEach((account, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.setAttribute("aria-label", selected === "pooled"
-      ? `Show ${account.label} profile activity`
-      : "Show combined profile activity");
-    button.title = [account.label, account.plan].filter(Boolean).join(" · ");
-    Object.assign(button.style, {
-      width: "80px", height: "80px", flexShrink: "0", padding: "0",
-      marginLeft: index === 0 ? "0" : "-20px", borderRadius: "9999px",
-      border: "4px solid var(--token-bg-primary)", overflow: "hidden",
-      position: "relative", zIndex: String(index + 1), cursor: "pointer",
-    });
-    const avatar = brokerAccountAvatar(account, 80);
-    Object.assign(avatar.style, { width: "100%", height: "100%", borderRadius: "9999px", objectFit: "cover" });
-    button.append(avatar);
-    button.addEventListener("click", () => selectProfileStatistics(
-      state,
-      selected === "pooled" ? account.accountId : "pooled",
-      accounts,
-    ));
-    avatarStack.append(button);
-  });
-  row.append(avatarStack);
-  const selectedAccount = selected === "pooled" ? null : accounts.find((account) => account.accountId === selected);
-  if (selectedAccount) {
-    const identity = document.createElement("div");
-    Object.assign(identity.style, { display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" });
-    const name = document.createElement("div");
-    name.className = "text-token-text-primary";
-    Object.assign(name.style, { fontSize: "20px", lineHeight: "28px", fontWeight: "500" });
-    name.textContent = selectedAccount.label;
-    const plan = document.createElement("div");
-    plan.className = "text-token-text-secondary text-sm";
-    plan.textContent = selectedAccount.plan || "ChatGPT subscription";
-    identity.append(name, plan);
-    row.append(identity);
-  }
+  // Activity selection changes the statistics scope only. The host retains
+  // its own signed-in identity and avatar outside this Accounts-owned slot.
   const copy = document.createElement("div");
   copy.className = "flex min-w-0 flex-col gap-1";
   Object.assign(copy.style, { alignItems: "center", position: "relative", zIndex: "10", pointerEvents: "auto" });

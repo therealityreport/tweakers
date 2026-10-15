@@ -8,7 +8,9 @@ import { isOpaqueAccountId, isPlainRecord, type OpaqueAccountId } from "./types"
 
 export const SHARED_NATIVE_MODE_FILE_V1 = "shared-native-mode.v1.json";
 export const SHARED_NATIVE_MODE_TRANSITION_FILE_V1 = "shared-native-mode-transition.v1.json";
+export const OFFICIAL_SHARED_PLUGIN_PREPARATION_TIMEOUT_MS_V1 = 600_000;
 type Sha256 = `sha256:${string}`;
+export type SharedNativeResolverProtocolV1 = "shared-native-overlay-v1" | "official-bundled-v1";
 type Root = { path: string; identity: NativeHistoryDirectoryIdentityV1 };
 export interface SharedNativeModeV1 {
   version: 1;
@@ -17,7 +19,7 @@ export interface SharedNativeModeV1 {
   sourceAccountId: OpaqueAccountId;
   nativeBase: Root;
   overlay: Root;
-  resolverProtocol: "shared-native-overlay-v1";
+  resolverProtocol: SharedNativeResolverProtocolV1;
   resolverBinarySha256: string;
   retiredCopyState: { priorSharedFingerprint: Sha256; priorPluginsFingerprint: Sha256; abortedRebaseFingerprint: Sha256 | null };
   signature: string;
@@ -33,7 +35,7 @@ export interface SharedNativeModePlanV1 {
 type Blocked = { state: "blocked"; reason: string };
 export type SharedNativeModeReadResultV1 = { state: "absent" } | Blocked | {
   state: "ready"; document: SharedNativeModeV1; fingerprint: Sha256;
-  environment: { TWEAKERS_NATIVE_BASE_ROOT: string; TWEAKERS_OVERLAY_ROOT: string };
+  environment: { TWEAKERS_NATIVE_BASE_ROOT?: string; TWEAKERS_OVERLAY_ROOT?: string };
 };
 export type SharedNativeModePublishResultV1 = Blocked | { state: "published"; document: SharedNativeModeV1; fingerprint: Sha256; binding: NativeHistorySourceBindingV1 };
 export interface PrepareSharedNativeModeInputV1 extends SharedNativeModeContextV1 {
@@ -67,6 +69,17 @@ function verify(value: Record<string, unknown>, secret: Buffer, domain: string):
   const { signature, ...unsigned } = value;
   const expected = mac(unsigned, secret, domain);
   if (typeof signature !== "string" || Buffer.byteLength(signature) !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) fail("invalid shared native signature");
+}
+
+/** A signed latency hint only. Full mode/root authority is still checked by the
+ * broker; this never authorizes a process, file mutation or account operation. */
+export function sharedNativePluginPreparationTimeoutV1(stateRoot: string, secret: Buffer, fallbackMs: number): number {
+  try {
+    const value: unknown = JSON.parse(read(join(stateRoot, SHARED_NATIVE_MODE_FILE_V1)).toString("utf8"));
+    if (!isPlainRecord(value) || value.version !== 1 || value.kind !== "account-router-shared-native-mode" || value.resolverProtocol !== "official-bundled-v1") return fallbackMs;
+    verify(value, secret, "shared-native-mode:v1");
+    return OFFICIAL_SHARED_PLUGIN_PREPARATION_TIMEOUT_MS_V1;
+  } catch { return fallbackMs; }
 }
 function present(path: string): boolean {
   try { lstatSync(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
@@ -102,18 +115,27 @@ function contextSafe(context: SharedNativeModeContextV1): void {
   const { signature, ...source } = context.binding.source;
   if (signNativeHistorySourceV1(source, context.secret).signature !== signature) fail("native source signing key mismatch");
 }
-function noAccountRecovery(context: SharedNativeModeContextV1): void {
+export interface OwnedPluginPreparationV1 { account: OpaqueAccountId; permitsPendingIntent: () => boolean }
+function noAccountRecovery(context: SharedNativeModeContextV1, preparation?: OwnedPluginPreparationV1): void {
   for (const account of context.binding.accounts) {
     const root = join(context.stateRoot, "accounts", account.opaqueAccountId);
     if (present(root)) { directory(join(context.stateRoot, "accounts")); directory(root); }
-    for (const name of ACCOUNT_INTENTS) if (present(join(root, name))) fail("unrelated account continuity recovery is pending");
+    for (const name of ACCOUNT_INTENTS) if (present(join(root, name))) {
+      if (name === "plugin-projection-intent.v1.json" && preparation?.account === account.opaqueAccountId) {
+        if (preparation.permitsPendingIntent()) continue;
+        // The worker can retire this marker during the ownership read. A fresh
+        // strict absence check accepts completed cleanup, never a retained marker.
+        if (!present(join(root, name))) continue;
+      }
+      fail("unrelated account continuity recovery is pending");
+    }
   }
 }
 function sharedRoot(context: SharedNativeModeContextV1): string { const root = join(context.stateRoot, "shared-account-config"); directory(root); return root; }
 function parseDocument(value: unknown, context: SharedNativeModeContextV1): SharedNativeModeV1 {
   if (!isPlainRecord(value) || !exact(value, ["version", "kind", "sourceFingerprint", "sourceAccountId", "nativeBase", "overlay", "resolverProtocol", "resolverBinarySha256", "retiredCopyState", "signature"])
     || value.version !== 1 || value.kind !== "account-router-shared-native-mode" || !sha(value.sourceFingerprint) || !isOpaqueAccountId(value.sourceAccountId)
-    || value.resolverProtocol !== "shared-native-overlay-v1" || typeof value.resolverBinarySha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.resolverBinarySha256)) return fail("invalid shared native registration");
+    || !["shared-native-overlay-v1", "official-bundled-v1"].includes(String(value.resolverProtocol)) || typeof value.resolverBinarySha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.resolverBinarySha256)) return fail("invalid shared native registration");
   verify(value, context.secret, "shared-native-mode:v1");
   for (const root of [value.nativeBase, value.overlay]) {
     if (!isPlainRecord(root) || !exact(root, ["path", "identity"]) || typeof root.path !== "string" || !isPlainRecord(root.identity)
@@ -149,17 +171,17 @@ function priorGlobals(context: SharedNativeModeContextV1, document: SharedNative
 }
 function archiveRebasePath(context: SharedNativeModeContextV1, digest: Sha256): string { return join(sharedRoot(context), `shared-source-rebase-aborted-${digest.slice(7)}.v1.json`); }
 
-export function readSharedNativeModeV1(context: SharedNativeModeContextV1): SharedNativeModeReadResultV1 {
+export function readSharedNativeModeV1(context: SharedNativeModeContextV1, preparation?: OwnedPluginPreparationV1): SharedNativeModeReadResultV1 {
   try {
     directory(context.stateRoot);
     if (present(join(context.stateRoot, SHARED_NATIVE_MODE_TRANSITION_FILE_V1))) return blocked(new Error("shared native transition recovery is pending"));
     const path = join(context.stateRoot, SHARED_NATIVE_MODE_FILE_V1);
     if (!present(path)) return { state: "absent" };
-    contextSafe(context); noAccountRecovery(context);
+    contextSafe(context); noAccountRecovery(context, preparation);
     if (present(join(context.stateRoot, "shared-account-config"))) sharedRoot(context);
     if (present(join(context.stateRoot, "shared-account-config", REBASE_FILE))) fail("shared source rebase recovery is pending");
     const content = read(path); const document = parseDocument(JSON.parse(content.toString("utf8")), context);
-    return { state: "ready", document, fingerprint: hash(content), environment: { TWEAKERS_NATIVE_BASE_ROOT: document.nativeBase.path, TWEAKERS_OVERLAY_ROOT: document.overlay.path } };
+    return { state: "ready", document, fingerprint: hash(content), environment: document.resolverProtocol === "official-bundled-v1" ? {} : { TWEAKERS_NATIVE_BASE_ROOT: document.nativeBase.path, TWEAKERS_OVERLAY_ROOT: document.overlay.path } };
   } catch (error) { return blocked(error); }
 }
 
@@ -312,16 +334,17 @@ function parseResolverTransition(value: unknown, context: SharedNativeModeContex
   }
   const prior = parseDocument(JSON.parse(value.priorDocumentBytes), context);
   const next = parseDocument(value.document, context);
-  const { signature: _oldSignature, resolverBinarySha256: _oldResolver, ...oldFields } = prior;
-  const { signature: _newSignature, resolverBinarySha256: _newResolver, ...newFields } = next;
-  if (canonical(oldFields) !== canonical(newFields) || prior.resolverBinarySha256 === next.resolverBinarySha256) fail("resolver transition must change only the resolver binary");
+  const { signature: _oldSignature, resolverBinarySha256: _oldResolver, resolverProtocol: _oldProtocol, ...oldFields } = prior;
+  const { signature: _newSignature, resolverBinarySha256: _newResolver, resolverProtocol: _newProtocol, ...newFields } = next;
+  if (canonical(oldFields) !== canonical(newFields) || (prior.resolverBinarySha256 === next.resolverBinarySha256 && prior.resolverProtocol === next.resolverProtocol)) fail("resolver transition must change only the resolver binary or protocol");
   return value as unknown as SharedNativeResolverTransitionV1;
 }
 
-/** Prepare a signed resolver-only CAS without changing the installed registration. */
+/** Prepare a signed resolver/protocol CAS without changing the installed registration. */
 export function prepareSharedNativeResolverTransitionV1(input: SharedNativeModeContextV1 & {
   expectedRegistrationFingerprint: Sha256;
   resolverBinarySha256: string;
+  resolverProtocol?: SharedNativeResolverProtocolV1;
   repairBinding: SharedNativeResolverRepairBindingV1;
 }): { state: "prepared"; plan: SharedNativeResolverTransitionV1; fingerprint: Sha256 } | Blocked {
   try {
@@ -330,7 +353,7 @@ export function prepareSharedNativeResolverTransitionV1(input: SharedNativeModeC
     const priorDocumentBytes = read(join(input.stateRoot, SHARED_NATIVE_MODE_FILE_V1)).toString("utf8");
     if (hash(priorDocumentBytes) !== current.fingerprint) fail("shared native resolver registration drift");
     const { signature: _signature, ...prior } = current.document;
-    const document = signed({ ...prior, resolverBinarySha256: input.resolverBinarySha256 }, input.secret, "shared-native-mode:v1");
+    const document = signed({ ...prior, resolverBinarySha256: input.resolverBinarySha256, resolverProtocol: input.resolverProtocol ?? prior.resolverProtocol }, input.secret, "shared-native-mode:v1");
     const plan = signed({ version: 1 as const, kind: "account-router-shared-native-resolver-transition" as const,
       binding: input.repairBinding, priorDocumentBytes, priorFingerprint: current.fingerprint, document }, input.secret, "shared-native-resolver-transition:v1");
     parseResolverTransition(plan, input);
@@ -397,7 +420,38 @@ export function executeSharedNativeResolverTransitionV1(input: SharedNativeModeC
   } catch (error) { return blocked(error); }
 }
 
-/** Installer port: load only the exact signed native binding and wipe the key after each phase. */
+/** Read/prepare ports share the native binding loader; signing keys never escape it. */
+function withSharedNativeModeAtRootV1<T>(stateRoot: string, action: (context: SharedNativeModeContextV1) => T): T | Blocked {
+  let secret: Buffer | undefined;
+  try {
+    directory(stateRoot);
+    secret = read(join(stateRoot, "control-secret.v1"));
+    if (secret.length !== 32) fail("invalid shared native resolver signing key");
+    const config = JSON.parse(read(join(stateRoot, "account-router-config.json")).toString("utf8"));
+    const native = readAndPreflightNativeHistorySourceStaticV1(stateRoot, config, secret);
+    if (native.state !== "ready") return fail("shared native resolver source binding unavailable");
+    return action({ stateRoot, secret, binding: native.binding });
+  } catch (error) { return blocked(error); }
+  finally { secret?.fill(0); }
+}
+
+export function readSharedNativeModeAtRootV1(input: { stateRoot: string }): SharedNativeModeReadResultV1 {
+  return withSharedNativeModeAtRootV1(input.stateRoot, readSharedNativeModeV1);
+}
+
+export function prepareSharedNativeResolverTransitionAtRootV1(input: {
+  stateRoot: string; expectedRegistrationFingerprint: string; resolverBinarySha256: string; resolverProtocol?: SharedNativeResolverProtocolV1;
+  repairBinding: SharedNativeResolverRepairBindingV1;
+}): ReturnType<typeof prepareSharedNativeResolverTransitionV1> {
+  return withSharedNativeModeAtRootV1(input.stateRoot, context => {
+    if (!sha(input.expectedRegistrationFingerprint) || !/^[a-f0-9]{64}$/.test(input.resolverBinarySha256)) return fail("invalid resolver preparation authority");
+    return prepareSharedNativeResolverTransitionV1({ ...context,
+      expectedRegistrationFingerprint: input.expectedRegistrationFingerprint,
+      resolverBinarySha256: input.resolverBinarySha256, resolverProtocol: input.resolverProtocol, repairBinding: input.repairBinding });
+  });
+}
+
+/** Installer execution port: load only the exact signed native binding and wipe the key after each phase. */
 export function executeSharedNativeResolverTransitionAtRootV1(input: {
   stateRoot: string; plan: unknown; expectedPlanFingerprint: Sha256; action: "validate" | "begin" | "publish" | "finish";
 }): ReturnType<typeof executeSharedNativeResolverTransitionV1> {

@@ -5,7 +5,9 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Socket } from "node:net";
 import type { Readable } from "node:stream";
 import { performance } from "node:perf_hooks";
-import { ACCOUNTS_BROKER_IDENTITY_FD_ENV, ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS } from "../codex-app-server-parent";
+import { ACCOUNTS_BROKER_IDENTITY_FD_ENV, ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS, ACCOUNTS_STARTUP_POLICY_ENV } from "../codex-app-server-parent";
+import { DESKTOP_APP_TOOLS_CONTEXT_ENV, parseDesktopAppToolsContext, type DesktopAppToolsContextV1 } from "./desktop-app-tools";
+import { StartupPolicySessionV1, verifyStartupPolicyHandshake, type StartupPolicyHandshakeV1 } from "./startup-policy";
 import {
   connectAccountsBrokerAppServerClient,
   type AccountsBrokerAppServerClientOptions,
@@ -13,12 +15,14 @@ import {
 } from "./broker-host";
 import { readAccountsBrokerSecret } from "./broker-socket";
 import { readRouterLaunchSelection } from "./config";
+import { sharedNativePluginPreparationTimeoutV1 } from "./shared-native-mode";
 import { parseJsonRpcLine } from "./protocol";
 import { redactedRouterError } from "./redaction";
 import { preflightRouterHomes } from "./app-server-mux";
 import {
   isOpaqueAppToolsRef,
   isOpaqueRendererRef,
+  isPlainRecord,
   type BrokerClientKind,
   type OpaqueAppToolsRef,
   type OpaqueRendererRef,
@@ -42,7 +46,7 @@ interface BrokerAppServerArguments {
  */
 export async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)): Promise<void> {
   const started = performance.now();
-  const deadline = started + ACCOUNTS_BROKER_STARTUP_TIMEOUT_MS;
+  let deadline = started + ACCOUNTS_BROKER_STARTUP_TIMEOUT_MS;
   const diagnostic = (stage: "preflight" | "identity" | "connect", code: "ready" | "unavailable" | "deadline_exceeded"): void => {
     process.stderr.write(`Tweakers Accounts bridge: ${JSON.stringify({ stage, code, elapsedMs: Math.round(performance.now() - started) })}\n`);
   };
@@ -64,9 +68,24 @@ export async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)
     process.exitCode = 1;
     return;
   }
+  deadline = started + sharedNativePluginPreparationTimeoutV1(parsed.stateRoot, secret, ACCOUNTS_BROKER_STARTUP_TIMEOUT_MS);
   const clientKind: BrokerClientKind = process.env.TWEAKERS_DERIVED_VARIANT === "1" ? "tweakers" : "chatgpt";
+  let desktopAppTools: DesktopAppToolsContextV1 | null = null;
+  if (process.env[DESKTOP_APP_TOOLS_CONTEXT_ENV] !== undefined) {
+    try { desktopAppTools = parseDesktopAppToolsContext(process.env[DESKTOP_APP_TOOLS_CONTEXT_ENV]!); }
+    catch { diagnostic("identity", "unavailable"); secret.fill(0); process.exitCode = 1; return; }
+  }
+  let startupPolicy: StartupPolicyHandshakeV1 | null = null;
+  if (process.env[ACCOUNTS_STARTUP_POLICY_ENV] !== undefined) {
+    try {
+      const value: unknown = JSON.parse(process.env[ACCOUNTS_STARTUP_POLICY_ENV]!);
+      if (clientKind !== "tweakers" || !verifyStartupPolicyHandshake(secret, value)) throw new Error("unavailable");
+      startupPolicy = value;
+      if (desktopAppTools) throw new Error("unavailable");
+    } catch { diagnostic("identity", "unavailable"); secret.fill(0); process.exitCode = 1; return; }
+  }
   let identity = desktopBrokerIdentityFromEnvironment();
-  if (!identity && process.env[ACCOUNTS_BROKER_IDENTITY_FD_ENV] === "3") {
+  if (!startupPolicy && !identity && process.env[ACCOUNTS_BROKER_IDENTITY_FD_ENV] === "3") {
     try {
       identity = await readBrokerDesktopIdentityBootstrap(new Socket({ fd: 3, readable: true, writable: false }), Math.max(0, deadline - performance.now()));
     } catch { /* Emit only the bounded stage result below. */ }
@@ -74,7 +93,7 @@ export async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)
   // Random bridge identities would disconnect the app-server task from the
   // renderer that is allowed to confirm a handoff and receive reverse tools.
   // A v3 child without the main-bound identity must fail closed.
-  if (!identity) {
+  if (!startupPolicy && !identity) {
     diagnostic("identity", performance.now() >= deadline ? "deadline_exceeded" : "unavailable");
     secret.fill(0);
     process.exitCode = 1;
@@ -85,10 +104,34 @@ export async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)
     root: parsed.stateRoot,
     secret,
     clientKind,
-    rendererRef: identity.rendererRef,
-    appToolsRef: identity.appToolsRef,
+    ...(desktopAppTools ? { desktopAppTools } : {}),
+    ...(startupPolicy ? { startupPolicyHandshake: startupPolicy }
+      : { rendererRef: identity!.rendererRef, appToolsRef: identity!.appToolsRef }),
   };
-  const bridge = await connectAccountsBrokerForStartup(clientOptions, writeDesktop, deadline, () => startOwner(parsed));
+  const startupSession = startupPolicy ? new StartupPolicySessionV1() : null;
+  let pendingStartupId: string | number | null = null;
+  let activeBridge: AccountsBrokerAppServerConnection | null = null;
+  const receive = (message: JsonRpcMessage): void => {
+    if (startupSession) {
+      if (!startupPolicy || !verifyStartupPolicyHandshake(secret, startupPolicy) || pendingStartupId === null
+        || !("id" in message) || message.id !== pendingStartupId || "method" in message
+        || Object.hasOwn(message, "result") === Object.hasOwn(message, "error")
+        || Object.keys(message).some(key => !["jsonrpc", "id", "result", "error"].includes(key))
+        || (Object.hasOwn(message, "jsonrpc") && message.jsonrpc !== "2.0")
+        || ("error" in message && (!isPlainRecord(message.error) || !Number.isSafeInteger(message.error.code) || typeof message.error.message !== "string"))) {
+        startupSession.fail(); activeBridge?.close(); return;
+      }
+      pendingStartupId = null;
+      startupSession.complete(!("error" in message) || !message.error);
+    }
+    writeDesktop(message);
+    if (startupSession?.state === "failed") activeBridge?.close();
+  };
+  const bridge = await connectAccountsBrokerForStartup(clientOptions, receive, deadline, () => startOwner(parsed));
+  activeBridge = bridge;
+  if (startupSession?.state === "failed") {
+    bridge?.close(); secret.fill(0); process.exitCode = 1; return;
+  }
   if (!bridge) {
     diagnostic("connect", "deadline_exceeded");
     secret.fill(0);
@@ -100,8 +143,16 @@ export async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)
   input.on("line", (line) => {
     const message = parseJsonRpcLine(line);
     if (!message) {
+      if (startupSession) { startupSession.fail(); process.exitCode = 1; input.close(); bridge!.close(); return; }
       writeDesktop(redactedRouterError(null, "invalid_request"));
       return;
+    }
+    if (startupSession) {
+      if (!startupPolicy || !verifyStartupPolicyHandshake(secret, startupPolicy) || !startupSession.prepare(message)) {
+        startupSession.fail(); process.exitCode = 1; input.close(); bridge!.close(); return;
+      }
+      if ("id" in message) pendingStartupId = message.id as string | number;
+      else startupSession.complete(true);
     }
     if (!bridge!.send(message)) {
       process.exitCode = 1;
@@ -110,12 +161,13 @@ export async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)
   });
   const shutdown = (): void => {
     input.close();
+    process.stdin.destroy();
     bridge?.close();
     secret.fill(0);
   };
   // A closed broker transport must become a visible app-server failure. Never
   // leave native requests waiting on a bridge that can no longer answer them.
-  void bridge.whenClosed.then(() => { process.exitCode = 1; shutdown(); });
+  void bridge.whenClosed.then(() => { process.exitCode = startupSession?.completed ? 0 : 1; shutdown(); });
   input.once("close", shutdown);
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
@@ -153,7 +205,7 @@ function startOwner(parsed: BrokerAppServerArguments): void {
   const entrypoint = join(__dirname, "broker-host.js");
   if (!existsSync(entrypoint)) return;
   const environment: NodeJS.ProcessEnv = {};
-  for (const key of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "SSL_CERT_FILE", "SSL_CERT_DIR"]) {
+  for (const key of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE", "NODE_EXTRA_CA_CERTS"]) {
     if (typeof process.env[key] === "string") environment[key] = process.env[key];
   }
   environment.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED = "1";

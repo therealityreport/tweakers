@@ -11,6 +11,7 @@ const service = require("./service");
 const nativeProjectMenu = require("./native-project-menu");
 const sidebar = require("./sidebar");
 const settings = require("./settings");
+const threadSummaryProfiles = require("./thread-summary-profiles");
 
 const IPC = "projects";
 const SERVICE_KEY = "__tweakersProjectsServiceV1";
@@ -19,6 +20,7 @@ const NATIVE_MENU_BRIDGE_KEY = "__tweakersProjectsNativeMenuBridgeV1";
 const settingsPresenter = settings.createSettingsPresenter({
   openNativeProjectEditDialog: sidebar.openNativeProjectEditDialog,
 });
+const activePages = new WeakMap();
 
 function startMain(api) {
   const projectService = service.createProjectService(api);
@@ -37,6 +39,19 @@ function startMain(api) {
 }
 
 function startRenderer(api) {
+  let disposed = false;
+  const profilesInstance = {};
+  const profilesApi = { ...api, ipc: { ...api.ipc,
+    invoke(channel, ...args) { return api.ipc.invoke(channel === "profiles.read" ? IPC : channel, ...args); },
+  } };
+  let profilesEnabled = false;
+  const setProfilesEnabled = (enabled) => {
+    if (disposed || enabled === profilesEnabled) return;
+    profilesEnabled = enabled;
+    if (enabled) threadSummaryProfiles.start.call(profilesInstance, profilesApi, { integrated: true });
+    else threadSummaryProfiles.stop.call(profilesInstance);
+  };
+  setProfilesEnabled(api.storage?.get?.("threadSummaryProfiles", false) === true);
   let latestState = null;
   let latestRevision = null;
   let latestNativeProjects = [];
@@ -44,14 +59,10 @@ function startRenderer(api) {
   let aliasRefreshRequest = 0;
   let revisionRefreshRequest = 0;
   let selectedSettingsProjectId = null;
-  let resizeObserver = null;
-  const apply = () => {
-    sidebar.applyNativeProjectColors(api, latestState);
-    resizeObserver?.sync();
-  };
-  resizeObserver = sidebar.installProjectSidebarResizeObserver(apply);
+  const updater = sidebar.createProjectSidebarUpdater(api, () => latestState);
+  const apply = () => updater.schedule(true);
   const acceptResponse = (response) => {
-    if (!response?.ok) return false;
+    if (disposed || !response?.ok) return false;
     if (Array.isArray(response.nativeProjects)) latestNativeProjects = response.nativeProjects;
     latestState = state.bindNativeProjectIdentities(response.state, latestNativeProjects);
     latestRevision = response.revision;
@@ -59,7 +70,11 @@ function startRenderer(api) {
     return true;
   };
   const saveAppearance = async (projectId, choice) => {
-    if (!latestState || !projectId) return;
+    if (!latestState || !projectId) return false;
+    if (!latestState.nodes.some((node) => node.type === "project" && node.id === projectId)) {
+      window.alert("Could not save project appearance because this project changed. Open Edit again to retry.");
+      return false;
+    }
     const taskOrderingChange = Object.prototype.hasOwnProperty.call(choice || {}, "taskSort")
       || Object.prototype.hasOwnProperty.call(choice || {}, "pinnedTaskIds");
     const changeLabel = taskOrderingChange ? "project task order" : "project color";
@@ -77,18 +92,20 @@ function startRenderer(api) {
           const current = await api.ipc.invoke(IPC, { action: "get" });
           if (acceptResponse(current)) apply();
           window.alert(`Could not save the ${changeLabel} because this project changed. Try again.`);
-          return;
+          return false;
         }
         window.alert(`Could not save the ${changeLabel}.`);
-        return;
+        return false;
       }
       latestState = state.bindNativeProjectIdentities(response.state, latestNativeProjects);
       latestRevision = response.revision;
       apply();
       window.dispatchEvent(new CustomEvent("tweaker:projects-color-change", { detail: { projectId } }));
+      return true;
     } catch (error) {
       api.log?.warn?.(`${changeLabel} save failed`, String(error));
       window.alert(`Could not save the ${changeLabel}.`);
+      return false;
     }
   };
   const removeRevision = api.ipc.on?.("revision", (payload) => {
@@ -106,19 +123,35 @@ function startRenderer(api) {
     description: "Organize the projects shown in your ChatGPT sidebar.",
     iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="icon-sm inline-block shrink-0 align-middle" aria-hidden="true"><path d="M2.5 5.5h6l1.5 2h7.5v7.5a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V5.5Z" stroke="currentColor" stroke-width="1.5"/></svg>',
     render(root) {
-      return settingsPresenter.renderProjectsPage(api, root, (nextState, revision, nativeProjects) => {
+      const profilesSetting = document.createElement("label");
+      profilesSetting.className = "flex items-center justify-between gap-4 rounded-lg border border-token-border p-3 text-sm text-token-text-primary";
+      const copy = document.createElement("span");
+      copy.textContent = "Thread Summary Profiles";
+      const toggle = document.createElement("input");
+      toggle.type = "checkbox";
+      toggle.setAttribute("role", "switch");
+      toggle.checked = profilesEnabled;
+      toggle.addEventListener("change", () => {
+        api.storage?.set?.("threadSummaryProfiles", toggle.checked);
+        setProfilesEnabled(toggle.checked);
+      });
+      profilesSetting.append(copy, toggle);
+      const content = document.createElement("div");
+      root.replaceChildren(profilesSetting, content);
+      const disposePage = settingsPresenter.renderProjectsPage(api, content, (nextState, revision, nativeProjects) => {
         if (Array.isArray(nativeProjects)) latestNativeProjects = nativeProjects;
         latestState = state.bindNativeProjectIdentities(nextState, latestNativeProjects);
         latestRevision = revision;
         apply();
       }, () => selectedSettingsProjectId, (projectId) => { selectedSettingsProjectId = projectId; });
+      return () => { disposePage?.(); root.replaceChildren(); };
     },
   });
   api.ipc.invoke(IPC, { action: "get" }).then((response) => {
     if (acceptResponse(response)) apply();
   }).catch(() => {});
   const removeHostObserver = api.react?.host?.observe?.(["projects"], () => {
-    apply();
+    updater.schedule();
     const fingerprint = sidebar.nativeProjectSurfaceFingerprint(api);
     if (fingerprint === latestSurfaceFingerprint) return;
     latestSurfaceFingerprint = fingerprint;
@@ -142,11 +175,13 @@ function startRenderer(api) {
   );
   return {
     unregister() {
+      disposed = true;
+      threadSummaryProfiles.stop.call(profilesInstance);
       aliasRefreshRequest += 1;
       revisionRefreshRequest += 1;
       removeRevision?.();
       removeHostObserver?.();
-      resizeObserver?.dispose();
+      updater.dispose();
       removeColorControls?.();
       removeTaskControls?.();
       removeEditProjectControls?.();
@@ -159,8 +194,10 @@ function startRenderer(api) {
 const tweak = {
   start(api) {
     if (api.process === "main") return startMain(api);
+    activePages.get(this)?.unregister?.();
     const page = startRenderer(api);
     this._page = page;
+    activePages.set(this, page);
     return page;
   },
   stop() {
@@ -177,6 +214,7 @@ const tweak = {
     }
     this._page?.unregister?.();
     this._page = null;
+    activePages.delete(this);
   },
   _test: {
     ...common,

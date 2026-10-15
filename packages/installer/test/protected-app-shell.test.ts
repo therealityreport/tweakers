@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { createContext, runInContext } from "node:vm";
 import {
   stageProtectedHealthLaunchGrant,
   writeProtectedAuthorityJsonAtomically,
@@ -19,12 +20,55 @@ const SHA = (character: string) => character.repeat(64);
 const NOW = "2026-08-12T19:01:00.000Z";
 const cjsRequire = createRequire(import.meta.url);
 
+test("UI-on protected loader reasserts its verified backend after runtime deletion or replacement", () => {
+  const loaderSource = readFileSync(resolve("packages/installer/assets/protected-loader.cjs"), "utf8");
+  for (const mutation of ["delete process.env.CODEX_CLI_PATH;", "process.env.CODEX_CLI_PATH = '/unverified/backend';"]) {
+    const root = mkdtempSync(join(tmpdir(), "tweaker-protected-pin-"));
+    try {
+      const authorityRoot = join(root, "authority");
+      const runtimeMain = join(authorityRoot, "runtime/main.js");
+      mkdirSync(dirname(runtimeMain), { recursive: true });
+      writeFileSync(runtimeMain, mutation);
+      writeFileSync(join(authorityRoot, "grant.json"), "{}");
+      writeFileSync(join(root, "tweakers-protected.json"), JSON.stringify({
+        authorityRoot, grantFile: "grant.json", preflightReceiptFile: "receipt.json", originalMain: "main.js",
+        transactionId: "protected-pin", attempt: 1, uiFeatures: "on", runtimeMain: "runtime/main.js",
+        runtimeMainSha256: createHash("sha256").update(mutation).digest("hex"),
+      }));
+      const module = { exports: {} as { bootstrapProtectedApp?: (options: Record<string, unknown>) => unknown } };
+      const env: Record<string, string> = { CODEX_CLI_PATH: "/prior/backend" };
+      const context = createContext({ module, exports: module.exports, __dirname: root, process: { env, pid: process.pid } });
+      const isolatedRequire = (path: string): unknown => {
+        if (path === runtimeMain) { runInContext(readFileSync(runtimeMain, "utf8"), context); return {}; }
+        if (path === "node:module") return { globalPaths: [] };
+        return cjsRequire(path);
+      };
+      Object.assign(context, { require: isolatedRequire });
+      runInContext(loaderSource, context);
+      let mainLoaded = false;
+      module.exports.bootstrapProtectedApp!({ root, bootstrap: {
+        runProtectedBootstrapPreflight: () => ({ verdict: "PASS", receiptSha256: SHA("a"), emittedAt: NOW }),
+        applyProtectedBootstrapEnvironment: () => ({ CODEX_CLI_PATH: "/verified/selected/backend" }),
+      }, loadMain: () => {
+        mainLoaded = true;
+        assert.equal(env.CODEX_CLI_PATH, "/verified/selected/backend");
+        assert.equal(runInContext("globalThis.__tweakersVerifiedBackendPathV1", context), "/verified/selected/backend");
+        const descriptor = runInContext("Object.getOwnPropertyDescriptor(globalThis, '__tweakersVerifiedBackendPathV1')", context);
+        assert.equal(descriptor.writable, false);
+        assert.equal(descriptor.configurable, false);
+      } });
+      assert.equal(mainLoaded, true);
+      assert.equal(env.CODEX_CLI_PATH, "/verified/selected/backend");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
 test("protected applied grant re-fingerprints one final app tree without candidate/final identity mixing", () => {
   const authorityRoot = mkdtempSync(join(tmpdir(), "tweaker-protected-final-grant-"));
   try {
     const finalAppRoot = join(authorityRoot, "final", "ChatGPT.app");
     const finalAsar = join(finalAppRoot, "Contents", "Resources", "app.asar");
-    let captured: { file: string; value: any } | null = null;
+    const captured: Array<{ file: string; value: unknown }> = [];
     stageProtectedHealthLaunchGrant({
       candidate: { appRoot: finalAppRoot, asarPath: finalAsar } as never,
       authorityRoot,
@@ -45,12 +89,13 @@ test("protected applied grant re-fingerprints one final app tree without candida
           assert.ok(path === finalAsar || path === join(finalAppRoot, "Contents", "Resources", "codex") || path === join(authorityRoot, "runtime", "main.js"));
           return path === finalAsar ? SHA("d") : path.endsWith("/runtime/main.js") ? SHA("f") : SHA("e");
         },
-        writeAuthority: (file, value) => { captured = { file, value }; },
+        writeAuthority: (file, value) => { captured.push({ file, value }); },
       },
     });
-    assert.ok(captured);
-    assert.equal(captured!.file, join(authorityRoot, "transactions", "protected", "protected-final-1", "launch-grant.json"));
-    assert.deepEqual(captured!.value.identity, {
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0]?.file, join(authorityRoot, "transactions", "protected", "protected-final-1", "launch-grant.json"));
+    assert.ok(captured[0]?.value && typeof captured[0].value === "object" && "identity" in captured[0].value);
+    assert.deepEqual(captured[0].value.identity, {
       appPath: finalAppRoot,
       appContentsSha256: SHA("c"),
       appAsarSha256: SHA("d"),

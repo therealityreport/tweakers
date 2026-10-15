@@ -13,6 +13,7 @@ import {
   resolveAccountsBrokerRootResolution,
   startAccountsBrokerSocket,
   startBrokerControlSocket,
+  probeAccountsBrokerControlStatus,
 } from "../../src/account-router/broker-socket";
 import type { OpaqueAccountId, OpaqueAppToolsRef, OpaqueRendererRef } from "../../src/account-router/types";
 
@@ -57,6 +58,7 @@ test("owner-private manager frames expose the exact Doctor lease lifecycle witho
     requests.push(request);
     if (request.action === "acquire") return { status: "ready", leaseId, opaqueAccountId: account, codexHome: root };
     if (request.action === "mark_dispatched") return { status: "dispatched", leaseId };
+    if (request.action !== "settle") throw new Error(`unexpected broker action ${request.action}`);
     return { status: "settled", leaseId, outcome: request.outcome };
   } });
   const client = new AccountsBrokerManagerClientV1({ root, secret });
@@ -147,7 +149,10 @@ test("broker control socket returns only its strict status projection", async ()
   assert.deepEqual(Object.keys(response).sort(), ["requestId", "status", "version"]);
   assert.deepEqual(Object.keys((response as { status: object }).status).sort(), ["browserEvidence", "pendingHandoffs", "pool", "registeredClients", "state", "version"]);
   assert.doesNotMatch(JSON.stringify(response), /auth\.json|secret|cookie|token|\b(?:ar|br|bat|bd|bt|bh)_/);
+  assert.equal(await probeAccountsBrokerControlStatus(root, secret), true);
+  assert.equal(await probeAccountsBrokerControlStatus(root, Buffer.alloc(32, 99)), false);
   await control.close();
+  assert.equal(await probeAccountsBrokerControlStatus(root, secret), false);
 });
 
 test("large plugin catalogs cross the authenticated socket and renderer adapter without widening other surfaces", async () => {
@@ -323,3 +328,26 @@ async function waitFor(predicate: () => boolean, failure: string): Promise<void>
   }
   throw new Error(failure);
 }
+
+test("control socket disconnect releases its session but preserves replay protection across reconnect", async () => {
+  const root = privateRoot();
+  const broker = new AccountsBrokerV1({accounts: [{opaqueAccountId: account, enabled: true}], secret});
+  const socket = await startAccountsBrokerSocket({root, broker, secret});
+  const options = {root, secret, clientKind: "tweakers" as const, rendererRef: renderer, appToolsRef: appTools};
+  const first = new AccountsBrokerSocketClientV1(options), replacement = new AccountsBrokerSocketClientV1(options);
+  try {
+    assert.equal((await first.invoke({version: 1, requestId: "once", command: "profile.read"})).ok, true);
+    assert.equal((await replacement.invoke({version: 1, requestId: "replacement", command: "profile.read"})).ok, true);
+    first.close();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(broker.status().registeredClients.length, 1, "old close preserves replacement");
+    replacement.close();
+    for (let i = 0; i < 100 && broker.status().registeredClients.length; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(broker.status().registeredClients.length, 0, "last socket is no longer a consumer");
+    const reconnect = new AccountsBrokerSocketClientV1(options);
+    try {
+      const result = await reconnect.invoke({version: 1, requestId: "once", command: "profile.read"});
+      assert.deepEqual(result, {version: 1, requestId: "once", ok: false, error: {code: "request_replayed", retryable: false}});
+    } finally { reconnect.close(); }
+  } finally { first.close(); replacement.close(); await socket.close(); }
+});

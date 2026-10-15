@@ -37,6 +37,7 @@ function inspectNativeTransferCompatibilityV2(marker, candidateVersion) {
 // Reviewed native history migrations 1 through 6, including the thread-scoped realtime cleanup trigger.
 exports.NATIVE_HISTORY_SCHEMA_FINGERPRINT_V2 = "sha256:d4b0347896267dd6c40b51edef0ca43f51a9a4770a77cf1ac083bfc0951a7bc9";
 const HISTORY_TABLES_V2 = ["thread_turns", "thread_items", "thread_history_projection_state", "thread_realtime_items"];
+const CAPABILITY_RETRY_MS = 60_000;
 exports.NATIVE_CATALOG_MAX_THREADS_V1 = 16_384;
 exports.NATIVE_CATALOG_MAX_BYTES_V1 = 64 * 1024 * 1024;
 exports.NATIVE_TRANSFER_MAX_ROLLOUT_BYTES_V1 = 512 * 1024 * 1024;
@@ -706,6 +707,7 @@ class NativeTransferCoordinatorV1 {
     resumedGenerationProofs = new Set();
     capability = null;
     capabilityInFlight = null;
+    capabilityProbedAt = 0;
     document;
     accounts = new Map();
     accountHomeIdentities = new Map();
@@ -745,6 +747,13 @@ class NativeTransferCoordinatorV1 {
      * failed real probe is a closed unsupported state, never a version guess.
      */
     async probeCapability() {
+        // A timeout or generic probe failure is usually a slow cold start, not a
+        // real incompatibility. Retry those after a cool-down instead of disabling
+        // transfers for the rest of the broker's lifetime; definitive answers stay.
+        if (this.capability && this.capability.state === "unsupported"
+            && (this.capability.reason === "probe_timeout" || this.capability.reason === "probe_failed")
+            && Date.now() - this.capabilityProbedAt >= CAPABILITY_RETRY_MS)
+            this.capability = null;
         if (this.capability)
             return this.capability;
         if (this.capabilityInFlight)
@@ -755,6 +764,7 @@ class NativeTransferCoordinatorV1 {
             .catch(() => unsupportedCapability("probe_failed"))
             .then((value) => {
             this.capability = value;
+            this.capabilityProbedAt = Date.now();
             return value;
         })
             .finally(() => { this.capabilityInFlight = null; });
@@ -1100,19 +1110,51 @@ class NativeTransferCoordinatorV1 {
         catch {
             return { state: "unavailable", reason: "threads_scan_unavailable" };
         }
+        // Report observed demand at the cap so the broker can surface a useful warning.
         if (sightings.size > exports.NATIVE_CATALOG_MAX_THREADS_V1)
-            return { state: "unavailable", reason: "threads_catalog_capacity" };
+            return { state: "unavailable", reason: "threads_catalog_capacity", capacity: { threads: sightings.size, max: exports.NATIVE_CATALOG_MAX_THREADS_V1 } };
         if (project && [...sightings.values()].some((rows) => [...rows.values()].some((row) => row.historyMode === "paginated"))) {
             return { state: "unsupported", reason: "paginated_catalog_mirroring_refused" };
         }
         let collisions = 0;
         let projected = 0;
         const unverifiable = [];
+        const additions = new Map();
+        for (const [threadId, byAccount] of sightings) {
+            if (this.document.threads[threadId] || byAccount.size !== 1)
+                continue;
+            const [originAccountId, row] = [...byAccount.entries()][0];
+            const originAccount = this.accounts.get(originAccountId);
+            if (!originAccount)
+                continue;
+            const sourceIdentity = pinnedRolloutIdentity(originAccount, row.rolloutPath, row.threadId);
+            if (!sourceIdentity)
+                continue;
+            const sourceDigest = rowDigest(row);
+            additions.set(threadId, {
+                threadId, originAccountId, writerAccountId: originAccountId,
+                sourceRolloutIdentity: sourceIdentity, sourceRowDigest: sourceDigest,
+                projections: { [originAccountId]: {
+                        state: "committed", targetPath: row.rolloutPath,
+                        rolloutIdentity: sourceIdentity, rowDigest: sourceDigest,
+                    } },
+            });
+        }
+        const threadCount = Object.keys(this.document.threads).length + additions.size;
+        if (threadCount > exports.NATIVE_CATALOG_MAX_THREADS_V1)
+            return { state: "unavailable", reason: "threads_catalog_capacity", capacity: { threads: threadCount, max: exports.NATIVE_CATALOG_MAX_THREADS_V1 } };
+        if (additions.size > 0)
+            this.mutate((next) => {
+                for (const [threadId, record] of additions) {
+                    if (next.threads[threadId])
+                        throw new Error("native catalog thread changed during reconciliation");
+                    next.threads[threadId] = record;
+                }
+            });
         for (const [threadId, byAccount] of sightings) {
             let record = this.document.threads[threadId];
             if (!record) {
-                // A new remote-created row becomes an owner receipt before any
-                // projection. A duplicate with no receipt has no safe owner.
+                // Duplicates have no safe owner; unverifiable paths wait for a later pass.
                 if (byAccount.size !== 1) {
                     collisions += 1;
                     continue;
@@ -1123,35 +1165,10 @@ class NativeTransferCoordinatorV1 {
                     collisions += 1;
                     continue;
                 }
-                const sourceIdentity = pinnedRolloutIdentity(originAccount, row.rolloutPath, row.threadId);
-                if (!sourceIdentity) {
-                    // A concurrent recorder can replace the pathname or append between
-                    // the pin checks. Do not make an unqualified busy row terminal;
-                    // only a clear per-thread census turns this into a real collision.
-                    unverifiable.push({ row, accountId: originAccountId, recordJson: null });
-                    continue;
-                }
-                const sourceDigest = rowDigest(row);
-                this.mutate((next) => {
-                    if (next.threads[threadId])
-                        throw new Error("native catalog thread changed during reconciliation");
-                    next.threads[threadId] = {
-                        threadId,
-                        originAccountId,
-                        writerAccountId: originAccountId,
-                        sourceRolloutIdentity: sourceIdentity,
-                        sourceRowDigest: sourceDigest,
-                        projections: {
-                            [originAccountId]: {
-                                state: "committed",
-                                targetPath: row.rolloutPath,
-                                rolloutIdentity: sourceIdentity,
-                                rowDigest: sourceDigest,
-                            },
-                        },
-                    };
-                });
-                record = this.document.threads[threadId];
+                // A concurrent recorder can replace the pathname between pin checks.
+                // Only a clear per-thread census turns this into a real collision.
+                unverifiable.push({ row, accountId: originAccountId, recordJson: null });
+                continue;
             }
             const knownSightings = this.validateKnownSightings(record, byAccount);
             if (typeof knownSightings !== "string") {
@@ -1208,9 +1225,10 @@ class NativeTransferCoordinatorV1 {
                 collisions += 1;
             }
         }
+        const capacity = { threads: Object.keys(this.document.threads).length, max: exports.NATIVE_CATALOG_MAX_THREADS_V1 };
         return collisions > 0
-            ? { state: "collision", scanned, projected, collisions }
-            : { state: "ready", scanned, projected, collisions };
+            ? { state: "collision", scanned, projected, collisions, capacity }
+            : { state: "ready", scanned, projected, collisions, capacity };
     }
     pendingTransfersForRecovery() {
         return Object.values(this.document.operations).filter((operation) => operation.phase !== "owner_committed" && operation.phase !== "source_owned")

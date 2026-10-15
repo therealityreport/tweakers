@@ -6,7 +6,7 @@ const MAIN_SOURCE = readFileSync(new URL("../src/main.ts", import.meta.url), "ut
 
 test("User Questions starts independently of MCP reconciliation while other MCP tweaks still reconcile first", () => {
   const start = MAIN_SOURCE.indexOf("async function loadAllMainTweaks");
-  const end = MAIN_SOURCE.indexOf("\nfunction stopAllMainTweaks", start);
+  const end = MAIN_SOURCE.indexOf("\nasync function stopMainTweak", start);
   const body = MAIN_SOURCE.slice(start, end);
   const reconciliation = body.indexOf("await mcpReconciler.reconcileNow");
   const lifecycleLoop = body.indexOf("for (const t of tweakState.discovered)");

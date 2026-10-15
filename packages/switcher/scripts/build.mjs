@@ -1,3 +1,5 @@
+import { ownEntrypoint } from "../../../scripts/owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 // Builds the Tweakers menu-bar switcher: clang-compiles the single ObjC file,
 // assembles a minimal `Tweakers Switcher.app` bundle (LSUIElement, no Dock
 // icon), and ad-hoc signs it. The per-machine local-identity signature is

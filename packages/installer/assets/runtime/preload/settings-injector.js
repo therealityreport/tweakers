@@ -76,6 +76,7 @@ const state = {
     tweaksPageQuery: "",
 };
 let pendingRegisteredPageOpen = null;
+let diagnosticsFrame = null;
 let activeBuiltinPageCleanup = null;
 const originalHistoryMethods = {};
 function plog(msg, extra) {
@@ -93,7 +94,13 @@ function publishRuntimeReadySettingsMount() {
     if (state.runtimeReadyMountPublished)
         return;
     state.runtimeReadyMountPublished = true;
-    electron_1.ipcRenderer.send("tweaker:settings-mounted", { version: 1 });
+    void electron_1.ipcRenderer.invoke("tweaker:settings-mount-context").then(context => {
+        if (!context || typeof context.operationId !== "string" || typeof context.promotionId !== "string" || typeof context.epoch !== "number") {
+            state.runtimeReadyMountPublished = false;
+            return;
+        }
+        electron_1.ipcRenderer.send("tweaker:settings-mounted", { version: 2, operationId: context.operationId, promotionId: context.promotionId, epoch: context.epoch });
+    }).catch(() => { state.runtimeReadyMountPublished = false; });
 }
 // ───────────────────────────────────────────────────────────── public API ──
 function startSettingsInjector() {
@@ -165,6 +172,9 @@ function stopSettingsInjector() {
     state.observerTarget = null;
     state.replacementObserver?.disconnect();
     state.replacementObserver = null;
+    if (diagnosticsFrame !== null)
+        cancelAnimationFrame(diagnosticsFrame);
+    diagnosticsFrame = null;
     if (state.settingsSurfaceHideTimer) {
         clearTimeout(state.settingsSurfaceHideTimer);
         state.settingsSurfaceHideTimer = null;
@@ -230,7 +240,11 @@ function scopeSettingsObserver(outcome) {
             return;
         }
         state.probeScheduler?.recordFilteredMutation(records.length);
-        publishSettingsInjectorDiagnostics();
+        if (diagnosticsFrame === null)
+            diagnosticsFrame = requestAnimationFrame(() => {
+                diagnosticsFrame = null;
+                publishSettingsInjectorDiagnostics();
+            });
     });
     state.observer.observe(target, { childList: true, subtree: true });
     state.observerTarget = target;
@@ -5258,14 +5272,33 @@ function findContentArea() {
     const sidebar = findSidebarItemsGroup();
     if (!sidebar)
         return null;
+    const findVisibleBox = (child) => {
+        const style = getComputedStyle(child);
+        if (child.hidden || child.getAttribute("aria-hidden") === "true" ||
+            style.display === "none" || style.visibility === "hidden" ||
+            style.visibility === "collapse")
+            return null;
+        // The native main surface is wrapped in display:contents, whose own
+        // rectangle is empty. Descend through that wrapper, not arbitrary panels.
+        if (style.display === "contents") {
+            for (const nested of Array.from(child.children)) {
+                const box = findVisibleBox(nested);
+                if (box)
+                    return box;
+            }
+            return null;
+        }
+        const rect = child.getBoundingClientRect();
+        return rect.width > 300 && rect.height > 200 ? child : null;
+    };
     let parent = sidebar.parentElement;
     while (parent) {
         for (const child of Array.from(parent.children)) {
             if (child === sidebar || child.contains(sidebar))
                 continue;
-            const r = child.getBoundingClientRect();
-            if (r.width > 300 && r.height > 200)
-                return child;
+            const box = findVisibleBox(child);
+            if (box)
+                return box;
         }
         parent = parent.parentElement;
     }

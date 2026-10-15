@@ -74,6 +74,8 @@ export declare class NativeRemoteControllerV1 {
     private readonly pairings;
     private readonly pairingGenerations;
     private disposed;
+    /** Configuration and registered devices are not live consumers. */
+    hasActiveOperation(): boolean;
     constructor(options: NativeRemoteControllerOptionsV1);
     status(accountId: OpaqueAccountId): Promise<RemotePublicStatusV1>;
     enable(accountId: OpaqueAccountId): Promise<RemotePublicStatusV1>;

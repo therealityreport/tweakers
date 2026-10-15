@@ -9,6 +9,7 @@ import {
   repairMcpLifecycle,
 } from "../src/commands/mcp-lifecycle";
 import { inspectMcpLifecycleHealth } from "../src/mcp-lifecycle-health";
+import { KNOWN_SCHEMA2_PREDECESSOR } from "../src/mcp-lifecycle-predecessor";
 import {
   MCP_LIFECYCLE_GUARD_LABEL,
   MCP_LIFECYCLE_LABELS,
@@ -28,6 +29,52 @@ const intentionallyDisabledGuard = (
   disabled: state.label === MCP_LIFECYCLE_GUARD_LABEL,
   loadedInstances: state.label === MCP_LIFECYCLE_REAPER_LABEL ? 1 as const : 0 as const,
 }));
+
+test("schema2 predecessor heartbeat compatibility is explicit, identity-bound and preserves termination guards", () => {
+  withTempRoot((root) => {
+    const home = join(root, "home"), userRoot = join(root, "tweakers");
+    const receiptPath = join(userRoot, "mcp-lifecycle-managed.json");
+    const sourceRoot = defaultMcpLifecycleSourceRoot();
+    const now = new Date("2026-10-11T19:00:00.000Z");
+    mkdirSync(userRoot, { recursive: true });
+    installMcpLifecyclePackage({ sourceRoot, targetHome: home, temporaryRoot: home, labelInstances: () => 0 });
+    writeCurrentManagedReceipt({ sourceRoot, targetHome: home, receiptPath, now });
+    const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+    writeFileSync(receiptPath, JSON.stringify({ ...receipt, ...KNOWN_SCHEMA2_PREDECESSOR }));
+    writeLifecycleStatus(home, now, "observed");
+    const path = join(home, ".codex", "tmp", "codex-mcp-lifecycle-status.json");
+    const status = { ...JSON.parse(readFileSync(path, "utf8")), schema_version: 2,
+      producer_version: "0.6.0", cleanup_policy_version: "strict-detached-v5" };
+    writeFileSync(path, JSON.stringify(status));
+    const inspect = (explicit = true) => inspectMcpLifecycleHealth({ targetHome: home, sourceRoot,
+      backupRoot: join(userRoot, "backup"), managedReceiptPath: receiptPath, deep: true,
+      allowKnownSchema2Predecessor: explicit }, { now: () => now, labelStates: intentionallyDisabledGuard });
+    assert.equal(inspect(false).preview.reloadEligible, false);
+    const transitional = inspect();
+    assert.equal(transitional.preview.reloadEligible, true);
+    assert.notEqual(transitional.checks.find((item) => item.id === "managed-proof")?.status, "ok");
+    for (const patch of [
+      { trees: undefined }, { trees: [{ state: "terminating" }] }, { producer_version: "unknown" },
+      { generated_at: now.getTime() / 1_000 - 181 },
+    ]) {
+      writeFileSync(path, JSON.stringify({ ...status, ...patch }));
+      assert.equal(inspect().preview.reloadEligible, false);
+    }
+    writeFileSync(path, JSON.stringify(status));
+    const verification = verifyMcpLifecyclePackage({ sourceRoot, targetHome: home });
+    const plist = verification.assets.find((asset) => asset.asset.label === MCP_LIFECYCLE_REAPER_LABEL)!;
+    const originalPlist = readFileSync(plist.destinationPath);
+    writeFileSync(plist.destinationPath, "changed cleanup job\n");
+    const changedReceipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+    changedReceipt.labelTransitions.find((transition: { label: string }) => transition.label === MCP_LIFECYCLE_REAPER_LABEL).observed.plistSha256
+      = createHash("sha256").update(readFileSync(plist.destinationPath)).digest("hex");
+    writeFileSync(receiptPath, JSON.stringify(changedReceipt));
+    assert.equal(inspect().preview.reloadEligible, false, "mutable transition hash cannot authorize a changed plist");
+    writeFileSync(plist.destinationPath, originalPlist);
+    writeFileSync(join(home, ".codex", "lib", "codex_mcp_lifecycle.py"), "unrecorded file\n");
+    assert.equal(inspect().preview.reloadEligible, false);
+  });
+});
 
 test("deep lifecycle health verifies installed assets and defers stale or terminating reloads", () => {
   withTempRoot((root) => {
@@ -218,8 +265,16 @@ test("an enabled Guard requires a complete fresh v3 heartbeat before repair can 
         counts: {},
         trees: [],
       }))],
-      ["companion-matcher", () => writeFileSync(lifecycleStatusPath, JSON.stringify({
+      ["previous-companion-schema", () => writeFileSync(lifecycleStatusPath, JSON.stringify({
         schema_version: 2,
+        generated_at: now.getTime() / 1_000,
+        matcher_registry_version: readMcpLifecycleManifest(sourceRoot).matcher_registry_version,
+        job: { ok: true, mode: "automatic", error: null },
+        counts: {},
+        trees: [],
+      }))],
+      ["companion-matcher", () => writeFileSync(lifecycleStatusPath, JSON.stringify({
+        schema_version: 3,
         generated_at: now.getTime() / 1_000,
         matcher_registry_version: "unexpected",
         job: { ok: true, mode: "automatic", error: null },
@@ -227,7 +282,7 @@ test("an enabled Guard requires a complete fresh v3 heartbeat before repair can 
         trees: [],
       }))],
       ["companion-counts-trees", () => writeFileSync(lifecycleStatusPath, JSON.stringify({
-        schema_version: 2,
+        schema_version: 3,
         generated_at: now.getTime() / 1_000,
         matcher_registry_version: readMcpLifecycleManifest(sourceRoot).matcher_registry_version,
         job: { ok: true, mode: "automatic", error: null },
@@ -761,7 +816,7 @@ function writeLifecycleStatus(home: string, generatedAt: Date, state: string): v
   const directory = join(home, ".codex", "tmp");
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, "codex-mcp-lifecycle-status.json"), JSON.stringify({
-    schema_version: 2,
+    schema_version: 3,
     generated_at: generatedAt.getTime() / 1_000,
     matcher_registry_version: readMcpLifecycleManifest(defaultMcpLifecycleSourceRoot()).matcher_registry_version,
     job: { ok: true, mode: "automatic", error: null },
@@ -788,7 +843,7 @@ function writeGuardStatus(home: string, generatedAt: Date, patch: Record<string,
     explanations: ["Guard observes process health and may notify; it does not control processes or access task data."],
     sample_count: 1,
     reset_reason: "initial_sample",
-    schema_versions: { guard: 3, lifecycle: 2 },
+    schema_versions: { guard: 3, lifecycle: 3 },
     matcher: {
       expected: manifest.matcher_registry_version,
       observed: manifest.matcher_registry_version,

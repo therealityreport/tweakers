@@ -37,6 +37,8 @@ function policyFixture(shape: PolicyShape = {}): string {
   return [
     `const ${ttl}=${ttlSeconds}*1e3,${check}=${checkMs},${cache}=${cacheLimit},${policy}=class {`,
     "  activeThreadSafeguard(e){return e.active||e.inProgress||e.isFollower}",
+    '  shouldKeepConversationLoaded(e){return this.getStreamRole(e.id)==="follower"?false:e.active||latestTurn(e)?.status===`inProgress`&&!e.waiting}',
+    '  async unsubscribeInactiveConversation(e){if(this.unsubscribingConversationIds.has(e))return;let t=this.params.threadStore.getConversation(e),n=this.getStreamRole(e);if(t?.resumeState!==`resumed`||!this.params.streamState.ownsConversationHistoryStream(e)){return}this.unsubscribingConversationIds.add(e);await this.params.requestClient.sendRequest("thread/unsubscribe",{threadId:e})}',
     "  evaluate(t,i,r){",
     "    return this.log(`inactive_thread_unsubscribe_candidates_evaluated`,{safe:{candidateCount:t.length," +
       `conversationIdsToUnsubscribe:i,maxInactiveOwnerThreads:${cache},overage:r,ttlMs:${ttl}},sensitive:{}}),i`,
@@ -57,7 +59,7 @@ test("bounds TTL and owner cache while preserving safeguards", () => {
   assert.equal(patched.changed, true);
   assert.equal(patched.strategy, "telemetry-key-discovery");
   assert.deepEqual(patched.observed, { ttlSeconds: 3600, ownerCache: 4 });
-  assert.match(patched.source, /zjn=60\*1e3,Bjn=15e3,Vjn=0\/\*__tweaker_inactive_thread_retention__\*\//);
+  assert.match(patched.source, /zjn=300\*1e3,Bjn=15e3,Vjn=2\/\*__tweaker_inactive_thread_retention_v2__\*\//);
   assert.match(patched.source, /activeThreadSafeguard\(e\)\{return e\.active\|\|e\.inProgress\|\|e\.isFollower\}/);
   // The telemetry call itself must be untouched — it is the anchor.
   assert.match(patched.source, /inactive_thread_unsubscribe_candidates_evaluated/);
@@ -91,7 +93,17 @@ test("tracks renamed minified bindings across desktop rebuilds", () => {
   const patched = patchCodexInactiveThreadRetentionSource(renamed);
   assert.ok(patched);
   assert.equal(patched.changed, true);
-  assert.match(patched.source, /jjn=60\*1e3,Mjn=15e3,Njn=0\/\*__tweaker_inactive_thread_retention__\*\//);
+  assert.match(patched.source, /jjn=300\*1e3,Mjn=15e3,Njn=2\/\*__tweaker_inactive_thread_retention_v2__\*\//);
+});
+
+test("accepts build 9922's direct millisecond TTL without changing its safeguards", () => {
+  const original = policyFixture({ ttl: "NUt", check: "PUt", cache: "FUt", policy: "IUt" }).replace("NUt=3600*1e3", "NUt=108e5");
+  const patched = patchCodexInactiveThreadRetentionSource(original);
+  assert.ok(patched);
+  assert.deepEqual(patched.observed, { ttlSeconds: 10800, ownerCache: 4 });
+  assert.match(patched.source, /NUt=300\*1e3,PUt=15e3,FUt=2/);
+  assert.ok(patched.source.includes("return e.active||e.inProgress||e.isFollower"));
+  assert.equal(patchCodexInactiveThreadRetentionSource(patched.source)?.changed, false);
 });
 
 test("absorbs value and interval churn the pinned matcher rejected", () => {
@@ -188,7 +200,7 @@ test("never binds a decoy ttlMs outside the telemetry window", () => {
   const decoy = `const other=1;const cfg={ttlMs:other};\n${policyFixture()}`;
   const patched = patchCodexInactiveThreadRetentionSource(decoy);
   assert.ok(patched);
-  assert.match(patched.source, /zjn=60\*1e3/);
+  assert.match(patched.source, /zjn=300\*1e3/);
   assert.match(patched.source, /const cfg=\{ttlMs:other\}/);
 });
 
@@ -205,7 +217,7 @@ test("extracted-app discovery patches exactly one renderer asset", () => {
     assert.equal(first.relativePath, join("webview", "assets", "app.js"));
     assert.equal(first.scannedFiles, 2);
     assert.match(first.detail ?? "", /bounded upstream ttl 3600s and owner cache 4/);
-    assert.match(readFileSync(join(assetsDir, "app.js"), "utf8"), /zjn=60\*1e3,Bjn=15e3,Vjn=0/);
+    assert.match(readFileSync(join(assetsDir, "app.js"), "utf8"), /zjn=300\*1e3,Bjn=15e3,Vjn=2/);
 
     const second = patchCodexInactiveThreadRetentionInExtractedApp(appDir);
     assert.equal(second.status, "already-patched");
@@ -224,7 +236,7 @@ test("extracted-app discovery rejects two verified renderer assets", () => {
     writeFileSync(join(assetsDir, "two.js"), policyFixture());
     assert.throws(
       () => patchCodexInactiveThreadRetentionInExtractedApp(appDir),
-      /matched 2 renderer files/,
+      /matched 2 files in webview/,
     );
   } finally {
     rmSync(appDir, { recursive: true, force: true });
@@ -243,6 +255,63 @@ test("no policy anywhere reports not-applicable", () => {
   } finally {
     rmSync(appDir, { recursive: true, force: true });
   }
+});
+
+test("native unsubscribe rechecks current activity and protects waiting turns", async () => {
+  const original = policyFixture();
+  const patched = patchCodexInactiveThreadRetentionSource(original)!;
+  const Policy = new Function("latestTurn", `${patched.source}\nreturn Hjn;`)((conversation: { turn?: unknown }) => conversation.turn);
+  for (const state of [
+    { label: "idle", expected: 1 },
+    { label: "visible after selection", visible: true, expected: 0 },
+    { label: "follower after selection", followers: true, expected: 0 },
+    { label: "running", turn: { status: "inProgress" }, expected: 0 },
+    { label: "waiting for input", turn: { status: "inProgress" }, waiting: true, expected: 0 },
+    { label: "pending request", requests: [{}], expected: 0 },
+    { label: "active runtime", active: true, expected: 0 },
+    { label: "completed", turn: { status: "completed" }, expected: 1 },
+  ]) {
+    const calls: unknown[] = [], conversation = { id: "chat", resumeState: "resumed", ...state };
+    const policy = new Policy();
+    Object.assign(policy, { unsubscribingConversationIds: new Set(),
+      getStreamRole: () => "owner",
+      hasActiveConversationView: () => state.visible === true, hasOwnedStreamFollowers: () => state.followers === true,
+      params: { threadStore: { getConversation: () => conversation }, streamState: { ownsConversationHistoryStream: () => true },
+        requestClient: { sendRequest: async (...args: unknown[]) => { calls.push(args); } } } });
+    await policy.unsubscribeInactiveConversation("chat");
+    assert.equal(calls.length, state.expected, state.label);
+    assert.equal(policy.unsubscribingConversationIds.size, state.expected, state.label);
+  }
+});
+
+test("both native policy carriers are verified before either is changed", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-two-retention-carriers-"));
+  try {
+    mkdirSync(join(root, "webview/assets"), { recursive: true });
+    mkdirSync(join(root, ".vite/build"), { recursive: true });
+    const renderer = join(root, "webview/assets/app.js"), main = join(root, ".vite/build/main.js");
+    const original = policyFixture();
+    writeFileSync(renderer, original);
+    writeFileSync(main, original.replace("ttlMs:zjn", "ttlMs:this.ttl()"));
+    assert.throws(() => patchCodexInactiveThreadRetentionInExtractedApp(root), RendererPatchDeclined);
+    assert.equal(readFileSync(renderer, "utf8"), original, "an invalid main policy must prevent the renderer write");
+    writeFileSync(main, original.replace("const zjn", "var zjn"));
+    const first = patchCodexInactiveThreadRetentionInExtractedApp(root);
+    assert.equal(first.relativePaths?.length, 2);
+    assert.equal(first.status, "patched");
+    for (const path of [renderer, main]) assert.equal(patchCodexInactiveThreadRetentionSource(readFileSync(path, "utf8"))?.changed, false);
+    assert.equal(patchCodexInactiveThreadRetentionInExtractedApp(root).status, "already-patched");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("legacy retention is upgraded and a new marker cannot omit activity guards", () => {
+  const legacy = policyFixture({ ttlSeconds: "60", cacheLimit: "0" }).replace("Vjn=0", "Vjn=0/*__tweaker_inactive_thread_retention__*/");
+  const patched = patchCodexInactiveThreadRetentionSource(legacy)!;
+  assert.equal(patched.changed, true);
+  assert.equal(patched.source.includes("__tweaker_inactive_thread_retention__"), false);
+  assert.equal(patchCodexInactiveThreadRetentionSource(patched.source)?.changed, false);
+  const incomplete = policyFixture({ ttlSeconds: "300", cacheLimit: "2" }).replace("Vjn=2", `Vjn=2/*${CODEX_INACTIVE_THREAD_RETENTION_MARKER}*/`);
+  assert.throws(() => patchCodexInactiveThreadRetentionSource(incomplete), /lacks verified activity safeguards/);
 });
 
 test("Doctor data-only repair locates a renamed retention event without granting code edits", async () => {

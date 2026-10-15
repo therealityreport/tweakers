@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.BrokerProcessChild = exports.AccountsBrokerOwnerV1 = exports.ENROLLMENT_MATERIALIZATION_JOURNAL_FILE = exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES = exports.ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE = void 0;
+exports.BrokerProcessChild = exports.AccountsBrokerOwnerV1 = exports.ENROLLMENT_MATERIALIZATION_JOURNAL_FILE = exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES = exports.ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE = exports.ACCOUNTS_ROUTING_SUSPENDED_FILE = void 0;
 exports.brokerChildEnvironment = brokerChildEnvironment;
 exports.runAccountsBrokerOwnerCli = runAccountsBrokerOwnerCli;
 exports.createBrokerStartupDiagnostics = createBrokerStartupDiagnostics;
@@ -8,8 +8,19 @@ exports.installBrokerTerminationDiagnostics = installBrokerTerminationDiagnostic
 exports.connectAccountsBrokerAppServerClient = connectAccountsBrokerAppServerClient;
 exports.createBrokerAppRendererRef = createBrokerAppRendererRef;
 exports.createBrokerAppToolsRef = createBrokerAppToolsRef;
+exports.createDesktopAppToolsProof = createDesktopAppToolsProof;
+exports.verifyDesktopAppToolsProof = verifyDesktopAppToolsProof;
 exports.credentialStoreArgs = credentialStoreArgs;
+exports.isolatedAuthHelperArgs = isolatedAuthHelperArgs;
+const admission_diagnostics_1 = require("./admission-diagnostics");
+const official_bundled_adapter_1 = require("./official-bundled-adapter");
+const official_plugin_service_controller_1 = require("./official-plugin-service-controller");
+const official_plugin_provider_read_1 = require("./official-plugin-provider-read");
+const shared_plugin_ledger_1 = require("./shared-plugin-ledger");
+const desktop_app_tools_1 = require("./desktop-app-tools");
+const native_desktop_config_1 = require("./native-desktop-config");
 const persistent_directory_identity_1 = require("./persistent-directory-identity");
+const startup_policy_1 = require("./startup-policy");
 const native_history_extensions_1 = require("./native-history-extensions");
 const native_auth_binding_1 = require("./native-auth-binding");
 const shared_native_mode_1 = require("./shared-native-mode");
@@ -45,8 +56,12 @@ const native_request_1 = require("./native-request");
 const models_1 = require("./models");
 const native_projects_1 = require("./native-projects");
 const native_thread_writer_lease_1 = require("./native-thread-writer-lease");
+const owned_process_tree_1 = require("./owned-process-tree");
 const native_legacy_projects_1 = require("./native-legacy-projects");
+const native_project_snapshot_1 = require("./native-project-snapshot");
 const native_history_1 = require("./native-history");
+/** Present while the Accounts tweak is disabled: shared history stays, automatic routing stops. */
+exports.ACCOUNTS_ROUTING_SUSPENDED_FILE = "accounts-routing-suspended.v1.json";
 exports.ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE = "accounts-broker-app.v1.sock";
 // The pinned native backend accepts 64 MiB JSONL messages (internal/backend/child.go).
 // Catalogs, tool schemas and native task responses exceed the separate small control plane.
@@ -94,7 +109,16 @@ class AccountsBrokerOwnerV1 {
     args;
     broker;
     children = new Map();
+    retiringEnrollmentChildren = new Set();
     clients = new Map();
+    desktopAppToolsBindings = new Map();
+    threadAppToolsBindings = new WeakMap();
+    officialDesktopConfigs = new WeakMap();
+    desktopThreadConfigs = new WeakMap();
+    appToolsRebindingTasks = new Set();
+    appToolsRebindObservations = new WeakMap();
+    startupPolicyClients = new Set();
+    startupPolicyNonces = new Map();
     pendingDesktop = new Map();
     pendingChild = new Map();
     pendingBrokerChild = new Map();
@@ -145,14 +169,27 @@ class AccountsBrokerOwnerV1 {
     nativeLegacyProjects = null;
     nativeLegacyProjectsReady = false;
     nativeLegacyProjectRefresh = null;
+    nativeProjectPages = new native_project_snapshot_1.NativeProjectSnapshotPagesV1();
+    nativeProjectSnapshotRead = null;
+    nativeProjectAuthorityGeneration = 0;
+    nativeProjectAuthorities = new Map();
+    nativeProjectAuthRevisions = new Map();
+    nativeProjectAuthorityRefreshes = new Map();
     nativeHistoryDegraded = false;
     nonce = 0;
     closed = false;
+    closePromise = null;
+    desktopQueues = new Map();
+    nativeThreadChecks = new Map();
     appServer = null;
     appConnections = new Set();
     controlClose = null;
     brokerClose = null;
     sweepTimer = null;
+    idleOwnerSince = null;
+    nextMaintenanceAt = 0;
+    maintenancePending = false;
+    managerExecutionCount = 0;
     enrollmentMaterializationFaultAt;
     onReservationAcquired;
     recoveryCompatibilityPreflight;
@@ -165,14 +202,24 @@ class AccountsBrokerOwnerV1 {
     featureBroadcastTail = Promise.resolve();
     childFeatureRevision = new WeakMap();
     childFeatureReplay = new WeakMap();
-    modelCheckedRequests = new WeakSet();
+    modelCheckedRequests = new WeakMap();
     inventoryCheckedRequests = new WeakSet();
     inventoryRefresh = null;
     inventoryFreshUntil = 0;
     inventoryFreshKey = "";
+    officialPluginLedger = null;
+    officialPluginGeneration = null;
+    officialPluginLedgerModeFingerprint = null;
+    officialPluginServices = new Map();
+    officialPluginPreparation = null;
+    officialPluginSessionNonces = new Map();
+    officialPluginServiceChildren = new WeakMap();
     modelEligibleRequests = new WeakMap();
     modelCatalogs = new models_1.AccountModelCatalogsV1((account) => this.readAccountModels(account));
     remoteRestoreStarted = false;
+    nativeProbePromise = null;
+    nativeRecoveryPromise = null;
+    nativeStartupHolds = new Set();
     startupStarted = node_perf_hooks_1.performance.now();
     onStartupStage;
     constructor(config, stateRoot, secret, command, args, options = {}) {
@@ -215,12 +262,23 @@ class AccountsBrokerOwnerV1 {
                 .map(([threadId, observation]) => [threadId, observation.state])),
         });
         this.reportStartup("probe", "started");
-        const capability = await this.nativeTransfer.probeCapability();
-        this.reportStartup("probe", capability.state === "ready" ? "ready" : capability.reason);
-        this.nativeTransfer.provisionSharedWriterLocks();
+        this.nativeProbePromise = this.nativeTransfer.probeCapability().then((capability) => {
+            this.reportStartup("probe", capability.state === "ready" ? "ready" : capability.reason);
+            return capability.state === "ready";
+        }, () => {
+            this.reportStartup("probe", "failed");
+            return false;
+        });
         this.recoverNativeWriterCommits();
-        await this.recoverInterruptedNativeTransfers();
-        await this.recoverNativeSourceRetirements();
+        for (const operation of [
+            ...this.nativeTransfer.pendingTransfersForRecovery(),
+            ...this.nativeTransfer.pendingSourceRetirements(),
+        ]) {
+            this.nativeStartupHolds.add(operation.sourceAccountId);
+            this.nativeStartupHolds.add(operation.targetAccountId);
+            this.nativeTransferHeldAccounts.add(operation.sourceAccountId);
+            this.nativeTransferHeldAccounts.add(operation.targetAccountId);
+        }
         this.readRemoteModes();
         this.remoteController = new remote_controller_1.NativeRemoteControllerV1({
             secret: this.secret,
@@ -237,6 +295,9 @@ class AccountsBrokerOwnerV1 {
             },
             gate: {
                 beginEnable: async (account) => {
+                    await this.nativeRecoveryPromise;
+                    if (this.nativeTransferHeldAccounts.has(account))
+                        return "busy";
                     if (this.nativeTransfer?.preflightSharedWriterLocks().state !== "ready")
                         return "unavailable";
                     if (this.remoteModes.get(account) === "enabled") {
@@ -245,7 +306,7 @@ class AccountsBrokerOwnerV1 {
                         this.broker.setChildPinned(account, true);
                         return "ready";
                     }
-                    if (this.nativeTransferHeldAccounts.has(account) || this.remoteModes.get(account) === "draining" || !this.accountIsIdle(account))
+                    if (this.remoteModes.get(account) === "draining" || !this.accountIsIdle(account))
                         return "busy";
                     this.setRemoteMode(account, "draining");
                     this.broker.setChildPinned(account, false);
@@ -282,6 +343,7 @@ class AccountsBrokerOwnerV1 {
         if (this.remoteRestoreStarted || !this.desktopInitialization || !this.remoteController)
             return;
         this.remoteRestoreStarted = true;
+        await this.nativeRecoveryPromise;
         // Previous processes start remote-disabled; restore each saved intent only through the gate.
         for (const [account, mode] of [...this.remoteModes]) {
             if (mode === "enabled")
@@ -430,14 +492,7 @@ class AccountsBrokerOwnerV1 {
         const released = this.broker.releaseIdleChild(account);
         if (!released || released !== existing)
             return false;
-        let timer;
-        try {
-            return await Promise.race([released.whenClosed().then(() => true), new Promise((resolve) => { timer = setTimeout(() => resolve(false), 5_000); })]);
-        }
-        finally {
-            if (timer)
-                clearTimeout(timer);
-        }
+        return released.terminateAndWait();
     }
     async loadedNativeThreads(account) {
         const child = this.children.get(account);
@@ -505,6 +560,7 @@ class AccountsBrokerOwnerV1 {
                 return;
             }
             const catalog = await this.nativeTransfer.reconcileCatalog({ project: false });
+            this.reportCatalogCapacity(catalog);
             if (catalog.state !== "ready")
                 return;
             const loaded = new Map();
@@ -519,7 +575,7 @@ class AccountsBrokerOwnerV1 {
                 const owner = this.nativeTransfer.ownerForThread(threadId);
                 if (!owner)
                     continue;
-                const previous = this.store.snapshot().threadOwners[threadId];
+                const previous = this.store.ownerOf(threadId);
                 if (previous === owner)
                     continue;
                 const conversation = previous ? this.canonicalHistory.conversationForNative(previous, threadId) : null;
@@ -553,13 +609,32 @@ class AccountsBrokerOwnerV1 {
     */
     initializeAfterElection() {
         if ((0, node_fs_1.existsSync)((0, node_path_1.join)(this.stateRoot, "native-storage-identities-repair.v2.json")))
-            throw new Error("accounts broker: identity_repair_incomplete; open Tweakers Doctor");
+            throw new Error("accounts broker: identity_repair_incomplete; open Tweakers Manager → Doctor");
         this.config = recoverEnrollmentMaterialization(this.stateRoot, this.config, this.secret);
         const native = (0, native_history_1.readAndPreflightNativeHistorySourceStaticV1)(this.stateRoot, this.config, this.secret);
         if (native.state === "invalid") {
             throw new Error("accounts broker native history source preflight failed");
         }
         this.nativeHistory = native.state === "ready" ? native.binding : null;
+        if (this.officialNativeMode()) {
+            (0, native_auth_binding_1.ensureNativeExecutionHomesV1)({ stateRoot: this.stateRoot, config: this.config, secret: this.secret,
+                authorizeCopy: (account, destination) => {
+                    if (this.closed || !this.brokerClose || this.children.size || this.activeAuthHelpers.size)
+                        return false;
+                    const current = (0, native_history_1.readAndPreflightNativeHistorySourceStaticV1)(this.stateRoot, this.config, this.secret);
+                    return current.state === "ready" && (0, native_history_1.observeNativeAccountWritersV1)(current.binding, account, []).ok
+                        && (0, native_history_1.observeNativeExecutionHomeWritersV1)(current.binding, account, destination).ok;
+                } });
+            const migrated = (0, native_history_1.readAndPreflightNativeHistorySourceStaticV1)(this.stateRoot, this.config, this.secret);
+            if (migrated.state !== "ready")
+                throw new Error("Stock account execution-home migration did not validate");
+            this.nativeHistory = migrated.binding;
+            // Check every included account before the slow plugin snapshot or any
+            // startup-policy RPC. A local migration failure must not become an RPC error.
+            for (const account of this.config.accounts)
+                if (account.included)
+                    this.officialExecutionHome(account.opaqueAccountId);
+        }
         if (!(0, app_server_mux_1.preflightRouterHomes)(this.config, this.stateRoot)) {
             throw new Error("accounts broker shared Skills/account-home preflight failed (including plugins)");
         }
@@ -610,6 +685,7 @@ class AccountsBrokerOwnerV1 {
         this.broker = new broker_1.AccountsBrokerV1({
             accounts: (0, broker_1.accountPoolSeedsFromRouterConfigV3)(this.config, store.snapshot().ledger),
             secret: this.secret,
+            onChildAdmissionFailure: stage => this.reportAdmissionFailure(stage),
             childFactory: {
                 create: (input) => this.createChild(input.opaqueAccountId),
             },
@@ -669,6 +745,7 @@ class AccountsBrokerOwnerV1 {
     remoteModes = new Map();
     remoteReconciliationPending = false;
     nativeTransferHeldAccounts = new Set();
+    nativeTransferSpawnAuthority = new Map();
     nativeRetirementHandoffs = new Map();
     nativeContinuityDeferred = new Set();
     nativeContinuityReasons = new Map();
@@ -690,9 +767,22 @@ class AccountsBrokerOwnerV1 {
             await this.onReservationAcquired?.();
             this.reportStartup("recovery", "started");
             this.initializeAfterElection();
+            if (this.officialNativeMode()) {
+                await this.ensureNativePluginInventory(true, false);
+                await this.prepareOfficialPluginServices();
+            }
             await this.initializeNativeRemote();
             this.reconcilePersistedHandoffs();
-            this.reportStartup("recovery", "ready");
+            let completeNativeRecovery = null;
+            if (this.nativeTransfer && this.nativeProbePromise) {
+                this.nativeRecoveryPromise = new Promise((resolvePromise) => { completeNativeRecovery = resolvePromise; });
+            }
+            // Official account preparation is synchronous and can starve the private
+            // probe's IO and deadline. Settle that probe before admitting startup
+            // clients. Transfer recovery still runs after sockets open because it
+            // may need a desktop child; its existing account holds remain in force.
+            if (this.officialNativeMode())
+                await this.nativeProbePromise;
             startupPhase = "connect";
             this.reportStartup("connect", "started");
             const brokerSocket = reservation.activate({ broker: this.broker,
@@ -705,14 +795,47 @@ class AccountsBrokerOwnerV1 {
             this.controlClose = () => controlSocket.close();
             await this.startAppServerSocket();
             this.reportStartup("connect", "ready");
+            if (completeNativeRecovery) {
+                void (async () => {
+                    if (!await this.nativeProbePromise)
+                        throw new Error("native capability unavailable");
+                    this.nativeTransfer.provisionSharedWriterLocks();
+                    await this.recoverInterruptedNativeTransfers();
+                    const retirements = this.nativeTransfer.pendingSourceRetirements();
+                    const sources = new Set(retirements.map((operation) => operation.sourceAccountId));
+                    let sourcesQuiesced = true;
+                    for (const account of sources) {
+                        if (!await this.quiesceIdleAccount(account))
+                            sourcesQuiesced = false;
+                    }
+                    if (sourcesQuiesced)
+                        await this.nativeTransfer.recoverSourceRetirements();
+                    const stillPending = new Set();
+                    for (const operation of [
+                        ...this.nativeTransfer.pendingTransfersForRecovery(),
+                        ...this.nativeTransfer.pendingSourceRetirements(),
+                    ]) {
+                        stillPending.add(operation.sourceAccountId);
+                        stillPending.add(operation.targetAccountId);
+                    }
+                    for (const account of this.nativeStartupHolds) {
+                        if (!stillPending.has(account))
+                            this.nativeTransferHeldAccounts.delete(account);
+                    }
+                    this.nativeStartupHolds.clear();
+                    this.reportStartup("recovery", "ready");
+                })().catch(() => {
+                    this.reportStartup("recovery", "failed");
+                    process.stderr.write("[Tweakers Accounts] Native recovery failed; affected accounts remain held.\n");
+                }).finally(completeNativeRecovery);
+            }
+            else
+                this.reportStartup("recovery", "ready");
             this.sweepTimer = setInterval(() => {
-                this.broker.sweep();
-                if (this.nativeHistory && this.children.size > 0)
-                    this.nativeHistoryWritersSafe();
-                if (this.nativeHistory && this.children.size > 0 && this.desktopInitialization)
-                    void this.ensureNativePluginInventory();
-                void this.reconcileRemoteActivity();
-            }, OWNER_IDLE_SWEEP_MS);
+                void this.maintainOwner().catch(() => {
+                    process.stderr.write("[Tweakers Accounts] Owner maintenance failed; active consumers were retained.\n");
+                });
+            }, 5_000);
             this.sweepTimer.unref();
         }
         catch (error) {
@@ -721,16 +844,83 @@ class AccountsBrokerOwnerV1 {
             throw error;
         }
     }
-    reportStartup(stage, code) {
+    /** Idle shutdown uses authenticated consumers and work state, never CPU or PPID. */
+    async maintainOwner(now = Date.now()) {
+        if (this.closed || this.maintenancePending)
+            return;
+        for (const startup of this.startupPolicyClients) {
+            if (!startup.socket.destroyed)
+                continue;
+            if (await this.releaseStartupPolicyChild(startup) && (!startup.childLease || startup.childLease.release()))
+                this.startupPolicyClients.delete(startup);
+        }
+        const status = this.broker.status();
+        const reservations = Object.values(this.store.snapshot().reservations);
+        const busy = this.clients.size > 0 || this.startupPolicyClients.size > 0 || status.registeredClients.length > 0 || this.broker.hasActiveOperations()
+            || status.pool.heldWorkCount > 0 || status.pendingHandoffs.pendingCount > 0
+            || this.managerExecutionCount > 0 || this.enrollmentHelpers.size > 0 || this.activeAuthHelpers.size > 0
+            || reservations.some((r) => r.purpose === "doctor_review" && ["reserved", "dispatched"].includes(r.state))
+            || this.remoteController?.hasActiveOperation() === true
+            || this.config.accounts.some(account => !this.accountIsIdle(account.opaqueAccountId));
+        if (busy)
+            this.idleOwnerSince = null;
+        else {
+            this.idleOwnerSince ??= now;
+            // Leave time for the existing bounded child termination handshake.
+            if (now - this.idleOwnerSince >= 20_000) {
+                await this.close();
+                return;
+            }
+            // No consumers: do not wake account backends just to refresh inventory.
+            return;
+        }
+        if (now < this.nextMaintenanceAt)
+            return;
+        this.maintenancePending = true;
+        this.nextMaintenanceAt = now + OWNER_IDLE_SWEEP_MS;
         try {
-            this.onStartupStage?.({ stage, code, elapsedMs: Math.max(0, Math.min(600_000, Math.round(node_perf_hooks_1.performance.now() - this.startupStarted))) });
+            if (this.nativeHistory && this.children.size > 0)
+                this.nativeHistoryWritersSafe();
+            if (this.nativeHistory && this.children.size > 0 && this.desktopInitialization)
+                await this.ensureNativePluginInventory();
+            await this.reconcileRemoteActivity();
+        }
+        finally {
+            this.maintenancePending = false;
+        }
+    }
+    reportAdmissionFailure(admissionStage) {
+        try {
+            this.onStartupStage?.({ stage: "child", code: "unavailable", admissionStage,
+                elapsedMs: Math.max(0, Math.min(600_000, Math.round(node_perf_hooks_1.performance.now() - this.startupStarted))) });
+        }
+        catch { /* Diagnostics cannot change admission. */ }
+    }
+    reportStartup(stage, code, preparationStage) {
+        try {
+            this.onStartupStage?.({ stage, code, ...(preparationStage ? { preparationStage } : {}), elapsedMs: Math.max(0, Math.min(600_000, Math.round(node_perf_hooks_1.performance.now() - this.startupStarted))) });
         }
         catch { /* Startup diagnostics cannot alter election or recovery. */ }
     }
-    async close() {
-        if (this.closed)
-            return;
+    close() {
+        // Share an in-flight attempt. A failed bounded child stop retains every
+        // owner socket and may be retried after the child has actually exited.
+        if (this.closePromise)
+            return this.closePromise;
+        const attempt = this.closeOwnedResources().catch((error) => {
+            if (this.closePromise === attempt)
+                this.closePromise = null;
+            throw error;
+        });
+        this.closePromise = attempt;
+        return attempt;
+    }
+    async closeOwnedResources() {
         this.closed = true;
+        for (const proof of this.nativeProjectAuthorities.values())
+            clearTimeout(proof.timer);
+        this.nativeProjectAuthorities.clear();
+        this.nativeProjectPages.clear();
         this.remoteController?.dispose();
         if (this.sweepTimer)
             clearInterval(this.sweepTimer);
@@ -763,20 +953,18 @@ class AccountsBrokerOwnerV1 {
         for (const pending of this.pendingDesktop.values())
             clearTimeout(pending.timer);
         this.pendingDesktop.clear();
+        const ownedChildren = [...new Set([
+                ...this.children.values(),
+                ...[...this.enrollmentHelpers.values()].map(helper => helper.child),
+                ...this.retiringEnrollmentChildren,
+                ...this.activeAuthHelpers.values(),
+            ])];
         for (const helper of this.enrollmentHelpers.values()) {
             if (helper.isolatedReconnect) {
                 clearTimeout(helper.isolatedReconnect.timer);
                 helper.isolatedReconnect.preimage.fill(0);
-                await helper.child.terminateAndWait();
             }
-            else
-                try {
-                    helper.child.terminate("shutdown");
-                }
-                catch { }
         }
-        await Promise.all([...this.activeAuthHelpers.values()].map((helper) => helper.terminateAndWait()));
-        this.enrollmentHelpers.clear();
         if (this.appServer?.listening) {
             // `close()` waits for every accepted socket. Test and reconnect paths
             // may have just destroyed those sockets, so force the server's own
@@ -787,12 +975,24 @@ class AccountsBrokerOwnerV1 {
             await new Promise((resolvePromise) => this.appServer.close(() => resolvePromise()));
         }
         this.appServer = null;
-        const ownedChildren = [...this.children.values()];
         for (const child of ownedChildren)
             child.terminate("shutdown");
         if (this.initialized)
             this.broker.close();
-        await Promise.all(ownedChildren.map((child) => child.whenClosed()));
+        const stopped = await Promise.all(ownedChildren.map((child) => child.terminateAndWait()));
+        if (stopped.some(value => !value))
+            throw new Error("Owned Accounts children did not terminate; broker ownership is retained for reconciliation");
+        const servicesClosed = await Promise.all([...this.officialPluginServices.values()].map(service => service.close()));
+        if (servicesClosed.some(value => !value))
+            throw new Error("Owned plugin service adapters did not close; broker ownership is retained for reconciliation");
+        this.officialPluginServices.clear();
+        this.officialPluginLedger?.close();
+        this.officialPluginLedger = null;
+        this.officialPluginGeneration = null;
+        this.officialPluginLedgerModeFingerprint = null;
+        this.enrollmentHelpers.clear();
+        this.retiringEnrollmentChildren.clear();
+        this.activeAuthHelpers.clear();
         await this.controlClose?.();
         await this.brokerClose?.();
         this.controlClose = null;
@@ -804,7 +1004,7 @@ class AccountsBrokerOwnerV1 {
             return { version: 1, status: "unavailable" };
         const conversationId = this.canonicalHistory.conversationForPublicThreadId(request.conversationNativeId)
             ?? (() => {
-                const account = this.store.snapshot().threadOwners[request.conversationNativeId];
+                const account = this.store.ownerOf(request.conversationNativeId);
                 return account ? this.canonicalHistory.conversationForNative(account, request.conversationNativeId) : null;
             })();
         if (!conversationId)
@@ -816,7 +1016,7 @@ class AccountsBrokerOwnerV1 {
             ? conversationId
             : this.canonicalHistory.conversationForPublicThreadId(request.composerNativeId)
                 ?? (() => {
-                    const account = this.store.snapshot().threadOwners[request.composerNativeId];
+                    const account = this.store.ownerOf(request.composerNativeId);
                     return account ? this.canonicalHistory.conversationForNative(account, request.composerNativeId) : null;
                 })();
         if (composerConversation !== conversationId)
@@ -848,8 +1048,8 @@ class AccountsBrokerOwnerV1 {
         const version = /^[^/\s]+\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?:\s|$)/.exec(child.initializeResult.userAgent)?.[1];
         if (!version)
             return { version: 1, status: "unavailable" };
-        return { version: 1, status: "ready", opaqueAccountId, codexHome: binding.codexHome,
-            configFile: (0, node_path_1.join)(binding.codexHome, "config.toml"), appServerVersion: version };
+        return { version: 1, status: "ready", opaqueAccountId, codexHome: this.officialNativeMode() ? this.officialExecutionHome(opaqueAccountId) : binding.codexHome,
+            configFile: (0, node_path_1.join)(this.officialNativeMode() ? this.officialExecutionHome(opaqueAccountId) : binding.codexHome, "config.toml"), appServerVersion: version };
     }
     async invokeNativeBrowserRequest(rendererRef, opaqueAccountId, method, params) {
         const request = (0, native_request_1.parseNativeBrowserChildRequestV1)(method, params);
@@ -975,6 +1175,8 @@ class AccountsBrokerOwnerV1 {
             this.store = new state_store_1.RouterStateStore(this.stateRoot, next);
             this.executionLedger = new ledger_1.AccountLedger(this.store, this.config);
             this.syncTokenBalanceAccounts();
+            if (change.enabled !== undefined)
+                this.modelCatalogs.invalidate(change.opaqueAccountId);
             return true;
         }
         catch {
@@ -1019,6 +1221,7 @@ class AccountsBrokerOwnerV1 {
             this.store = new state_store_1.RouterStateStore(this.stateRoot, next);
             this.executionLedger = new ledger_1.AccountLedger(this.store, this.config);
             this.syncTokenBalanceAccounts();
+            this.modelCatalogs.invalidate();
             return true;
         }
         catch {
@@ -1100,7 +1303,7 @@ class AccountsBrokerOwnerV1 {
                     return;
                 const [profile, quota] = await Promise.all([
                     this.requestBrokerChild(account, child, "account/read", {}),
-                    this.requestBrokerChild(account, child, "account/rateLimits/read", {}),
+                    this.requestBrokerChild(account, child, "account/rateLimits/read", null),
                 ]);
                 this.automaticAccountAuthenticated.set(account, profile !== null && !profile.error ? providerAuthenticated(profile.result) : false);
                 const projection = quota && !quota.error ? providerQuotaProjection(quota.result) : null;
@@ -1119,7 +1322,9 @@ class AccountsBrokerOwnerV1 {
     }
     /** Serialize the manager-only lease protocol with every durable state transition. */
     handleManagerExecution(request) {
-        const run = this.managerExecutionTail.then(() => this.performManagerExecution(request));
+        this.managerExecutionCount++;
+        const run = this.managerExecutionTail.then(() => this.performManagerExecution(request))
+            .finally(() => { this.managerExecutionCount--; });
         this.managerExecutionTail = run.then(() => undefined, () => undefined);
         return run.catch(() => ({ status: "unavailable", reason: "broker_unavailable" }));
     }
@@ -1264,6 +1469,11 @@ class AccountsBrokerOwnerV1 {
         if (this.nativeHistory && !(0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory))
             return { outcome: "rejected" };
         if (action.kind === "device.start") {
+            const preparing = action.opaqueAccountId === null ? undefined : this.children.get(action.opaqueAccountId);
+            if (preparing && (!await preparing.whenPrepared() || this.children.get(action.opaqueAccountId) !== preparing || this.closed))
+                return { outcome: "rejected" };
+            if (action.opaqueAccountId !== null && action.opaqueAccountId === this.officialNativeMode()?.document.sourceAccountId)
+                return { outcome: "rejected" };
             if (this.nativeHistory && !this.nativeHistoryWritersSafe())
                 return { outcome: "rejected" };
             const helper = action.opaqueAccountId === null
@@ -1309,40 +1519,63 @@ class AccountsBrokerOwnerV1 {
             this.retireEnrollmentHelper(action.enrollmentRef);
             return { outcome: "accepted", value: {} };
         }
+        if (action.kind === "native.request" && this.officialNativeMode() && (0, official_bundled_adapter_1.officialFollowNativePluginMutationV1)(action.method, action.params))
+            return { outcome: "rejected", errorCode: "unavailable", value: { reason: official_bundled_adapter_1.OFFICIAL_FOLLOW_NATIVE_PLUGIN_MUTATION_HOLD_V1 } };
+        if (action.kind === "native.request" && !this.officialNativeMutationAllowed(action.opaqueAccountId, action.method, action.params))
+            return { outcome: "rejected" };
+        if (this.officialNativeMode() !== null && !await this.ensureNativePluginInventory())
+            return { outcome: "rejected" };
         if (action.kind === "native.request" && isolatedAuthMutation(action.method, action.params))
             return { outcome: "rejected" };
         if (action.kind === "native.request" && action.surface === "plugins" && !await this.ensureNativePluginInventory())
             return { outcome: "rejected" };
-        const child = this.broker.acquireChild(action.opaqueAccountId);
+        const probe = action.kind === "profile.read" || action.kind === "quota.read";
+        if (probe && this.broker.accountFailure(action.opaqueAccountId) === "authentication") {
+            if (action.kind === "profile.read" && this.nativeHistory) {
+                const entry = this.nativeAccountBinding(action.opaqueAccountId), home = this.reconnectAuthHome(action.opaqueAccountId);
+                try {
+                    const value = entry && home ? (0, native_auth_binding_1.readNativeSavedProfileV1)(home, entry, this.secret) : null;
+                    if (value && (0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory) && this.reconnectAuthHome(action.opaqueAccountId) === home)
+                        return { outcome: "accepted", value };
+                }
+                catch { /* Missing or changed credentials retain the explicit auth failure. */ }
+            }
+            return { outcome: "rejected", errorCode: "authentication" };
+        }
+        const child = this.broker.acquireChild(action.opaqueAccountId, undefined, probe);
         if (!child)
-            return { outcome: "rejected" };
+            return { outcome: "rejected", ...(probe ? { errorCode: this.broker.accountFailure(action.opaqueAccountId) ?? "unavailable" } : {}) };
         if (action.kind === "profile.email") {
             const response = await this.requestBrokerChild(action.opaqueAccountId, child, "account/read", {});
             const result = response && !response.error && (0, types_1.isPlainRecord)(response.result) ? response.result : null;
             const email = result && (0, types_1.isPlainRecord)(result.account) ? result.account.email : null;
             return typeof email === "string" ? { outcome: "accepted", value: email } : { outcome: "rejected" };
         }
-        if (action.kind === "profile.read") {
-            const response = await this.requestBrokerChild(action.opaqueAccountId, child, "account/read", {});
-            const profile = response && !response.error ? providerSafeProfileProjection(response.result) : null;
-            return profile ? { outcome: "accepted", value: profile } : { outcome: "rejected" };
-        }
-        if (action.kind === "quota.read") {
-            const response = await this.requestBrokerChild(action.opaqueAccountId, child, "account/rateLimits/read", {});
-            const quota = response && !response.error ? providerQuotaProjection(response.result) : null;
-            return quota ? { outcome: "accepted", value: quota } : { outcome: "rejected" };
+        if (action.kind === "profile.read" || action.kind === "quota.read") {
+            try {
+                const response = await this.requestBrokerChild(action.opaqueAccountId, child, action.kind === "profile.read" ? "account/read" : "account/rateLimits/read", action.kind === "profile.read" ? {} : null);
+                const errorCode = response?.error ? providerAccountFailure(response) : !response ? child.initializationFailure ?? "connection"
+                    : action.kind === "profile.read" && !providerAuthenticated(response.result) ? "authentication" : undefined;
+                if (errorCode)
+                    return { outcome: "rejected", errorCode };
+                const value = action.kind === "profile.read" ? providerSafeProfileProjection(response.result) : providerQuotaProjection(response.result);
+                return value ? { outcome: "accepted", value } : { outcome: "rejected", errorCode: "unavailable" };
+            }
+            catch (error) {
+                return { outcome: "rejected", errorCode: accountProbeFailure(error) };
+            }
         }
         if (action.kind === "native.request") {
             if (this.remoteBlocksDesktop(action.opaqueAccountId))
                 throw new broker_1.BrokerCommandError("account_history_busy", true);
             const scopedThreadId = (0, types_1.isPlainRecord)(action.params) && typeof action.params.threadId === "string" ? action.params.threadId : null;
-            if (scopedThreadId && this.store.snapshot().threadOwners[scopedThreadId] !== action.opaqueAccountId)
+            if (scopedThreadId && this.store.ownerOf(scopedThreadId) !== action.opaqueAccountId)
                 return { outcome: "rejected" };
             if ((action.method === "config/value/write" || action.method === "config/batchWrite") && (0, types_1.isPlainRecord)(action.params)
                 && action.params.filePath !== null) {
                 const binding = this.nativeAccountBinding(action.opaqueAccountId);
                 const mode = this.sharedNativeMode();
-                const activeConfig = mode?.state === "ready" ? (0, node_path_1.join)(mode.document.overlay.path, "config.toml") : binding ? (0, node_path_1.join)(binding.codexHome, "config.toml") : null;
+                const activeConfig = mode?.state === "ready" && mode.document.resolverProtocol === "shared-native-overlay-v1" ? (0, node_path_1.join)(mode.document.overlay.path, "config.toml") : binding ? (0, node_path_1.join)(mode?.state === "ready" && mode.document.resolverProtocol === "official-bundled-v1" ? this.officialExecutionHome(action.opaqueAccountId) : binding.codexHome, "config.toml") : null;
                 if (!binding || typeof action.params.filePath !== "string"
                     || mode?.state === "blocked" || (0, node_path_1.resolve)(action.params.filePath) !== activeConfig)
                     return { outcome: "rejected" };
@@ -1361,7 +1594,35 @@ class AccountsBrokerOwnerV1 {
                         return { outcome: "rejected" };
                     if (this.isolatedAuthHome(action.opaqueAccountId) && !await this.refreshIsolatedAuth(action.opaqueAccountId))
                         return { outcome: "rejected" };
-                    value = await (0, native_request_1.requestNativeHttpV1)(this.isolatedAuthHome(action.opaqueAccountId) ?? binding.codexHome, action.surface, action.params);
+                    const pluginTarget = action.surface === "plugins" && this.officialNativeMode() && (0, types_1.isPlainRecord)(action.params)
+                        ? (0, native_request_1.parseNativePluginHttpTargetV1)(action.params) : null;
+                    if (pluginTarget && /^\/(?:ps\/)?plugins(?:\/|$)/.test(pluginTarget.path)) {
+                        const service = this.officialPluginServices.get(action.opaqueAccountId);
+                        if (!service?.verify())
+                            return { outcome: "rejected", errorCode: "unavailable" };
+                        const reply = await service.interceptHttp(pluginTarget.verb, pluginTarget.path, new URLSearchParams(Object.entries(pluginTarget.query).map(([key, value]) => [key, String(value)])), pluginTarget.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(pluginTarget.body)));
+                        if (reply.status < 200 || reply.status >= 300)
+                            return { outcome: "rejected", errorCode: "unavailable" };
+                        value = reply.value;
+                    }
+                    else
+                        value = await (0, native_request_1.requestNativeHttpV1)(this.isolatedAuthHome(action.opaqueAccountId) ?? binding.codexHome, action.surface, action.params);
+                }
+                else if (action.method === "usage.analytics.read") {
+                    const binding = this.nativeAccountBinding(action.opaqueAccountId);
+                    if (!binding || !(0, types_1.isPlainRecord)(action.params))
+                        return { outcome: "rejected" };
+                    if (action.params.kind === "thread-usage") {
+                        if (!Array.isArray(action.params.threads) || action.params.threads.some((thread) => {
+                            if (!(0, types_1.isPlainRecord)(thread) || typeof thread.thread_id !== "string" || !Array.isArray(thread.descendant_thread_ids))
+                                return true;
+                            return [thread.thread_id, ...thread.descendant_thread_ids].some((threadId) => typeof threadId !== "string" || this.store.ownerOf(threadId) !== action.opaqueAccountId);
+                        }))
+                            return { outcome: "rejected" };
+                    }
+                    if (this.isolatedAuthHome(action.opaqueAccountId) && !await this.refreshIsolatedAuth(action.opaqueAccountId))
+                        return { outcome: "rejected" };
+                    value = await (0, native_request_1.requestNativeUsageAnalyticsV1)(this.isolatedAuthHome(action.opaqueAccountId) ?? binding.codexHome, action.params);
                 }
                 else if (action.method === "usage.credits.read" || action.method === "usage.credits.consume") {
                     const binding = this.nativeAccountBinding(action.opaqueAccountId);
@@ -1408,9 +1669,12 @@ class AccountsBrokerOwnerV1 {
         if (action.kind === "connection.authorize") {
             if (action.connectionKind !== "mcp")
                 return { outcome: "rejected" };
-            const target = this.connectionTargets.get(providerConnectionKey(action.opaqueAccountId, action.connectionKind, action.definitionRef));
-            if (!target)
+            const connections = await this.readProviderConnections(action.opaqueAccountId, action.connectionKind, child);
+            if (!connections?.some(connection => connection.definitionRef === action.definitionRef))
                 return { outcome: "rejected" };
+            const target = this.connectionTargets.get(providerConnectionKey(action.opaqueAccountId, action.connectionKind, action.definitionRef));
+            if (!target || !this.officialNativeMutationAllowed(action.opaqueAccountId, "mcpServer/oauth/login", { name: target.name }))
+                return { outcome: "rejected", errorCode: "unavailable" };
             if (this.nativeHistory && !this.nativeHistoryWritersSafe())
                 return { outcome: "rejected" };
             if (this.nativeHistory && !this.nativeAccountOperationSafe(action.opaqueAccountId, child)) {
@@ -1461,7 +1725,7 @@ class AccountsBrokerOwnerV1 {
                 loginId: null,
                 completion: null,
             };
-            helper.child = new BrokerProcessChild(synthetic, childProcess, (message) => this.receiveChild(synthetic, helper.child, message), () => { if (this.enrollmentHelpers.get(enrollmentRef) === helper)
+            helper.child = new BrokerProcessChild(synthetic, childProcess, (message) => this.receiveChild(synthetic, helper.child, message), (_expected, retained) => { if (!retained && this.enrollmentHelpers.get(enrollmentRef) === helper)
                 this.enrollmentHelpers.delete(enrollmentRef); });
             this.enrollmentHelpers.set(enrollmentRef, helper);
             return helper;
@@ -1486,7 +1750,7 @@ class AccountsBrokerOwnerV1 {
             (0, node_fs_1.writeFileSync)((0, node_path_1.join)(root, "config.toml"), "", { flag: "wx", mode: 0o600 });
             const preimage = (0, native_auth_binding_1.readNativeAuthPrivateFileV1)((0, node_path_1.join)(authHome, "auth.json"));
             const synthetic = `ar_${(0, node_crypto_1.createHmac)("sha256", this.secret).update(`reconnect-helper:${enrollmentRef}`).digest("base64url")}`;
-            const child = new BrokerProcessChild(synthetic, (0, node_child_process_1.spawn)(this.command, credentialStoreArgs(this.args, "file"), {
+            const child = new BrokerProcessChild(synthetic, (0, node_child_process_1.spawn)(this.command, isolatedAuthHelperArgs(this.args, Boolean(this.officialNativeMode())), {
                 cwd: root, env: brokerChildEnvironment(root, root), stdio: ["pipe", "pipe", "ignore"],
             }), (message) => this.receiveChild(synthetic, child, message), () => { });
             const timer = setTimeout(() => this.retireEnrollmentHelper(enrollmentRef), 15 * 60_000);
@@ -1515,9 +1779,10 @@ class AccountsBrokerOwnerV1 {
             const actor = `ar_${(0, node_crypto_1.createHmac)("sha256", this.secret).update(`account-router:v1:${raw}`).digest("base64url")}`;
             const matches = this.config.accounts.filter((account) => account.opaqueAccountId === actor && account.included);
             const entry = this.nativeAccountBinding(actor);
-            if (matches.length !== 1 || !entry || entry.authIdentityHmac !== (0, native_history_1.nativeHistoryAuthIdentityHmacV1)(raw, this.secret))
+            if (matches.length !== 1 || !entry || (mode.document.resolverProtocol === "official-bundled-v1" && (actor !== mode.document.sourceAccountId || entry.codexHome !== mode.document.nativeBase.path)) || entry.authIdentityHmac !== (0, native_history_1.nativeHistoryAuthIdentityHmacV1)(raw, this.secret))
                 return null;
-            return { actor, mode, key: `${mode.fingerprint}:${actor}`, directory: (0, node_path_1.join)(mode.document.overlay.path, "plugins") };
+            const sourceConfigFingerprint = mode.document.resolverProtocol === "official-bundled-v1" ? (0, official_bundled_adapter_1.officialSourceConfigFingerprintV1)(mode.document.nativeBase.path) : null;
+            return { actor, mode, sourceConfigFingerprint, key: `${mode.fingerprint}:${actor}${sourceConfigFingerprint ? ":" + sourceConfigFingerprint : ""}`, directory: (0, node_path_1.join)(mode.document.overlay.path, "plugins") };
         }
         catch {
             return null;
@@ -1531,9 +1796,11 @@ class AccountsBrokerOwnerV1 {
                 return null;
             const inventory = JSON.parse((0, native_auth_binding_1.readNativeAuthPrivateFileV1)((0, node_path_1.join)(binding.directory, NATIVE_INVENTORY_FILE), NATIVE_INVENTORY_MAX_BYTES).toString("utf8"));
             const provenance = JSON.parse((0, native_auth_binding_1.readNativeAuthPrivateFileV1)((0, node_path_1.join)(this.stateRoot, NATIVE_INVENTORY_PROVENANCE_FILE), 4096).toString("utf8"));
-            if (!isNativePluginInventory(inventory, binding.mode.document.nativeBase.path) || !(0, types_1.isPlainRecord)(provenance)
-                || Object.keys(provenance).sort().join() !== "actor,inventoryDigest,modeFingerprint,version"
+            if (!(binding.mode.document.resolverProtocol === "official-bundled-v1" ? (0, official_bundled_adapter_1.isOfficialPluginInventoryV1)(inventory, binding.mode.document.nativeBase.path) : isNativePluginInventory(inventory, binding.mode.document.nativeBase.path)) || !(0, types_1.isPlainRecord)(provenance)
+                || Object.keys(provenance).sort().join() !== (binding.sourceConfigFingerprint ? "actor,inventoryDigest,modeFingerprint,sourceConfigFingerprint,sourceSnapshotFingerprint,version" : "actor,inventoryDigest,modeFingerprint,version")
                 || provenance.version !== 1 || provenance.actor !== binding.actor || provenance.modeFingerprint !== binding.mode.fingerprint
+                || (binding.sourceConfigFingerprint !== null && (provenance.sourceConfigFingerprint !== binding.sourceConfigFingerprint
+                    || typeof provenance.sourceSnapshotFingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(provenance.sourceSnapshotFingerprint)))
                 || provenance.inventoryDigest !== durableDigest(inventory))
                 return null;
             return inventory;
@@ -1553,8 +1820,17 @@ class AccountsBrokerOwnerV1 {
         if (!binding)
             return false;
         const cached = this.cachedNativeInventory(binding);
-        if (!force && cached && this.inventoryFreshKey === binding.key && Date.now() < this.inventoryFreshUntil)
+        if (!force && cached && this.inventoryFreshKey === binding.key && this.officialNativeMode()
+            && this.officialPluginLedgerModeFingerprint === binding.mode.fingerprint && this.officialPluginGeneration
+            && this.officialPluginLedger?.verifyGeneration(this.officialPluginGeneration.fingerprint)) {
+            await this.prepareOfficialPluginServices();
             return true;
+        }
+        if (!force && cached && this.inventoryFreshKey === binding.key && Date.now() < this.inventoryFreshUntil) {
+            if (this.officialNativeMode())
+                await this.prepareOfficialPluginServices();
+            return true;
+        }
         const pending = this.inventoryRefresh;
         if (pending) {
             const ready = await pending.promise;
@@ -1562,17 +1838,34 @@ class AccountsBrokerOwnerV1 {
         }
         const work = (async () => {
             try {
-                const child = this.broker.acquireChild(binding.actor);
-                if (!child || !await this.initializeChild(child))
-                    throw new Error("native inventory actor unavailable");
-                const response = await this.requestInitializedBrokerChild(binding.actor, child, "plugin/installed", { nativeBaseInventoryOnly: true });
-                const inventory = response && !response.error ? nativePluginInventoryFromResponse(response.result, binding.mode.document.nativeBase.path) : null;
+                let snapshotFingerprint = null;
+                let inventory;
+                if (binding.mode.document.resolverProtocol === "official-bundled-v1") {
+                    const ledger = await this.ensureOfficialPluginLedger();
+                    if (!ledger || this.officialPluginLedgerModeFingerprint !== binding.mode.fingerprint)
+                        return false;
+                    const snapshot = await ledger.readNativeSnapshot();
+                    if (snapshot.configFingerprint !== binding.sourceConfigFingerprint)
+                        return false;
+                    snapshotFingerprint = snapshot.fingerprint;
+                    inventory = { schema_version: 1, native_base_root: binding.mode.document.nativeBase.path, plugins: snapshot.plugins };
+                    if (!(0, official_bundled_adapter_1.isOfficialPluginInventoryV1)(inventory, binding.mode.document.nativeBase.path))
+                        return false;
+                }
+                else {
+                    const child = this.broker.acquireChild(binding.actor);
+                    if (!child || !await this.initializeChild(child))
+                        throw new Error("native inventory actor unavailable");
+                    const response = await this.requestInitializedBrokerChild(binding.actor, child, "plugin/installed", { nativeBaseInventoryOnly: true });
+                    inventory = response && !response.error ? nativePluginInventoryFromResponse(response.result, binding.mode.document.nativeBase.path) : null;
+                }
                 if (this.closed || this.nativeInventoryBinding()?.key !== binding.key)
                     return false;
                 if (!inventory)
                     return this.cachedNativeInventory(binding) !== null;
                 const digest = durableDigest(inventory);
-                const changed = !cached || durableDigest(cached) !== digest;
+                const priorSnapshot = cached && binding.sourceConfigFingerprint ? JSON.parse((0, native_auth_binding_1.readNativeAuthPrivateFileV1)((0, node_path_1.join)(this.stateRoot, NATIVE_INVENTORY_PROVENANCE_FILE), 4096).toString("utf8")).sourceSnapshotFingerprint : null;
+                const changed = !cached || durableDigest(cached) !== digest || (snapshotFingerprint !== null && priorSnapshot !== snapshotFingerprint);
                 if (changed) {
                     // Native create_dir_all uses the process umask. Tighten this one
                     // existing direct child of the sealed private overlay, never a link.
@@ -1594,9 +1887,11 @@ class AccountsBrokerOwnerV1 {
                     (0, state_store_1.writePrivateJsonAtomicBounded)(binding.directory, NATIVE_INVENTORY_FILE, inventory, NATIVE_INVENTORY_MAX_BYTES);
                 }
                 if (changed || !cached)
-                    (0, state_store_1.writePrivateJsonAtomicBounded)(this.stateRoot, NATIVE_INVENTORY_PROVENANCE_FILE, { version: 1, actor: binding.actor, modeFingerprint: binding.mode.fingerprint, inventoryDigest: digest }, 4096);
+                    (0, state_store_1.writePrivateJsonAtomicBounded)(this.stateRoot, NATIVE_INVENTORY_PROVENANCE_FILE, { version: 1, actor: binding.actor, modeFingerprint: binding.mode.fingerprint, inventoryDigest: digest, ...(binding.sourceConfigFingerprint ? { sourceConfigFingerprint: binding.sourceConfigFingerprint, sourceSnapshotFingerprint: snapshotFingerprint } : {}) }, 4096);
                 if (changed && reloadChanged)
                     await this.reloadSharedNativeChildren();
+                else if (this.officialNativeMode() && this.officialPluginLedger)
+                    await this.prepareOfficialPluginServices();
                 return this.nativeInventoryBinding()?.key === binding.key && this.cachedNativeInventory(binding) !== null;
             }
             catch {
@@ -1640,17 +1935,33 @@ class AccountsBrokerOwnerV1 {
         return true;
     }
     async reloadSharedNativeChildren() {
+        this.modelCatalogs.invalidate();
+        if (this.officialNativeMode()) {
+            // New definitions enter only after an idle child leaves its writer lease.
+            // Active turns keep their package snapshot; never overwrite their cache.
+            for (const [account] of [...this.children]) {
+                if (this.accountIsIdle(account))
+                    await this.quiesceIdleAccount(account);
+                else
+                    this.nativeContinuityDeferred.add(account);
+            }
+            await this.prepareOfficialPluginServices();
+            return;
+        }
         await Promise.all([...this.children].filter(([, child]) => child.ready).map(async ([account, child]) => {
             // Direct protocol-ready seam: reload must not recursively await its own inventory publication.
             await this.requestInitializedBrokerChild(account, child, "config/batchWrite", {
                 edits: [], filePath: null, expectedVersion: null, reloadUserConfig: true,
             });
         }));
+        this.modelCatalogs.invalidate();
     }
     /** Reload resident account runtimes after an overlay mutation, without starting idle accounts. */
     async refreshSharedNativeRuntimes(method) {
-        if (!["config/value/write", "config/batchWrite", "plugin/install", "plugin/uninstall", "marketplace/add", "marketplace/remove", "marketplace/upgrade", "skills/config/write"].includes(method)
-            || this.sharedNativeMode()?.state !== "ready")
+        if (!["config/value/write", "config/batchWrite", "plugin/install", "plugin/uninstall", "marketplace/add", "marketplace/remove", "marketplace/upgrade", "skills/config/write"].includes(method))
+            return;
+        this.modelCatalogs.invalidate();
+        if (this.sharedNativeMode()?.state !== "ready")
             return;
         if (await this.ensureNativePluginInventory(true, false))
             await this.reloadSharedNativeChildren();
@@ -1663,10 +1974,16 @@ class AccountsBrokerOwnerV1 {
                 const entry = this.nativeAccountBinding(account);
                 if (!entry)
                     return null;
-                (0, native_auth_binding_1.readNativeExternalTokensV1)(home, entry, this.secret);
+                try {
+                    (0, native_auth_binding_1.readNativeExternalTokensV1)(home, entry, this.secret);
+                }
+                catch {
+                    throw new NativeAccountProbeError("authentication");
+                }
                 const response = await helper.requestPrivate("account/read", { refreshToken: false });
-                if (!response || response.error || !providerAuthenticated(response.result) || this.isolatedAuthHome(account) !== home)
-                    return null;
+                requireAuthenticatedProvider(response);
+                if (this.isolatedAuthHome(account) !== home)
+                    throw new NativeAccountProbeError("unavailable");
                 (0, native_auth_binding_1.readNativeExternalTokensV1)(home, entry, this.secret);
                 return response;
             });
@@ -1677,7 +1994,10 @@ class AccountsBrokerOwnerV1 {
     }
     /** Feature replay is itself part of readiness, so it uses this protocol-ready seam without recursively awaiting readiness. */
     async requestInitializedBrokerChild(account, child, method, params, deadlineAt) {
-        if (!child.ready || this.closed || !this.nativeHistoryWritersSafe())
+        if (!child.ready || this.closed || !this.nativeHistoryWritersSafe() || !this.officialNativeMutationAllowed(account, method, params))
+            return null;
+        if (this.nativeHistory && method.startsWith("project/") && nativeProjectWriteMethod(method)
+            && (!await this.refreshNativeProjectAuthority(account, child) || !this.nativeHistoryWritersSafe()))
             return null;
         const desktopWrite = (method.startsWith("project/") && nativeProjectWriteMethod(method)) || method === "account/rateLimitResetCredit/consume" || method === "mcpServer/oauth/login";
         if (desktopWrite && this.remoteBlocksDesktop(account))
@@ -1685,7 +2005,9 @@ class AccountsBrokerOwnerV1 {
         if (this.nativeHistory && method === "mcpServer/oauth/login" && !this.nativeAccountOperationSafe(account, child))
             return null;
         const threadId = (0, protocol_1.threadIdFrom)(params);
-        if (this.nativeHistory && threadId && !isReadOnlyNativeAccountMethod(method) && this.nativeThreadConflict(threadId) !== "clear")
+        if (this.nativeHistory && threadId && !isReadOnlyNativeAccountMethod(method) && await this.nativeThreadConflictAsync(threadId) !== "clear")
+            return null;
+        if (this.closed || !child.ready || !this.isRegisteredRequestChild(account, child))
             return null;
         const timeoutMs = Math.min(10_000, deadlineAt === undefined ? 10_000 : deadlineAt - Date.now());
         if (timeoutMs <= 0)
@@ -1700,9 +2022,19 @@ class AccountsBrokerOwnerV1 {
                 pending.resolve(null);
             }, timeoutMs);
             timer.unref();
-            this.pendingBrokerChild.set(id, { account, resolve: resolvePromise, timer });
+            this.pendingBrokerChild.set(id, { account, child, resolve: response => {
+                    // Authority can expire after dispatch. Never let projection failure
+                    // escape the child callback or return an unprojected provider result.
+                    try {
+                        resolvePromise(response && !response.error
+                            ? { ...response, result: this.officialPluginResponse(account, method, response.result, (0, types_1.isPlainRecord)(params) && params.tweakersRuntimeOwnership === true) } : response);
+                    }
+                    catch {
+                        resolvePromise(null);
+                    }
+                }, timer });
             try {
-                child.send({ jsonrpc: "2.0", id, method, params });
+                child.send({ jsonrpc: "2.0", id, method, params: this.officialThreadParams(account, method, this.officialPluginParams(account, method, params)) });
             }
             catch {
                 clearTimeout(timer);
@@ -1711,13 +2043,28 @@ class AccountsBrokerOwnerV1 {
             }
         });
     }
+    isRegisteredRequestChild(account, child) {
+        return this.children.get(account) === child
+            || [...this.enrollmentHelpers.values()].some(helper => helper.transportAccountId === account && helper.child === child);
+    }
     /**
      * NativeProjectLinks has no direct child access.  Its reads and tiny
      * idempotent imports/updates pass through the same source fence as every
      * native turn, and the raw provider result never leaves this owner.
      */
     async requestNativeProject(account, method, params) {
-        if (!this.nativeHistory || !this.nativeAccountBinding(account) || !this.nativeHistoryWritersSafe())
+        if (!this.nativeHistory || !this.nativeAccountBinding(account))
+            return null;
+        if (account === this.nativeHistory.source.metadataAccountId && !nativeProjectWriteMethod(method)) {
+            const snapshot = await this.readNativeProjectSnapshot();
+            if (!snapshot)
+                return null;
+            if (method === "project/list")
+                return { data: snapshot.projects.map((row) => (0, native_project_snapshot_1.nativeProjectRpcRowV1)(row, snapshot.source)), nextCursor: null };
+            const project = snapshot.projects.find((entry) => (0, types_1.isPlainRecord)(entry) && entry.id === params.projectId);
+            return project ? { project: (0, native_project_snapshot_1.nativeProjectRpcRowV1)(project, snapshot.source) } : null;
+        }
+        if (!this.nativeHistoryWritersSafe())
             return null;
         const child = this.broker.acquireChild(account);
         if (!child)
@@ -1739,23 +2086,18 @@ class AccountsBrokerOwnerV1 {
         if (active)
             return active;
         const work = (async () => {
-            if (!this.nativeHistory || !this.nativeLegacyProjects || !this.nativeHistoryWritersSafe())
-                return false;
-            const account = this.nativeHistory.source.metadataAccountId;
-            const child = this.broker.acquireChild(account);
-            if (!child || !this.nativeHistoryWritersSafe())
-                return false;
-            const response = await this.requestBrokerChild(account, child, "project/list", { cursor: null, limit: 512 });
-            if (!response || response.error || !(0, types_1.isPlainRecord)(response.result)
-                || (response.result.nextCursor !== undefined && response.result.nextCursor !== null)
-                || !Array.isArray(response.result.data))
-                return false;
-            return this.refreshNativeLegacyProjectsFromResult(response.result);
+            const snapshot = await this.readNativeProjectSnapshot();
+            return !!snapshot && this.nativeLegacyProjectsReady;
         })().catch(() => false).finally(() => { this.nativeLegacyProjectRefresh = null; });
         this.nativeLegacyProjectRefresh = work;
         return work;
     }
     async readProviderConnections(opaqueAccountId, kind, child) {
+        const revision = this.modelCatalogs.revision;
+        const current = () => !this.closed && this.children.get(opaqueAccountId) === child
+            && revision === this.modelCatalogs.revision;
+        if (!current())
+            return null;
         let method = kind === "app" ? "app/installed" : kind === "plugin" ? "plugin/installed" : kind === "mcp" ? "mcpServerStatus/list" : null;
         if (!method)
             return [];
@@ -1765,11 +2107,13 @@ class AccountsBrokerOwnerV1 {
         const deadlineAt = Date.now() + 12_000;
         let cursor = null;
         for (let page = 0; page < 32; page += 1) {
-            const params = method === "app/installed" ? { forceRefresh: false } : kind === "app" ? { cursor, limit: 100 } : kind === "plugin" ? {} : { cursor, limit: 100, detail: "toolsAndAuthOnly" };
+            const params = method === "app/installed" ? { forceRefresh: true } : kind === "app" ? { cursor, limit: 100 } : kind === "plugin" ? {} : { cursor, limit: 100, detail: "toolsAndAuthOnly" };
             let response = null;
             const attempts = kind === "plugin" ? 2 : 1;
             for (let attempt = 0; attempt < attempts; attempt += 1) {
                 response = await this.requestBrokerChild(opaqueAccountId, child, method, params, deadlineAt);
+                if (!current())
+                    return null;
                 // Older native backends expose only catalog reads. Fall back solely
                 // for an unsupported method, never for authentication/provider errors.
                 if (response?.error?.code === -32601 && (method === "app/installed" || method === "plugin/installed")) {
@@ -1781,7 +2125,7 @@ class AccountsBrokerOwnerV1 {
                 if (attempt + 1 < attempts)
                     await new Promise((resolvePromise) => setTimeout(resolvePromise, PLUGIN_CONNECTION_RETRY_MS));
             }
-            if (!response || response.error)
+            if (!current() || !response || response.error)
                 return null;
             const entries = providerConnectionRows(response.result, kind);
             if (!entries || rows.length + entries.length > 2048)
@@ -1800,10 +2144,22 @@ class AccountsBrokerOwnerV1 {
             seenCursors.add(next);
             cursor = next;
         }
+        // A complete current read replaces only this account's handles. Removed
+        // definitions must not remain actionable through an earlier list response.
+        const prefix = `${opaqueAccountId}\u0000${kind}\u0000`;
+        for (const key of this.connectionTargets.keys())
+            if (key.startsWith(prefix))
+                this.connectionTargets.delete(key);
+        const stock = kind === "mcp" || kind === "plugin" ? this.officialAccountPlan(opaqueAccountId) : null;
         const projected = rows.map((row) => {
             const definitionRef = `bd_${(0, node_crypto_1.createHmac)("sha256", this.secret).update(`provider-connection:${opaqueAccountId}:${kind}:${row.name}`, "utf8").digest("base64url")}`;
             this.connectionTargets.set(providerConnectionKey(opaqueAccountId, kind, definitionRef), { opaqueAccountId, kind, name: row.name });
-            return { definitionRef, ...(row.displayLabel ? { displayLabel: row.displayLabel } : {}), status: row.status };
+            const isolated = kind === "mcp" && stock?.plan.oauthIsolation === "blocked" && stock.plan.blockedMcpNames.includes(row.name);
+            const withheld = kind === "plugin" && stock?.plan.withheldPlugins[row.name];
+            const label = isolated ? (0, broker_1.safeConnectionDisplayLabel)(`${(row.displayLabel ?? row.name).slice(0, 70)}: Account OAuth storage needs isolation`)
+                : withheld ? (0, broker_1.safeConnectionDisplayLabel)(`${(row.displayLabel ?? row.name).slice(0, 70)}: Definition contains account credentials`) : row.displayLabel;
+            const status = isolated || withheld ? "unavailable" : kind === "plugin" && stock && row.status === "connected" ? "unknown" : row.status;
+            return { definitionRef, ...(label ? { displayLabel: label } : {}), status };
         });
         return projected;
     }
@@ -1831,12 +2187,12 @@ class AccountsBrokerOwnerV1 {
         // required for an admitted account. Provider-shaped responses stay inside
         // this helper; only the later bounded quota projection is ever public.
         const profile = await this.requestBrokerChild(helper.transportAccountId, helper.child, "account/read", {});
-        const quota = await this.requestBrokerChild(helper.transportAccountId, helper.child, "account/rateLimits/read", {});
+        const quota = await this.requestBrokerChild(helper.transportAccountId, helper.child, "account/rateLimits/read", null);
         const safeProfile = profile && !profile.error ? providerSafeProfileProjection(profile.result) : null;
         if (!safeProfile || !quota || quota.error || !providerQuotaProjection(quota.result))
             return null;
-        helper.child.terminate("capacity");
-        await helper.child.whenClosed();
+        if (!await helper.child.terminateAndWait())
+            return null;
         if (this.config.accounts.some((account) => account.opaqueAccountId === opaqueAccountId) || (0, node_fs_1.existsSync)(target))
             return null;
         const primary = this.config.accounts.find((account) => account.opaqueAccountId === this.config.primaryOpaqueAccountId);
@@ -1943,26 +2299,49 @@ class AccountsBrokerOwnerV1 {
         if (!helper)
             return;
         this.enrollmentHelpers.delete(enrollmentRef);
+        this.retiringEnrollmentChildren.add(helper.child);
         if (helper.isolatedReconnect) {
             clearTimeout(helper.isolatedReconnect.timer);
             helper.isolatedReconnect.preimage.fill(0);
-            void helper.child.terminateAndWait();
+            void helper.child.terminateAndWait().then(stopped => {
+                if (stopped)
+                    this.retiringEnrollmentChildren.delete(helper.child);
+            });
             return;
         }
         try {
             helper.child.terminate("capacity");
         }
         catch { }
-        if (!helper.root || !(0, node_fs_1.existsSync)(helper.root))
+        if (!helper.root || !(0, node_fs_1.existsSync)(helper.root)) {
+            void helper.child.terminateAndWait().then(stopped => { if (stopped)
+                this.retiringEnrollmentChildren.delete(helper.child); });
             return;
+        }
         // Preserve recoverability while removing the temporary login home from the
         // active enrollment namespace; no credential data is copied.
         const retiredRoot = (0, node_path_1.join)(this.stateRoot, "enrollment-retired");
         try {
+            if ((0, node_path_1.resolve)(helper.root) !== (0, node_path_1.join)(this.stateRoot, "enrollments", enrollmentRef))
+                return;
             (0, node_fs_1.mkdirSync)(retiredRoot, { recursive: true, mode: 0o700 });
-            (0, node_fs_1.renameSync)(helper.root, (0, node_path_1.join)(retiredRoot, `${enrollmentRef}.${Date.now()}`));
+            const retired = (0, node_path_1.join)(retiredRoot, `${enrollmentRef}.${Date.now()}`);
+            (0, node_fs_1.renameSync)(helper.root, retired);
+            void helper.child.terminateAndWait().then((stopped) => {
+                if (stopped)
+                    this.retiringEnrollmentChildren.delete(helper.child);
+                if (!stopped || (0, node_fs_1.existsSync)((0, node_path_1.join)(this.stateRoot, exports.ENROLLMENT_MATERIALIZATION_JOURNAL_FILE)))
+                    return;
+                const stat = (0, node_fs_1.lstatSync)(retired);
+                if (stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === process.getuid?.())
+                    (0, node_fs_1.rmSync)(retired, { recursive: true });
+            }).catch(() => { });
         }
-        catch { /* a private orphan is safer than broad deletion */ }
+        catch {
+            // Keep uncertain recovery material and the exact child in the owner set.
+            void helper.child.terminateAndWait().then(stopped => { if (stopped)
+                this.retiringEnrollmentChildren.delete(helper.child); });
+        }
     }
     async startAppServerSocket() {
         const path = (0, broker_socket_1.accountsBrokerSocketPath)(this.stateRoot, exports.ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE);
@@ -1995,12 +2374,22 @@ class AccountsBrokerOwnerV1 {
         let buffered = "";
         let byteLength = 0;
         let client = null;
+        let startup = null;
+        let releaseTransport = null;
         const handshakeTimer = setTimeout(() => socket.destroy(), 5_000);
         handshakeTimer.unref();
         socket.once("close", () => {
             clearTimeout(handshakeTimer);
             if (client && this.clients.get(client.rendererRef) === client)
                 this.disconnectAppClient(client);
+            releaseTransport?.();
+            releaseTransport = null;
+            if (startup) {
+                const closed = startup;
+                closed.session.fail();
+                void this.releaseStartupPolicyChild(closed).then(stopped => { if (stopped && (!closed.childLease || closed.childLease.release()))
+                    this.startupPolicyClients.delete(closed); });
+            }
         });
         socket.setEncoding("utf8");
         socket.on("data", (chunk) => {
@@ -2016,7 +2405,7 @@ class AccountsBrokerOwnerV1 {
                     return;
                 const line = buffered.slice(0, newline);
                 buffered = buffered.slice(newline + 1);
-                byteLength = Buffer.byteLength(buffered, "utf8");
+                byteLength -= Buffer.byteLength(line, "utf8") + 1;
                 if (Buffer.byteLength(line, "utf8") > exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES) {
                     socket.destroy();
                     return;
@@ -2029,8 +2418,47 @@ class AccountsBrokerOwnerV1 {
                     socket.destroy();
                     return;
                 }
+                if (startup) {
+                    if (!isAppMessage(frame)) {
+                        socket.destroy();
+                        return;
+                    }
+                    const current = startup;
+                    current.queue = current.queue.then(() => this.receiveStartupPolicy(current, frame.message)).catch(() => { socket.destroy(); });
+                    continue;
+                }
                 if (!client) {
+                    if ((0, startup_policy_1.verifyStartupPolicyHandshake)(this.secret, frame)) {
+                        const now = Date.now();
+                        for (const [nonce, expiry] of this.startupPolicyNonces)
+                            if (expiry <= now)
+                                this.startupPolicyNonces.delete(nonce);
+                        if (this.startupPolicyClients.size || this.startupPolicyNonces.size >= 128 || this.startupPolicyNonces.has(frame.authorization.nonce)) {
+                            socket.destroy();
+                            return;
+                        }
+                        this.startupPolicyNonces.set(frame.authorization.nonce, frame.authorization.expiresAt);
+                        startup = { socket, handshake: frame, session: new startup_policy_1.StartupPolicySessionV1(), queue: Promise.resolve(), createdChild: null, childLease: null, account: null, child: null, historyBinding: this.nativeHistory };
+                        this.startupPolicyClients.add(startup);
+                        clearTimeout(handshakeTimer);
+                        const expiryTimer = setTimeout(() => socket.destroy(), Math.max(1, frame.authorization.expiresAt - now));
+                        expiryTimer.unref();
+                        socket.once("close", () => clearTimeout(expiryTimer));
+                        if (!writeAppFrame(socket, { version: 1, kind: "handshake", ok: true }, exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES))
+                            socket.destroy();
+                        continue;
+                    }
                     if (!isAppHandshake(frame)) {
+                        socket.destroy();
+                        return;
+                    }
+                    if (!verifyDesktopAppToolsProof(this.secret, frame)) {
+                        socket.destroy();
+                        return;
+                    }
+                    const contextBinding = desktopAppToolsBinding(frame.desktopAppTools ?? null);
+                    const priorBinding = this.desktopAppToolsBindings.get(frame.handshake.rendererRef);
+                    if (priorBinding !== undefined && priorBinding !== contextBinding) {
                         socket.destroy();
                         return;
                     }
@@ -2040,8 +2468,11 @@ class AccountsBrokerOwnerV1 {
                         socket.end();
                         return;
                     }
+                    this.desktopAppToolsBindings.set(frame.handshake.rendererRef, contextBinding);
+                    releaseTransport = this.broker.retainRendererTransport(frame.handshake.rendererRef);
                     clearTimeout(handshakeTimer);
                     client = {
+                        desktopAppTools: frame.desktopAppTools ?? null,
                         rendererRef: frame.handshake.rendererRef,
                         appToolsRef: frame.handshake.appToolsRef,
                         clientKind: frame.handshake.clientKind,
@@ -2066,7 +2497,148 @@ class AccountsBrokerOwnerV1 {
             }
         });
     }
+    /** No renderer registration, task ownership, reverse tools, or pool warming. */
+    async receiveStartupPolicy(client, message) {
+        if (client.socket.destroyed || !this.startupPolicyClients.has(client) || !(0, startup_policy_1.verifyStartupPolicyHandshake)(this.secret, client.handshake)
+            || !client.session.prepare(message) || this.closed || (this.nativeHistory && !(0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory))) {
+            client.session.fail();
+            client.socket.destroy();
+            return;
+        }
+        if ((0, protocol_1.isNotification)(message)) {
+            client.session.complete(true);
+            return;
+        }
+        if (!(0, protocol_1.isRequest)(message)) {
+            client.socket.destroy();
+            return;
+        }
+        const account = this.config.primaryOpaqueAccountId;
+        let response = null;
+        if (message.method === "initialize") {
+            const existed = this.children.get(account);
+            if (!existed)
+                client.childLease = this.broker.reserveStartupChild(account);
+            const child = (existed ?? client.childLease?.acquire());
+            client.account = account;
+            client.child = child;
+            if (child && !existed)
+                client.createdChild = child;
+            if (!child) {
+                // A refused factory has no child identity to validate. Keep changed
+                // ownership fail-closed, but return the correlated admission failure
+                // while this authenticated, unchanged startup session still owns it.
+                if (this.children.has(account) || this.nativeHistory !== client.historyBinding
+                    || account !== this.config.primaryOpaqueAccountId || this.closed
+                    || client.socket.destroyed || !this.startupPolicyClients.has(client)
+                    || !(0, startup_policy_1.verifyStartupPolicyHandshake)(this.secret, client.handshake)
+                    || (this.nativeHistory && !(0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory))) {
+                    client.session.fail();
+                    client.socket.destroy();
+                    return;
+                }
+                this.reportStartup("child", "unavailable");
+                const failure = (0, redaction_1.redactedRouterError)(message.id, "post_start_failure");
+                if (!writeAppFrame(client.socket, { version: 1, kind: "message", message: failure }, exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES)) {
+                    client.session.fail();
+                    client.socket.destroy();
+                    return;
+                }
+                client.session.complete(false);
+                client.socket.end();
+                return;
+            }
+            if (child && (child.ready || (!existed && await child.initialize({
+                ...message.params,
+                capabilities: { experimentalApi: true, explicitGatewayOauth: true },
+            }, null, () => !client.socket.destroyed && this.startupPolicyClients.has(client)
+                && (0, startup_policy_1.verifyStartupPolicyHandshake)(this.secret, client.handshake) && this.startupPolicyBindingSafe(client)))))
+                response = { jsonrpc: "2.0", id: message.id, result: child.initializeResult };
+        }
+        else {
+            const child = client.child;
+            if (child?.ready && this.startupPolicyBindingSafe(client) && this.nativeHistoryWritersSafe()) {
+                const value = await child.requestPrivate(message.method, message.params, Math.min(10_000, Math.max(1, client.handshake.authorization.expiresAt - Date.now())));
+                if (value)
+                    response = { ...value, id: message.id };
+            }
+        }
+        // A child created solely for policy reads must close before native proceeds
+        // to full desktop negotiation. Existing consumers' children are preserved.
+        if (!this.startupPolicyBindingSafe(client)) {
+            client.session.fail();
+            client.socket.destroy();
+            return;
+        }
+        const stoppedOwnChild = message.method === "config/read" && !!client.createdChild;
+        if (message.method === "config/read" && response && !response.error) {
+            if (!await this.releaseStartupPolicyChild(client))
+                response = null;
+        }
+        if (client.socket.destroyed || !this.startupPolicyClients.has(client) || !(0, startup_policy_1.verifyStartupPolicyHandshake)(this.secret, client.handshake)
+            || !this.startupPolicyBindingSafe(client, stoppedOwnChild && !client.createdChild)) {
+            client.socket.destroy();
+            return;
+        }
+        if (!response)
+            response = (0, redaction_1.redactedRouterError)(message.id, "post_start_failure");
+        const success = !response.error;
+        if (!writeAppFrame(client.socket, { version: 1, kind: "message", message: response }, exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES)) {
+            client.socket.destroy();
+            return;
+        }
+        client.session.complete(success);
+        if (!success)
+            client.socket.end();
+        else if (client.session.completed) {
+            if (!client.childLease || client.childLease.release())
+                this.startupPolicyClients.delete(client);
+            client.socket.end();
+        }
+    }
+    startupPolicyBindingSafe(client, stoppedOwnChild = false) {
+        return client.account === this.config.primaryOpaqueAccountId && this.nativeHistory === client.historyBinding
+            && (!this.nativeHistory || (0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory))
+            && (stoppedOwnChild ? !!client.childLease && !this.children.has(client.account) : this.children.get(client.account) === client.child);
+    }
+    releaseStartupPolicyChild(client) {
+        if (client.stopPromise)
+            return client.stopPromise;
+        const stop = this.stopStartupPolicyChild(client);
+        client.stopPromise = stop;
+        void stop.then(stopped => { if (!stopped && client.stopPromise === stop)
+            client.stopPromise = undefined; });
+        return stop;
+    }
+    async stopStartupPolicyChild(client) {
+        const child = client.createdChild;
+        if (!child)
+            return true;
+        const account = child.opaqueAccountId;
+        if (!client.childLease || !this.accountIsIdle(account))
+            return false;
+        client.childLease.retire();
+        const closed = await child.terminateAndWait();
+        if (closed) {
+            client.createdChild = null;
+            return true;
+        }
+        return closed;
+    }
     receiveDesktop(client, message, resumedAutomaticCapacityKey = null, nativeProvenOwner = null) {
+        const previous = this.desktopQueues.get(client) ?? Promise.resolve();
+        const work = previous.catch(() => { }).then(() => this.processDesktop(client, message, resumedAutomaticCapacityKey, nativeProvenOwner));
+        this.desktopQueues.set(client, work);
+        void work.catch(() => {
+            if ((0, protocol_1.isRequest)(message) && this.clients.get(client.rendererRef) === client) {
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(message.id, "post_start_failure"));
+            }
+        }).finally(() => {
+            if (this.desktopQueues.get(client) === work)
+                this.desktopQueues.delete(client);
+        });
+    }
+    async processDesktop(client, message, resumedAutomaticCapacityKey, nativeProvenOwner) {
         if (this.closed || this.clients.get(client.rendererRef) !== client)
             return;
         // Drift is recoverable, but never grants authority to dispatch under another account.
@@ -2103,6 +2675,10 @@ class AccountsBrokerOwnerV1 {
             for (const existing of [...this.children.values(), ...[...this.enrollmentHelpers.values()].map((helper) => helper.child)]) {
                 if (existing.ready && existing.initializationClient && this.clients.get(existing.initializationClient.rendererRef) !== existing.initializationClient)
                     existing.initializationClient = client;
+            }
+            if (this.officialNativeMode() && !await this.ensureNativePluginInventory()) {
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
+                return;
             }
             const child = this.broker.acquireChild(this.config.primaryOpaqueAccountId);
             if (!child) {
@@ -2156,7 +2732,7 @@ class AccountsBrokerOwnerV1 {
         if (this.nativeHistory && !nativeProvenOwner) {
             const root = this.nativeRootThreadId(request);
             if (root) {
-                const durableOwner = this.store.snapshot().threadOwners[root] ?? null;
+                const durableOwner = this.store.ownerOf(root) ?? null;
                 if (durableOwner) {
                     if (!this.nativeHistoryWritersSafe()) {
                         if (resumedAutomaticCapacityKey)
@@ -2251,14 +2827,35 @@ class AccountsBrokerOwnerV1 {
             }
             routedRequest = translated;
         }
+        if (["thread/start", "thread/resume", "thread/fork"].includes(request.method)) {
+            try {
+                routedRequest = { ...routedRequest, params: this.desktopAppToolsParams(client, routedRequest.params) };
+            }
+            catch {
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "invalid_correlation"));
+                return;
+            }
+        }
         if (this.nativeHistory && request.method === "thread/start")
             routedRequest = { ...routedRequest, params: { ...((0, types_1.isPlainRecord)(routedRequest.params) ? routedRequest.params : {}), historyMode: "paginated" } };
         if (nativeProjectTranslation) {
             routedRequest = withProjectId(routedRequest, nativeProjectTranslation.projectId);
             this.nativeProjectStartTranslations.delete(request);
         }
+        if (request.method === "marketplace/add")
+            routedRequest = this.stageSharedBundledMarketplace(routedRequest, account);
+        // This observation belongs only to this request. Native MCP rebinding
+        // below refreshes it after its asynchronous teardown; never reuse it for
+        // another request, even for the same thread.
+        let mutationWriterObservation = "clear";
         if (this.nativeHistory && threadId && !isReadOnlyNativeAccountMethod(request.method)) {
-            const conflict = this.nativeThreadConflict(threadId);
+            const conflict = mutationWriterObservation = await this.nativeThreadConflictAsync(threadId);
+            if (this.closed || this.clients.get(client.rendererRef) !== client)
+                return;
+            if (this.store.ownerOf(threadId) && this.store.ownerOf(threadId) !== account) {
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "unknown_thread_owner"));
+                return;
+            }
             if (conflict !== "clear") {
                 // Retry only source retirement at an idle boundary. This incoming
                 // mutation is refused; recovery never retains or replays its payload.
@@ -2270,6 +2867,8 @@ class AccountsBrokerOwnerV1 {
                 return;
             }
         }
+        if (this.retryInvalidatedModelCatalog(client, request, resumedAutomaticCapacityKey))
+            return;
         const taskAccount = request.method === "thread/section/move" ? ownerAccount : account;
         const taskRef = threadId ? this.ensureTask(client, taskAccount, threadId) : null;
         const conversationId = logicalRoute?.conversationId ?? (taskRef ? this.conversationForTask(taskRef) : null);
@@ -2326,6 +2925,11 @@ class AccountsBrokerOwnerV1 {
                 return;
             }
         }
+        if (this.officialNativeMode() && ((0, official_bundled_adapter_1.officialFollowNativePluginMutationV1)(request.method, request.params)
+            || ["thread/start", "thread/resume", "thread/fork"].includes(request.method) && !(0, official_bundled_adapter_1.officialThreadPluginConfigAllowedV1)(routedRequest.params))) {
+            this.sendDesktop(client, { jsonrpc: "2.0", id: request.id, error: { code: -32000, message: official_bundled_adapter_1.OFFICIAL_FOLLOW_NATIVE_PLUGIN_MUTATION_HOLD_V1 } });
+            return;
+        }
         if (isolatedAuthMutation(request.method, request.params)) {
             this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "balanced_mode_auth_mutation"));
             return;
@@ -2338,6 +2942,30 @@ class AccountsBrokerOwnerV1 {
             return;
         }
         if (this.deferUntilChildReady(client, request, child, () => this.receiveDesktop(client, request, resumedAutomaticCapacityKey)))
+            return;
+        if (threadId && taskRef && (request.method === "thread/resume" || isContinuationRequestMethod(request.method))) {
+            if (!await this.ensureDesktopAppToolsBinding(client, child, threadId, taskRef, conversationId, routedRequest)) {
+                if (resumedAutomaticCapacityKey)
+                    this.automaticCapacityRefreshRequests.delete(resumedAutomaticCapacityKey);
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
+                return;
+            }
+            // Rebinding awaits native teardown. Refresh the writer census before
+            // admitting a user turn, instead of reusing the earlier observation.
+            if (this.nativeHistory)
+                mutationWriterObservation = await this.nativeThreadConflictAsync(threadId);
+            if (this.closed || this.clients.get(client.rendererRef) !== client || this.children.get(account) !== child
+                || !child.ready || mutationWriterObservation !== "clear") {
+                if (resumedAutomaticCapacityKey)
+                    this.automaticCapacityRefreshRequests.delete(resumedAutomaticCapacityKey);
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
+                return;
+            }
+        }
+        // Both writer censuses and native MCP rebinding can await account/policy
+        // changes. Re-enter eligibility selection before reserving or writing a
+        // turn; no asynchronous boundary remains between this check and send.
+        if (this.retryInvalidatedModelCatalog(client, request, resumedAutomaticCapacityKey))
             return;
         let logicalTurnId = null;
         let balanceReservation = null;
@@ -2385,6 +3013,8 @@ class AccountsBrokerOwnerV1 {
             account,
             taskRef,
             method: request.method,
+            ...(["thread/start", "thread/resume", "thread/fork"].includes(request.method) ? { desktopThreadParams: routedRequest.params } : {}),
+            ...(request.method === "plugin/list" && (0, types_1.isPlainRecord)(routedRequest.params) && routedRequest.params.tweakersRuntimeOwnership === true ? { nativeRuntimeOwnershipRequested: true } : {}),
             conversationId,
             logicalTurnId,
             balanceReservationId: balanceReservation?.reservationId ?? null,
@@ -2398,23 +3028,44 @@ class AccountsBrokerOwnerV1 {
         let dispatchAttempted = false;
         let preDispatchConflict = "clear";
         try {
-            // Recheck after every durable lease/reservation and immediately before
-            // a native provider write. The census cannot lock a same-UID race, but
-            // it never knowingly dispatches after one is observed.
-            if (this.nativeHistory && threadId && !isReadOnlyNativeAccountMethod(request.method))
-                preDispatchConflict = this.nativeThreadConflict(threadId);
+            // Revalidate ownership after synchronous lease/reservation work. The
+            // request's single census completed in this same uninterrupted turn.
+            preDispatchConflict = mutationWriterObservation;
             if (this.nativeHistory && ((0, account_continuity_1.isAccountScopedCapabilityMutationV1)(request.method) || request.method === "mcpServer/oauth/login")) {
                 if (!this.nativeAccountOperationSafe(account, child))
                     preDispatchConflict = "conflict";
             }
-            if (!this.nativeHistoryWritersSafe() || preDispatchConflict !== "clear")
+            if (this.closed || this.clients.get(client.rendererRef) !== client || this.children.get(account) !== child
+                || !child.ready || (threadId && this.store.ownerOf(threadId) && this.store.ownerOf(threadId) !== account)
+                || !this.nativeHistoryWritersSafe() || preDispatchConflict !== "clear")
                 throw new Error("native history writer conflict");
             if (balanceReservation) {
                 this.tokenBalance.markDispatched(balanceReservation.reservationId);
                 balanceDispatched = true;
             }
             dispatchAttempted = true;
-            child.send({ ...routedRequest, id: childId });
+            if (!this.officialNativeMutationAllowed(account, routedRequest.method, routedRequest.params))
+                throw new Error("native definitions are read-only");
+            if (routedRequest.method === "account/read" && this.officialNativeMode() && this.isolatedAuthHome(account)) {
+                // The execution child's base URL belongs to the private plugin facade.
+                // Native desktop HTTP uses account/read.workspaceRouting.backendOrigin
+                // but does not inherit that child's CA. Read genuine provider routing
+                // through the existing account-owned auth helper, without inventing a
+                // public origin or changing residency and principal checks.
+                dispatchAttempted = false;
+                // Do not hold the desktop receive queue while the account helper runs:
+                // turn interrupts and responses to child RPCs share that queue.
+                void this.readOfficialDesktopAccount(account, child, client, routedRequest.params).catch(() => null).then((response) => {
+                    // The normal desktop watchdog may already have settled this read.
+                    if (!this.pendingDesktop.has(childId))
+                        return;
+                    this.resolveDesktopResponse(account, child, response
+                        ? { ...response, id: childId }
+                        : (0, redaction_1.redactedRouterError)(childId, "post_start_failure"));
+                });
+                return;
+            }
+            child.send({ ...routedRequest, params: this.officialThreadParams(account, routedRequest.method, this.officialPluginParams(account, routedRequest.method, routedRequest.params)), id: childId });
         }
         catch {
             this.removePendingDesktop(childId);
@@ -2433,47 +3084,311 @@ class AccountsBrokerOwnerV1 {
             this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, preDispatchConflict === "conflict" ? "account_history_busy" : dispatchAttempted ? "ambiguous_dispatch" : "post_start_failure"));
         }
     }
-    /** Main/preload-only aggregate read; account and source home come from the signed owner binding. */
-    readDesktopProjects(client, request) {
-        if (!(0, types_1.isPlainRecord)(request.params) || Object.keys(request.params).length !== 0) {
-            this.sendDesktop(client, { jsonrpc: "2.0", id: request.id, error: { code: -32602, message: "Desktop project read takes no parameters." } });
-            return;
+    async readOfficialDesktopAccount(account, child, client, params) {
+        const binding = this.nativeHistory;
+        const session = this.officialPluginSession(account);
+        const service = this.officialPluginServices.get(account);
+        const authIdentity = this.nativeAccountBinding(account)?.authIdentityHmac;
+        const current = () => !this.closed && this.clients.get(client.rendererRef) === client
+            && this.children.get(account) === child && child.ready && this.nativeHistory === binding && this.nativeHistoryWritersSafe()
+            && this.accountForRequest({ id: "routing", method: "account/read", params }) === account
+            && !!session && this.officialPluginSession(account)?.stamp === session.stamp
+            && !!authIdentity && this.nativeAccountBinding(account)?.authIdentityHmac === authIdentity
+            && this.officialPluginServices.get(account) === service && !!service?.verify();
+        if (!current())
+            return null;
+        const response = await this.requestBrokerChild(account, child, "account/read", params);
+        if (!current() || !response || response.error)
+            return null;
+        // A helper must never hand the execution facade back to the desktop.
+        const routing = (0, types_1.isPlainRecord)(response.result) ? response.result.workspaceRouting : null;
+        if (!(0, types_1.isPlainRecord)(routing) || typeof routing.chatgptAccountId !== "string"
+            || (0, native_history_1.nativeHistoryAuthIdentityHmacV1)(routing.chatgptAccountId, this.secret) !== authIdentity
+            || typeof routing.backendOrigin !== "string"
+            || !["NO_CONSTRAINT", "us", "us_cr"].includes(String(routing.accountRoutingOverride)))
+            return null;
+        let origin;
+        try {
+            origin = new URL(routing.backendOrigin);
         }
-        if (!this.nativeHistory || !this.nativeLegacyProjects || !(0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory)) {
-            this.sendDesktop(client, { jsonrpc: "2.0", id: request.id, error: { code: -32603, message: "Desktop project projection is unavailable." } });
-            return;
+        catch {
+            return null;
         }
-        client.outstanding += 1;
-        void (async () => {
+        if (origin.protocol !== "https:" || origin.origin !== routing.backendOrigin
+            || origin.origin === new URL(service.baseUrl).origin)
+            return null;
+        return response;
+    }
+    desktopAppToolsParams(client, params) {
+        const base = (0, types_1.isPlainRecord)(params) ? params : {};
+        if (this.officialNativeMode()) {
+            // Discard renderer replacements of the desktop-owned tool. Validate all
+            // remaining policy before restoring the exact authenticated main context.
+            const context = client.desktopAppTools ?? null;
+            const inherited = (0, types_1.isPlainRecord)(base.config) ? this.officialDesktopConfigs.get(base.config) : undefined;
+            if (inherited && (inherited.client !== client || inherited.context !== context))
+                throw new Error("Desktop tool binding changed");
+            const detached = inherited ? { config: base.config, native: inherited.native } : (0, native_desktop_config_1.detachNativeDesktopConfigV1)(this.secret, context, base.config);
+            const config = (0, official_bundled_adapter_1.officialDesktopAppToolsConfigV1)(detached.config, null);
+            this.officialDesktopConfigs.set(config, { client, context, native: (0, official_bundled_adapter_1.officialDesktopAppToolsConfigV1)(detached.native, null) });
+            return { ...base, config };
+        }
+        return { ...base, config: (0, desktop_app_tools_1.injectDesktopAppToolsRequestConfig)(base.config, client.desktopAppTools ?? null) };
+    }
+    /** A loaded resume silently ignores changed config unless its last subscriber
+     * has detached. Prove idle, detach, then require native teardown evidence
+     * before accepting a new desktop binding; a successful RPC alone is not proof. */
+    async ensureDesktopAppToolsBinding(client, child, threadId, taskRef, conversationId, request) {
+        const previous = this.threadAppToolsBindings.get(child)?.get(threadId);
+        const context = client.desktopAppTools ?? null;
+        const desired = desktopAppToolsBinding(context);
+        if (previous === desired || (!context && previous === undefined))
+            return true;
+        if (!context || this.appToolsRebindingTasks.has(taskRef)
+            || (conversationId && this.canonicalHistory.hasActiveTurn(conversationId)))
+            return false;
+        const current = () => !this.closed && this.clients.get(client.rendererRef) === client
+            && this.children.get(child.opaqueAccountId) === child && child.ready
+            && this.broker.routeAppTools(taskRef)?.ownerRendererRef === client.rendererRef;
+        if (!current() || !this.broker.beginRun(taskRef))
+            return false;
+        this.appToolsRebindingTasks.add(taskRef);
+        let observations = this.appToolsRebindObservations.get(child);
+        if (!observations) {
+            observations = new Map();
+            this.appToolsRebindObservations.set(child, observations);
+        }
+        const observation = { unloaded: false, idle: false };
+        observations.set(threadId, observation);
+        try {
+            const params = request.method === "thread/resume" ? this.desktopAppToolsParams(client, request.params)
+                : this.desktopThreadParams(client, threadId, { threadId, excludeTurns: true });
+            if (!params)
+                return false;
+            const loaded = await this.loadedNativeThreads(child.opaqueAccountId);
+            if (!current() || loaded === null)
+                return false;
+            const wasLoaded = loaded.includes(threadId);
+            if (!wasLoaded && request.method === "thread/resume")
+                return true;
+            if (wasLoaded) {
+                const read = await this.requestBrokerChild(child.opaqueAccountId, child, "thread/read", { threadId, includeTurns: false });
+                const result = read && !read.error && (0, types_1.isPlainRecord)(read.result) ? read.result : null;
+                const thread = result && (0, types_1.isPlainRecord)(result.thread) ? result.thread : null;
+                if (!current() || !thread || !(0, types_1.isPlainRecord)(thread.status) || thread.status.type !== "idle")
+                    return false;
+                const detached = await this.requestBrokerChild(child.opaqueAccountId, child, "thread/unsubscribe", { threadId });
+                if (!current() || !detached || detached.error || !(0, types_1.isPlainRecord)(detached.result)
+                    || detached.result.status !== "unsubscribed")
+                    return false;
+            }
+            if (this.nativeHistory && await this.nativeThreadConflictAsync(threadId) !== "clear")
+                return false;
+            if (!current())
+                return false;
+            // Native may spend up to ten seconds shutting down the old session before
+            // starting its replacement. Keep this bounded request separate from turns.
+            const resumed = await child.requestPrivate("thread/resume", this.officialThreadParams(child.opaqueAccountId, "thread/resume", params), 25_000);
+            if (!current() || !resumed || resumed.error || (0, protocol_1.threadIdFrom)(resumed.result) !== threadId)
+                return false;
+            if (wasLoaded && (!observation.unloaded || !observation.idle))
+                return false;
+            this.recordThreadAppToolsBinding(child, threadId, client, params);
+            return true;
+        }
+        finally {
+            observations.delete(threadId);
+            this.appToolsRebindingTasks.delete(taskRef);
+            this.broker.finishRun(taskRef);
+        }
+    }
+    desktopThreadParams(client, threadId, params) {
+        if (!this.officialNativeMode())
+            return this.desktopAppToolsParams(client, params);
+        const config = this.desktopThreadConfigs.get(client)?.get(threadId);
+        if (!config)
+            return null;
+        try {
+            return this.desktopAppToolsParams(client, { ...params, config });
+        }
+        catch {
+            return null;
+        }
+    }
+    recordThreadAppToolsBinding(child, threadId, client, params) {
+        let bindings = this.threadAppToolsBindings.get(child);
+        if (!bindings) {
+            bindings = new Map();
+            this.threadAppToolsBindings.set(child, bindings);
+        }
+        bindings.set(threadId, desktopAppToolsBinding(client.desktopAppTools ?? null));
+        if ((0, types_1.isPlainRecord)(params) && (0, types_1.isPlainRecord)(params.config) && this.officialDesktopConfigs.has(params.config)) {
+            let configs = this.desktopThreadConfigs.get(client);
+            if (!configs) {
+                configs = new Map();
+                this.desktopThreadConfigs.set(client, configs);
+            }
+            configs.set(threadId, params.config);
+            while (configs.size > 4096)
+                configs.delete(configs.keys().next().value);
+        }
+    }
+    /** Saved reads never acquire/initialize an account child or start an authentication helper. */
+    readNativeProjectSnapshot() {
+        if (this.nativeProjectSnapshotRead)
+            return this.nativeProjectSnapshotRead;
+        const work = (async () => {
             this.nativeLegacyProjectsReady = false;
-            const binding = this.nativeHistory;
-            const helper = this.nativeLegacyProjects;
+            const binding = this.nativeHistory, helper = this.nativeLegacyProjects;
             if (!binding || !helper || !(0, native_history_1.nativeHistoryBindingSafeV1)(binding))
                 return null;
+            const reader = new native_project_snapshot_1.NativeProjectSnapshotReaderV1(binding);
             const account = binding.source.metadataAccountId;
-            const child = this.broker.acquireChild(account);
-            if (!child?.ready || !(0, native_history_1.nativeHistoryBindingSafeV1)(binding))
-                return null;
-            const response = await this.requestBrokerChild(account, child, "project/list", { cursor: null, limit: 512 });
-            if (this.closed || this.clients.get(client.rendererRef) !== client || this.nativeHistory !== binding
-                || this.nativeLegacyProjects !== helper || this.children.get(account) !== child)
-                return null;
-            if (!response || response.error || !(0, types_1.isPlainRecord)(response.result)
-                || (response.result.nextCursor !== undefined && response.result.nextCursor !== null)
-                || !Array.isArray(response.result.data))
-                return null;
-            const ids = [];
-            for (const project of response.result.data) {
-                if (!(0, types_1.isPlainRecord)(project) || !validNativeProjectId(project.id))
-                    return null;
-                ids.push(project.id);
+            const child = this.children.get(account);
+            let snapshot = null;
+            if (child?.ready) {
+                const fingerprint = reader.fingerprint(false);
+                if (fingerprint) {
+                    const rows = [], cursors = new Set();
+                    let cursor = null;
+                    const deadline = Date.now() + 5_000;
+                    for (let page = 0; page < 512; page++) {
+                        const response = await this.requestInitializedBrokerChild(account, child, "project/list", { cursor, limit: 512 }, deadline);
+                        if (!response || response.error || !(0, types_1.isPlainRecord)(response.result) || !Array.isArray(response.result.data))
+                            break;
+                        rows.push(...response.result.data);
+                        if (rows.length > 512 || Buffer.byteLength(JSON.stringify(rows)) > native_project_snapshot_1.NATIVE_PROJECT_SNAPSHOT_MAX_BYTES)
+                            break;
+                        const next = response.result.nextCursor;
+                        if (next === undefined || next === null) {
+                            if (reader.fingerprint(false) === fingerprint && this.children.get(account) === child && child.ready)
+                                snapshot = { account, fingerprint, projects: rows, source: "app_server" };
+                            break;
+                        }
+                        if (typeof next !== "string" || !next.length || next.length > 4096 || cursors.has(next) || !response.result.data.length)
+                            break;
+                        cursors.add(next);
+                        cursor = next;
+                    }
+                }
             }
-            if (new Set(ids).size !== ids.length || !(0, native_history_1.nativeHistoryBindingSafeV1)(binding))
+            if (!snapshot) {
+                this.invalidateNativeProjectAuthority(account);
+                snapshot = await reader.read();
+            }
+            if (!snapshot || this.closed || this.nativeHistory !== binding || this.nativeLegacyProjects !== helper
+                || !(0, native_history_1.nativeHistoryBindingSafeV1)(binding) || reader.fingerprint(snapshot.source === "saved_local") !== snapshot.fingerprint)
                 return null;
-            const result = helper.desktopProjection(response.result.data);
-            this.nativeLegacyProjectsReady = result !== null;
-            return result;
-        })().then((result) => {
+            const projection = helper.desktopProjection(snapshot.projects, {
+                access: snapshot.source === "app_server" && this.hasNativeProjectAuthority(account) ? "read_write" : "read_only",
+                source: snapshot.source, authorityGeneration: this.nativeProjectAuthorityGeneration,
+            });
+            if (!projection || Buffer.byteLength(JSON.stringify(projection)) + Buffer.byteLength(JSON.stringify(snapshot.projects)) > native_project_snapshot_1.NATIVE_PROJECT_SNAPSHOT_MAX_BYTES
+                || reader.fingerprint(snapshot.source === "saved_local") !== snapshot.fingerprint)
+                return null;
+            this.nativeLegacyProjectsReady = true;
+            return { ...snapshot, desktop: projection };
+        })().catch(() => null).finally(() => { this.nativeProjectSnapshotRead = null; });
+        this.nativeProjectSnapshotRead = work;
+        return work;
+    }
+    hasNativeProjectAuthority(account) {
+        const proof = this.nativeProjectAuthorities.get(account);
+        if (!proof)
+            return false;
+        if (proof.expiresAt <= Date.now() || !proof.child.ready || this.children.get(account) !== proof.child
+            || !this.nativeHistory || !(0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory)) {
+            this.invalidateNativeProjectAuthority(account, proof.child);
+            return false;
+        }
+        return true;
+    }
+    setNativeProjectAuthority(account, child) {
+        const previous = this.nativeProjectAuthorities.get(account);
+        if (previous)
+            clearTimeout(previous.timer);
+        this.nativeProjectAuthorities.delete(account);
+        if (child) {
+            const expiresAt = Date.now() + 60_000;
+            const timer = setTimeout(() => { if (this.nativeProjectAuthorities.get(account)?.expiresAt === expiresAt)
+                this.invalidateNativeProjectAuthority(account, child); }, 60_000);
+            timer.unref();
+            this.nativeProjectAuthorities.set(account, { child, expiresAt, timer });
+        }
+        if (account === this.nativeHistory?.source.metadataAccountId && (!!previous !== !!child || (child && previous?.child !== child))) {
+            this.nativeProjectAuthorityGeneration++;
+            this.nativeProjectPages.clear();
+            for (const client of this.clients.values())
+                this.sendDesktop(client, { jsonrpc: "2.0", method: "tweakers/desktopProjects/changed",
+                    params: { version: 1, access: child ? "read_write" : "read_only", source: child ? "app_server" : "saved_local", authorityGeneration: this.nativeProjectAuthorityGeneration } });
+        }
+    }
+    /** An account event retires every proof/probe from the preceding auth revision. */
+    invalidateNativeProjectAuthority(account, child) {
+        if (child && this.children.get(account) !== child && this.nativeProjectAuthorities.get(account)?.child !== child)
+            return;
+        this.nativeProjectAuthRevisions.set(account, (this.nativeProjectAuthRevisions.get(account) ?? 0) + 1);
+        this.setNativeProjectAuthority(account, null);
+    }
+    /** Current app-server authentication status; no token refresh or helper. Remote validity is checked separately by usage/sign-in. */
+    refreshNativeProjectAuthority(account, child) {
+        const revision = this.nativeProjectAuthRevisions.get(account) ?? 0;
+        const active = this.nativeProjectAuthorityRefreshes.get(account);
+        if (active?.child === child && active.revision === revision)
+            return active.work;
+        const binding = this.nativeHistory;
+        const work = (async () => {
+            if (!binding || !(0, native_history_1.nativeHistoryBindingSafeV1)(binding) || !child.ready || this.children.get(account) !== child) {
+                if (this.children.get(account) === child && (this.nativeProjectAuthRevisions.get(account) ?? 0) === revision)
+                    this.invalidateNativeProjectAuthority(account, child);
+                return false;
+            }
+            const response = await child.requestPrivate("account/read", { refreshToken: false }, 5_000);
+            const valid = !!response && !response.error && providerAuthenticated(response.result) && !this.closed && child.ready
+                && this.children.get(account) === child && (this.nativeProjectAuthRevisions.get(account) ?? 0) === revision
+                && this.nativeHistory === binding && (0, native_history_1.nativeHistoryBindingSafeV1)(binding);
+            if (this.children.get(account) === child && (this.nativeProjectAuthRevisions.get(account) ?? 0) === revision) {
+                if (valid)
+                    this.setNativeProjectAuthority(account, child);
+                else
+                    this.invalidateNativeProjectAuthority(account, child);
+            }
+            return valid;
+        })().catch(() => { if (this.children.get(account) === child && (this.nativeProjectAuthRevisions.get(account) ?? 0) === revision)
+            this.invalidateNativeProjectAuthority(account, child); return false; })
+            .finally(() => { if (this.nativeProjectAuthorityRefreshes.get(account)?.work === work)
+            this.nativeProjectAuthorityRefreshes.delete(account); });
+        this.nativeProjectAuthorityRefreshes.set(account, { child, revision, work });
+        return work;
+    }
+    /** Main/preload-only aggregate read; the signed owner chooses every source path. */
+    readDesktopProjects(client, request) {
+        if (!(0, types_1.isPlainRecord)(request.params) || Object.keys(request.params).some((key) => key !== "prepareWrite")
+            || (Object.hasOwn(request.params, "prepareWrite") && request.params.prepareWrite !== true)) {
+            this.sendDesktop(client, { jsonrpc: "2.0", id: request.id, error: { code: -32602, message: "Invalid desktop project read parameters." } });
+            return;
+        }
+        const prepareWrite = request.params.prepareWrite === true;
+        client.outstanding++;
+        void (async () => {
+            const binding = this.nativeHistory, account = binding?.source.metadataAccountId;
+            const child = account ? this.children.get(account) : undefined;
+            const currentWriter = () => !!account && !!child?.ready && !this.closed && this.nativeHistory === binding
+                && this.clients.get(client.rendererRef) === client && this.children.get(account) === child
+                && !this.remoteBlocksDesktop(account) && this.nativeHistoryWritersSafe();
+            // Only an explicit native write preparation renews expired authority.
+            // Saved reads never start an auth helper or acquire a child.
+            if (prepareWrite && (!currentWriter() || !await this.refreshNativeProjectAuthority(account, child) || !currentWriter()))
+                return null;
+            const snapshot = await this.readNativeProjectSnapshot();
+            if (prepareWrite && (!currentWriter() || !this.hasNativeProjectAuthority(account)))
+                return null;
+            return snapshot;
+        })().then((snapshot) => {
+            const result = snapshot && { ...snapshot.desktop,
+                access: snapshot.source === "app_server" && this.hasNativeProjectAuthority(snapshot.account) ? "read_write" : "read_only",
+                source: snapshot.source, authorityGeneration: this.nativeProjectAuthorityGeneration,
+            };
             if (!result)
                 this.sendDesktop(client, { jsonrpc: "2.0", id: request.id, error: { code: -32603, message: "Desktop project projection is unavailable." } });
             else
@@ -2481,6 +3396,34 @@ class AccountsBrokerOwnerV1 {
         }).catch(() => {
             this.sendDesktop(client, { jsonrpc: "2.0", id: request.id, error: { code: -32603, message: "Desktop project projection is unavailable." } });
         }).finally(() => { client.outstanding = Math.max(0, client.outstanding - 1); });
+    }
+    readDesktopNativeProject(client, request) {
+        client.outstanding++;
+        void (async () => {
+            const binding = this.nativeHistory;
+            if (!binding || !(0, native_history_1.nativeHistoryBindingSafeV1)(binding))
+                return null;
+            const reader = new native_project_snapshot_1.NativeProjectSnapshotReaderV1(binding);
+            if (request.method === "project/list" && (0, types_1.isPlainRecord)(request.params) && request.params.cursor) {
+                this.hasNativeProjectAuthority(binding.source.metadataAccountId);
+                const fingerprint = reader.fingerprint(false);
+                return fingerprint ? this.nativeProjectPages.page(null, binding.source.metadataAccountId, fingerprint, this.nativeProjectAuthorityGeneration, request.params) : null;
+            }
+            const snapshot = await this.readNativeProjectSnapshot();
+            if (!snapshot)
+                return null;
+            if (request.method === "project/list")
+                return this.nativeProjectPages.page(snapshot, snapshot.account, snapshot.fingerprint, this.nativeProjectAuthorityGeneration, request.params ?? {});
+            if (!(0, types_1.isPlainRecord)(request.params) || Object.keys(request.params).join() !== "projectId" || !validNativeProjectId(request.params.projectId))
+                return null;
+            const projectId = request.params.projectId;
+            const project = snapshot.projects.find((entry) => (0, types_1.isPlainRecord)(entry) && entry.id === projectId);
+            return project ? { project: (0, native_project_snapshot_1.nativeProjectRpcRowV1)(project, snapshot.source) } : null;
+        })().then((result) => {
+            this.sendDesktop(client, result ? { jsonrpc: "2.0", id: request.id, result }
+                : { jsonrpc: "2.0", id: request.id, error: { code: -32603, message: "Project snapshot is unavailable or stale." } });
+        }).catch(() => this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure")))
+            .finally(() => { client.outstanding = Math.max(0, client.outstanding - 1); });
     }
     /** Convert only a known logical alias back to its sealed native root. */
     nativeRootThreadId(request) {
@@ -2490,7 +3433,7 @@ class AccountsBrokerOwnerV1 {
         const conversationId = this.canonicalHistory.conversationForPublicThreadId(requested);
         if (conversationId)
             return this.canonicalHistory.rootNativeThreadId(conversationId);
-        const owner = this.store.snapshot().threadOwners[requested] ?? null;
+        const owner = this.store.ownerOf(requested) ?? null;
         const nativeConversation = owner ? this.canonicalHistory.conversationForNative(owner, requested) : null;
         return nativeConversation ? this.canonicalHistory.rootNativeThreadId(nativeConversation) : requested;
     }
@@ -2600,7 +3543,6 @@ class AccountsBrokerOwnerV1 {
             }
             catch { }
         }
-        this.broker.disconnectRenderer(client.rendererRef);
     }
     settleUncertainPending(pending) {
         if (!pending.conversationId || !pending.taskRef)
@@ -2877,7 +3819,7 @@ class AccountsBrokerOwnerV1 {
         if (!this.nativeHistory || !["thread/read", "thread/turns/list", "thread/items/list"].includes(request.method))
             return false;
         const rootThreadId = this.nativeRootThreadId(request);
-        if (!rootThreadId || !nativeProvenOwner || this.store.snapshot().threadOwners[rootThreadId] !== nativeProvenOwner
+        if (!rootThreadId || !nativeProvenOwner || this.store.ownerOf(rootThreadId) !== nativeProvenOwner
             || !this.nativeHistoryWritersSafe()) {
             this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "unknown_thread_owner"));
             return true;
@@ -3036,42 +3978,46 @@ class AccountsBrokerOwnerV1 {
     routeNativeProjectRequest(client, request) {
         if (!this.nativeHistory || !request.method.startsWith("project/"))
             return false;
+        if (!nativeProjectWriteMethod(request.method)) {
+            this.readDesktopNativeProject(client, request);
+            return true;
+        }
         const account = this.nativeHistory.source.metadataAccountId;
-        if (!this.nativeHistoryWritersSafe()) {
-            this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
+        const child = this.children.get(account);
+        if (!child?.ready || this.remoteBlocksDesktop(account) || !this.nativeHistoryWritersSafe()) {
+            this.invalidateNativeProjectAuthority(account);
+            this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "authentication_recovery_required"));
             return true;
         }
-        const child = this.broker.acquireChild(account);
-        if (!child) {
-            this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "pool_depleted"));
-            return true;
-        }
-        if (this.deferUntilChildReady(client, request, child, () => this.receiveDesktop(client, request)))
-            return true;
-        if (nativeProjectWriteMethod(request.method) && !this.nativeHistoryWritersSafe()) {
-            this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
-            return true;
-        }
-        const childId = `abp:${++this.nonce}`;
-        this.addPendingDesktop(childId, {
-            client,
-            desktopId: request.id,
-            account,
-            taskRef: null,
-            method: request.method,
-            conversationId: null,
-            logicalTurnId: null,
-            balanceReservationId: null,
-        });
-        client.outstanding += 1;
-        try {
-            child.send({ ...request, id: childId });
-        }
-        catch {
-            this.removePendingDesktop(childId);
-            client.outstanding = Math.max(0, client.outstanding - 1);
-            this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
-        }
+        client.outstanding++;
+        void this.refreshNativeProjectAuthority(account, child).then((valid) => {
+            if (!valid || this.closed || this.clients.get(client.rendererRef) !== client || this.children.get(account) !== child
+                || !child.ready || this.remoteBlocksDesktop(account) || !this.nativeHistoryWritersSafe()) {
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "authentication_recovery_required"));
+                return;
+            }
+            const childId = `abp:${++this.nonce}`;
+            this.addPendingDesktop(childId, {
+                client,
+                desktopId: request.id,
+                account,
+                taskRef: null,
+                method: request.method,
+                conversationId: null,
+                logicalTurnId: null,
+                balanceReservationId: null,
+            });
+            client.outstanding += 1;
+            try {
+                child.send({ ...request, id: childId });
+            }
+            catch {
+                this.removePendingDesktop(childId);
+                client.outstanding = Math.max(0, client.outstanding - 1);
+                this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
+            }
+        }).catch(() => this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "authentication_recovery_required")))
+            .finally(() => { client.outstanding = Math.max(0, client.outstanding - 1); });
         return true;
     }
     /** Lazily import only allowlisted project metadata before a cross-home start. */
@@ -3281,7 +4227,8 @@ class AccountsBrokerOwnerV1 {
             }
             if (project.state === "value") {
                 if (account === this.nativeHistory.source.metadataAccountId) {
-                    this.dispatchNativeLegacyProjectRows(fanout, account, request, project.projectId);
+                    void this.dispatchNativeLegacyProjectRows(fanout, account, request, project.projectId)
+                        .catch(() => this.failHistoryFanout(fanout.key, "post_start_failure"));
                     return;
                 }
                 const targetProjectId = this.nativeProjects?.projectForAccount(project.projectId, account) ?? null;
@@ -3337,15 +4284,26 @@ class AccountsBrokerOwnerV1 {
      * project filter can find them. Once the legacy page is exhausted, continue
      * with ordinary non-null native project rows under the same public cursor.
      */
-    dispatchNativeLegacyProjectRows(fanout, account, request, projectId) {
+    async dispatchNativeLegacyProjectRows(fanout, account, request, projectId) {
         const helper = this.nativeLegacyProjects;
         const input = nativeLegacyProjectListInput(request.params, projectId);
-        const ids = helper?.legacyNativeThreadIdsForProject(projectId) ?? null;
-        const state = input ? this.resolveNativeLegacyProjectListCursor(input.cursor, projectId) : null;
+        let ids = helper?.legacyNativeThreadIdsForProject(projectId) ?? null;
+        const state = input ? this.resolveNativeLegacyProjectListCursor(input.cursor, projectId, input.sortKey, input.sortDirection) : null;
         if (!this.nativeHistory || !helper || !this.nativeLegacyProjectsReady || !input || !ids || !state || !this.nativeHistoryWritersSafe()) {
             this.failHistoryFanout(fanout.key, "post_start_failure");
             return;
         }
+        if (state.legacyIds === null) {
+            state.legacyIds = ids.length <= 1 ? [...ids]
+                : await new native_project_snapshot_1.NativeProjectSnapshotReaderV1(this.nativeHistory).readThreadOrder(ids, input.sortKey, input.sortDirection);
+            if (this.pendingHistory.get(fanout.key) !== fanout)
+                return;
+            if (!state.legacyIds || !this.nativeHistoryWritersSafe()) {
+                this.failHistoryFanout(fanout.key, "post_start_failure");
+                return;
+            }
+        }
+        ids = state.legacyIds;
         const child = this.broker.acquireChild(account);
         if (!child) {
             fanout.partial = true;
@@ -3357,7 +4315,8 @@ class AccountsBrokerOwnerV1 {
             const selected = ids.slice(state.legacyOffset, Math.min(ids.length, state.legacyOffset + input.limit));
             void Promise.all(selected.map(async (threadId) => {
                 const response = await this.requestBrokerChild(account, child, "thread/read", { threadId, includeTurns: false });
-                return nativeLegacyThreadListRow(response?.error ? null : response?.result, threadId, projectId, (id) => this.nativeHistoryRowVisible(account, id));
+                return helper.legacyPublicProjectIdForThread(threadId) === projectId
+                    ? nativeLegacyThreadListRow(response?.error ? null : response?.result, threadId, projectId, (id) => this.nativeHistoryRowVisible(account, id)) : null;
             })).then((rows) => {
                 if (this.pendingHistory.get(fanout.key) !== fanout)
                     return;
@@ -3365,9 +4324,7 @@ class AccountsBrokerOwnerV1 {
                 if (accepted.length !== selected.length)
                     fanout.partial = true;
                 const nextOffset = state.legacyOffset + selected.length;
-                const nextCursor = nextOffset < ids.length
-                    ? this.createNativeLegacyProjectListCursor({ projectId, legacyOffset: nextOffset, nativeStarted: false, nativeCursor: null })
-                    : this.createNativeLegacyProjectListCursor({ projectId, legacyOffset: nextOffset, nativeStarted: false, nativeCursor: null });
+                const nextCursor = this.createNativeLegacyProjectListCursor({ ...state, legacyOffset: nextOffset, nativeStarted: false, nativeCursor: null });
                 // The final exact legacy page still needs one synthetic page to query
                 // native non-null project rows.  Its cursor is owner-private and will
                 // disappear after that native page if the provider has no next page.
@@ -3402,7 +4359,7 @@ class AccountsBrokerOwnerV1 {
                 const rows = response.result.data.flatMap((entry) => nativeNonNullProjectListRow(entry, projectId, (id) => this.nativeHistoryRowVisible(account, id)) ? [entry] : []);
                 const providerCursor = providerHistoryCursor(response.result);
                 const nextCursor = providerCursor
-                    ? this.createNativeLegacyProjectListCursor({ projectId, legacyOffset: state.legacyOffset, nativeStarted: true, nativeCursor: providerCursor })
+                    ? this.createNativeLegacyProjectListCursor({ ...state, nativeStarted: true, nativeCursor: providerCursor })
                     : null;
                 fanout.responses.push({ account, response: { jsonrpc: "2.0", id: `abh-legacy:${++this.nonce}`, result: { data: rows, nextCursor } } });
             }
@@ -3456,10 +4413,40 @@ class AccountsBrokerOwnerV1 {
             this.sendDesktop(fanout.client, (0, redaction_1.redactedRouterError)(fanout.desktopId, "unknown_thread_owner"));
             return;
         }
-        const result = mergeHistoryResponses(fanout.request.method, fanout.responses, (threadId, account) => partialNativeRead ? this.bindNativeReadHint(account, threadId) : this.bindHistoryOwnership(account, threadId), (threadId) => this.store.snapshot().threadOwners[threadId] ?? null, (account, localId) => this.nativeHistory ? this.nativeHistorySectionId(account, localId) : this.historySectionId(account, localId), this.nativeHistory !== null, this.nativeHistory ? (account, threadId) => this.nativeHistoryRowVisible(account, threadId) : undefined);
+        const newOwners = new Map();
+        const bindMergedOwner = (threadId, account) => {
+            const existing = this.store.ownerOf(threadId) ?? newOwners.get(threadId);
+            if (existing)
+                return existing === account;
+            newOwners.set(threadId, account);
+            return true;
+        };
+        const result = mergeHistoryResponses(fanout.request.method, fanout.responses, (threadId, account) => partialNativeRead ? this.bindNativeReadHint(account, threadId) : bindMergedOwner(threadId, account), (threadId) => this.store.ownerOf(threadId) ?? newOwners.get(threadId) ?? null, (account, localId) => this.nativeHistory ? this.nativeHistorySectionId(account, localId) : this.historySectionId(account, localId), this.nativeHistory !== null, this.nativeHistory ? (account, threadId) => this.nativeHistoryRowVisible(account, threadId) : undefined);
         if (result === null) {
             this.sendDesktop(fanout.client, (0, redaction_1.redactedRouterError)(fanout.desktopId, "unknown_thread_owner"));
             return;
+        }
+        if (newOwners.size > 0) {
+            try {
+                this.store.update((state) => {
+                    for (const [threadId, account] of newOwners) {
+                        if (state.threadOwners[threadId] && state.threadOwners[threadId] !== account)
+                            throw new Error("history owner collision");
+                        if (state.threadOwners[threadId])
+                            continue;
+                        const ledger = state.ledger[account];
+                        if (!ledger)
+                            throw new Error("history ledger account unavailable");
+                        state.threadOwners[threadId] = account;
+                        ledger.assignedThreadCount += 1;
+                    }
+                });
+                this.syncBrokerAssignedTaskCounts();
+            }
+            catch {
+                this.sendDesktop(fanout.client, (0, redaction_1.redactedRouterError)(fanout.desktopId, "unknown_thread_owner"));
+                return;
+            }
         }
         if (fanout.request.method === "thread/list" && (0, types_1.isPlainRecord)(fanout.request.params)
             && typeof fanout.request.params.sectionId === "string" && fanout.request.params.sortKey === "section_position"
@@ -3646,15 +4633,15 @@ class AccountsBrokerOwnerV1 {
             this.nativeMergedCursors.delete(this.nativeMergedCursors.keys().next().value);
         return id;
     }
-    resolveNativeLegacyProjectListCursor(cursor, projectId) {
+    resolveNativeLegacyProjectListCursor(cursor, projectId, sortKey, sortDirection) {
         if (cursor === null)
-            return { expiresAt: Date.now() + HISTORY_CURSOR_TTL_MS, projectId, legacyOffset: 0, nativeStarted: false, nativeCursor: null };
+            return { expiresAt: Date.now() + HISTORY_CURSOR_TTL_MS, projectId, legacyOffset: 0, nativeStarted: false, nativeCursor: null, legacyIds: null, sortKey, sortDirection };
         const state = this.nativeLegacyProjectListCursors.get(cursor);
         if (!state || state.expiresAt <= Date.now()) {
             this.nativeLegacyProjectListCursors.delete(cursor);
             return null;
         }
-        if (state.projectId !== projectId)
+        if (state.projectId !== projectId || state.sortKey !== sortKey || state.sortDirection !== sortDirection)
             return null;
         return { ...state };
     }
@@ -3672,7 +4659,7 @@ class AccountsBrokerOwnerV1 {
     accountForRequest(message) {
         const threadId = (0, protocol_1.threadIdFrom)(message.params);
         if (threadId)
-            return this.store.snapshot().threadOwners[threadId] ?? null;
+            return this.store.ownerOf(threadId) ?? null;
         if (this.nativeHistory && OWNERLESS_NATIVE_THREAD_READ_METHODS.has(message.method))
             return this.config.primaryOpaqueAccountId;
         // Native mode has no implicit source-owner fallback for task mutations.
@@ -3683,7 +4670,7 @@ class AccountsBrokerOwnerV1 {
         if (message.method === "thread/start") {
             // Manual keeps an exact primary route. Quota readings remain visible but
             // never become an implicit substitute selection.
-            if (this.config.mode === "manual")
+            if (this.config.mode === "manual" || this.routingSuspended())
                 return this.config.primaryOpaqueAccountId;
             if (this.isTokenBalancingEnabled()) {
                 if (this.balanceConfiguredAccounts().length !== 2)
@@ -3722,6 +4709,49 @@ class AccountsBrokerOwnerV1 {
         }
         return this.config.primaryOpaqueAccountId;
     }
+    catalogCapacityLevel = "ok";
+    /** The session catalog has a hard thread cap; say so before it silently stops. */
+    reportCatalogCapacity(result) {
+        const capacity = result.capacity;
+        if (!capacity || !(capacity.max > 0))
+            return;
+        const ratio = capacity.threads / capacity.max;
+        const level = result.state === "unavailable" && result.reason === "threads_catalog_capacity" ? "full"
+            : ratio >= 0.95 ? "critical" : ratio >= 0.8 ? "high" : "ok";
+        if (level === this.catalogCapacityLevel)
+            return;
+        this.catalogCapacityLevel = level;
+        if (level === "ok")
+            return;
+        const message = level === "full"
+            ? `Session catalog is full (${capacity.threads}/${capacity.max}); new sessions are no longer shared.`
+            : `Session catalog is ${Math.round(ratio * 100)}% full (${capacity.threads}/${capacity.max}).`;
+        try {
+            process.stderr.write(`[Tweakers Accounts] ${message}\n`);
+        }
+        catch { /* diagnostics only */ }
+    }
+    routingSuspendedCache = null;
+    /**
+     * Local projects and sessions are shared history, not an Accounts feature,
+     * so the broker keeps serving them when the Accounts tweak is off. The tweak
+     * toggle only controls automatic routing between subscriptions; the desktop
+     * main process publishes that choice as a marker file in the broker root.
+     */
+    routingSuspended() {
+        const now = Date.now();
+        if (this.routingSuspendedCache && now - this.routingSuspendedCache.checkedAt < 2_000)
+            return this.routingSuspendedCache.value;
+        let value = false;
+        try {
+            value = (0, node_fs_1.existsSync)((0, node_path_1.join)(this.stateRoot, exports.ACCOUNTS_ROUTING_SUSPENDED_FILE));
+        }
+        catch {
+            value = false;
+        }
+        this.routingSuspendedCache = { checkedAt: now, value };
+        return value;
+    }
     accountNeedsContinuationHandoff(account) {
         const pool = this.broker.pool().accounts.find((candidate) => candidate.opaqueAccountId === account);
         const quota = this.broker.quota().find((candidate) => candidate.opaqueAccountId === account);
@@ -3729,6 +4759,10 @@ class AccountsBrokerOwnerV1 {
             || !hasFreshPositiveQuota(quota);
     }
     selectContinuationTarget(exclude) {
+        // With the Accounts tweak off, a conversation never moves between
+        // subscriptions automatically; it behaves like a single-account desktop.
+        if (this.routingSuspended())
+            return null;
         if (this.isTokenBalancingEnabled()) {
             const eligible = this.eligibleAutomaticAccounts(exclude);
             return this.tokenBalance.choose(eligible)?.opaqueAccountId ?? null;
@@ -3747,7 +4781,7 @@ class AccountsBrokerOwnerV1 {
      * compaction, realtime, and a small difference never churn ownership.
      */
     shouldProposeBalanceHandoff(account, request, conversationId) {
-        if (!this.isTokenBalancingEnabled() || request.method !== "turn/start" || !conversationId
+        if (this.routingSuspended() || !this.isTokenBalancingEnabled() || request.method !== "turn/start" || !conversationId
             || this.canonicalHistory.hasActiveTurn(conversationId))
             return false;
         const configured = this.balanceConfiguredAccounts();
@@ -3769,7 +4803,7 @@ class AccountsBrokerOwnerV1 {
     /** Persist sticky ownership discovered during a merged read without making
      * the reading desktop the reverse app-tools owner of somebody else's task. */
     bindHistoryOwnership(account, threadId) {
-        const current = this.store.snapshot().threadOwners[threadId];
+        const current = this.store.ownerOf(threadId);
         if (current)
             return current === account;
         try {
@@ -3792,7 +4826,7 @@ class AccountsBrokerOwnerV1 {
         }
     }
     ensureTask(client, account, threadId) {
-        const current = this.store.snapshot().threadOwners[threadId];
+        const current = this.store.ownerOf(threadId);
         if (current && current !== account)
             return null;
         if (!current) {
@@ -3852,7 +4886,7 @@ class AccountsBrokerOwnerV1 {
         const root = this.canonicalHistory.rootNativeThreadId(conversationId);
         if (!root)
             return null;
-        const owner = this.store.snapshot().threadOwners[root];
+        const owner = this.store.ownerOf(root);
         return owner && this.canonicalHistory.conversationForNative(owner, root) === conversationId ? root : null;
     }
     conversationForTask(taskRef) {
@@ -3965,22 +4999,413 @@ class AccountsBrokerOwnerV1 {
         });
     }
     /** Binding drift blocks new dispatch; a foreign thread never terminates unrelated work. */
+    /**
+     * The patched backend validates a reserved bundled marketplace source
+     * against its overlay root, but the desktop stages that folder under its own
+     * CODEX_HOME. Mirror the desktop's staged folder into the overlay's managed
+     * location and point the request there, so `openai-bundled` registers
+     * without changing the backend. Anything else passes through unchanged.
+     */
+    stageSharedBundledMarketplace(request, account) {
+        if (!(0, types_1.isPlainRecord)(request.params) || typeof request.params.source !== "string")
+            return request;
+        const mode = this.sharedNativeMode();
+        if (mode?.state !== "ready" || mode.document.resolverProtocol !== "shared-native-overlay-v1")
+            return request;
+        const overlay = mode.document.overlay.path;
+        const roots = [this.nativeAccountBinding(account)?.codexHome, mode.document.nativeBase.path]
+            .filter((root) => typeof root === "string" && (0, node_path_1.isAbsolute)(root));
+        const source = (0, node_path_1.resolve)(request.params.source);
+        const managed = roots.map((root) => (0, node_path_1.join)(root, ".tmp", "bundled-marketplaces"))
+            .find((parent) => (0, node_path_1.dirname)(source) === parent);
+        const name = managed ? source.slice(managed.length + 1) : "";
+        if (!managed || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(name))
+            return request;
+        const target = (0, node_path_1.join)(overlay, ".tmp", "bundled-marketplaces", name);
+        const accountHome = this.nativeAccountBinding(account)?.codexHome;
+        if (accountHome)
+            this.mirrorInheritedBundledPlugins(name, mode.document.nativeBase.path, accountHome);
+        if (target === source)
+            return request;
+        try {
+            const stat = (0, node_fs_1.lstatSync)(source);
+            if (!stat.isDirectory() || stat.isSymbolicLink())
+                return request;
+            (0, node_fs_1.mkdirSync)((0, node_path_1.dirname)(target), { recursive: true, mode: 0o700 });
+            const staging = `${target}.staging-${process.pid}-${(0, node_crypto_1.randomBytes)(6).toString("hex")}`;
+            (0, node_fs_1.cpSync)(source, staging, { recursive: true, dereference: false, verbatimSymlinks: true, errorOnExist: true, force: false });
+            (0, node_fs_1.rmSync)(target, { recursive: true, force: true });
+            (0, node_fs_1.renameSync)(staging, target);
+        }
+        catch {
+            // Leave the original request intact; the backend reports its own error.
+            return request;
+        }
+        return { ...request, params: { ...request.params, source: target } };
+    }
+    /**
+     * In shared mode the backend reports bundled plugins inherited from the
+     * native base as current and skips installing them, but the desktop reads
+     * plugin files straight from its own CODEX_HOME plugin cache. Copy any
+     * inherited version the account home lacks (and point its `latest` link at
+     * the copy) so both sides see the same files. Never touches the native base.
+     */
+    mirrorInheritedBundledPlugins(marketplace, nativeBase, accountHome) {
+        const sourceRoot = (0, node_path_1.join)(nativeBase, "plugins", "cache", marketplace);
+        const targetRoot = (0, node_path_1.join)(accountHome, "plugins", "cache", marketplace);
+        if (!(0, node_path_1.isAbsolute)(nativeBase) || !(0, node_path_1.isAbsolute)(accountHome) || (0, node_path_1.resolve)(sourceRoot) === (0, node_path_1.resolve)(targetRoot))
+            return;
+        let plugins;
+        try {
+            plugins = (0, node_fs_1.readdirSync)(sourceRoot);
+        }
+        catch {
+            return;
+        }
+        const safe = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+        for (const plugin of plugins) {
+            if (!safe.test(plugin))
+                continue;
+            const pluginSource = (0, node_path_1.join)(sourceRoot, plugin), pluginTarget = (0, node_path_1.join)(targetRoot, plugin);
+            try {
+                if (!(0, node_fs_1.lstatSync)(pluginSource).isDirectory())
+                    continue;
+                for (const version of (0, node_fs_1.readdirSync)(pluginSource)) {
+                    if (!safe.test(version) || version === "latest")
+                        continue;
+                    const versionSource = (0, node_path_1.join)(pluginSource, version), versionTarget = (0, node_path_1.join)(pluginTarget, version);
+                    const stat = (0, node_fs_1.lstatSync)(versionSource);
+                    if (!stat.isDirectory() || stat.isSymbolicLink() || (0, node_fs_1.existsSync)(versionTarget))
+                        continue;
+                    (0, node_fs_1.mkdirSync)(pluginTarget, { recursive: true, mode: 0o755 });
+                    const staging = `${versionTarget}.staging-${process.pid}-${(0, node_crypto_1.randomBytes)(6).toString("hex")}`;
+                    (0, node_fs_1.cpSync)(versionSource, staging, { recursive: true, dereference: false, verbatimSymlinks: true, errorOnExist: true, force: false });
+                    (0, node_fs_1.renameSync)(staging, versionTarget);
+                }
+                // Mirror the native `latest` choice, re-pointed at the account's own copy.
+                const latestSource = (0, node_path_1.join)(pluginSource, "latest");
+                let chosen = null;
+                try {
+                    chosen = (0, node_fs_1.readlinkSync)(latestSource).split("/").pop() ?? null;
+                }
+                catch {
+                    chosen = null;
+                }
+                if (chosen && safe.test(chosen) && (0, node_fs_1.existsSync)((0, node_path_1.join)(pluginTarget, chosen))) {
+                    const latestTarget = (0, node_path_1.join)(pluginTarget, "latest");
+                    let current = null;
+                    try {
+                        current = (0, node_fs_1.readlinkSync)(latestTarget);
+                    }
+                    catch {
+                        current = null;
+                    }
+                    if (current !== (0, node_path_1.join)(pluginTarget, chosen)) {
+                        const temporary = `${latestTarget}.staging-${process.pid}-${(0, node_crypto_1.randomBytes)(6).toString("hex")}`;
+                        (0, node_fs_1.symlinkSync)((0, node_path_1.join)(pluginTarget, chosen), temporary);
+                        (0, node_fs_1.renameSync)(temporary, latestTarget);
+                    }
+                }
+            }
+            catch { /* Best effort per plugin; the desktop reports what is still missing. */ }
+        }
+    }
     nativeAccountBinding(account) {
         return this.nativeHistory?.accounts.find((entry) => entry.opaqueAccountId === account) ?? null;
     }
     nativeHistoryWritersSafe() {
         return !this.nativeHistory || (0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory);
     }
-    sharedNativeMode() {
+    sharedNativeMode(preparingAccount) {
         return this.nativeHistory
-            ? (0, shared_native_mode_1.readSharedNativeModeV1)({ stateRoot: this.stateRoot, binding: this.nativeHistory, secret: this.secret })
+            ? (0, shared_native_mode_1.readSharedNativeModeV1)({ stateRoot: this.stateRoot, binding: this.nativeHistory, secret: this.secret }, preparingAccount ? {
+                account: preparingAccount, permitsPendingIntent: () => this.officialPluginLedger?.ownsPendingProjection(this.stateRoot, preparingAccount) === true,
+            } : undefined)
             : null;
+    }
+    officialNativeMode() {
+        const mode = this.sharedNativeMode();
+        return mode?.state === "ready" && mode.document.resolverProtocol === "official-bundled-v1" ? mode : null;
+    }
+    officialExecutionHome(account) {
+        let home;
+        try {
+            home = this.isolatedAuthHome(account);
+        }
+        catch {
+            throw new Error("stock account child held: existing signed account execution-home is missing or invalid");
+        }
+        if (!home || !(0, official_bundled_adapter_1.officialOwnedAccountHomeV1)(this.stateRoot, account, home)) {
+            throw new Error("stock account child held: existing signed account execution-home is missing or invalid");
+        }
+        if (!this.nativeHistory || !(0, native_history_1.nativeHistoryBindingSafeV1)(this.nativeHistory)
+            || this.nativeHistory.accounts.some(entry => [entry.codexHome, entry.sqliteHome].some(root => home === root || home.startsWith(root + "/") || root.startsWith(home + "/")))) {
+            throw new Error("stock account execution-home must be disjoint from native history roots");
+        }
+        return home;
+    }
+    officialAccountInventory(account) {
+        const binding = this.nativeInventoryBinding(), entry = this.nativeAccountBinding(account);
+        if (!binding || binding.mode.document.resolverProtocol !== "official-bundled-v1" || !entry)
+            return null;
+        const inventory = this.cachedNativeInventory(binding);
+        if (!inventory)
+            return null;
+        try {
+            return { inventory, binding, entry, home: this.officialExecutionHome(account) };
+        }
+        catch {
+            return null;
+        }
+    }
+    officialAccountPlan(account) {
+        const shared = this.officialAccountInventory(account);
+        if (!shared)
+            return null;
+        const { inventory, binding, entry, home } = shared;
+        try {
+            return { inventory, plan: (0, official_bundled_adapter_1.officialBundledAccountPlanV1)({ sourceHome: binding.mode.document.nativeBase.path,
+                    accountHome: home, settingsHome: entry.codexHome, args: this.args, inventory, localLibrary: true,
+                    withheldPlugins: this.officialPluginLedgerModeFingerprint === binding.mode.fingerprint ? this.officialPluginGeneration?.withheldPlugins : undefined }) };
+        }
+        catch {
+            return null;
+        }
+    }
+    officialPluginSession(account, preparing = false) {
+        const candidate = preparing ? this.sharedNativeMode(account) : this.sharedNativeMode();
+        const mode = candidate?.state === "ready" && candidate.document.resolverProtocol === "official-bundled-v1" ? candidate : null, entry = this.nativeAccountBinding(account), nonce = this.officialPluginSessionNonces.get(account);
+        if (this.closed || !mode || !entry || !nonce || !this.nativeHistoryWritersSafe())
+            return null;
+        try {
+            this.officialExecutionHome(account);
+        }
+        catch {
+            return null;
+        }
+        const service = this.officialPluginServices.get(account), bound = service && this.officialPluginServiceChildren.get(service);
+        if (bound && this.children.get(account) !== bound)
+            return null;
+        return { actor: account, authIdentity: entry.authIdentityHmac, stamp: `${account}:${entry.authIdentityHmac}:${nonce}:${mode.fingerprint}` };
+    }
+    officialPluginUpstream(account) {
+        const home = this.officialExecutionHome(account);
+        const tree = (0, node_fs_1.existsSync)((0, node_path_1.join)(home, "config.toml")) ? (0, account_continuity_1.readLosslessTomlDocument)((0, node_path_1.join)(home, "config.toml")).tree : {};
+        let value = tree.chatgpt_base_url;
+        for (let index = 0; index < this.args.length; index++) {
+            const arg = this.args[index];
+            const assignment = arg === "-c" || arg === "--config" ? this.args[++index] : arg.startsWith("--config=") ? arg.slice(9) : undefined;
+            if (assignment)
+                value = (0, account_continuity_1.parseLosslessTomlDocument)(assignment + "\n").tree.chatgpt_base_url ?? value;
+        }
+        const base = value && "type" in value && value.type === "string" ? value.value : "https://chatgpt.com/backend-api";
+        const url = new URL(base);
+        if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !["/backend-api", "/backend-api/"].includes(url.pathname))
+            throw new Error("Stock plugin service origin is incompatible");
+        return base;
+    }
+    /** Async admission preparation does not start an account child or touch native files. */
+    prepareOfficialPluginServices() {
+        if (this.officialPluginPreparation)
+            return this.officialPluginPreparation;
+        const work = this.prepareOfficialPluginServicesNow();
+        this.officialPluginPreparation = work;
+        void work.finally(() => { if (this.officialPluginPreparation === work)
+            this.officialPluginPreparation = null; }).catch(() => { });
+        return work;
+    }
+    async ensureOfficialPluginLedger() {
+        const mode = this.officialNativeMode();
+        if (!mode || this.closed)
+            return null;
+        const source = this.nativeAccountBinding(mode.document.sourceAccountId);
+        if (!source)
+            return null;
+        const ledgerRoot = (0, official_bundled_adapter_1.officialPluginLedgerRootV1)(mode.document.overlay.path, mode.fingerprint);
+        if (this.officialPluginLedger && this.officialPluginLedgerModeFingerprint !== mode.fingerprint) {
+            if (this.children.size || this.activeAuthHelpers.size)
+                return null;
+            const released = await Promise.all([...this.officialPluginServices.values()].map(service => service.close()));
+            if (released.some(value => !value))
+                return null;
+            this.officialPluginServices.clear();
+            this.officialPluginLedger.close();
+            this.officialPluginLedger = null;
+            this.officialPluginGeneration = null;
+        }
+        const ledger = this.officialPluginLedger ?? new shared_plugin_ledger_1.SharedPluginLedgerStoreV1({ root: ledgerRoot, sourceHome: mode.document.nativeBase.path, secret: this.secret,
+            authority: { sourceAccountId: source.opaqueAccountId, sourceRootIdentity: durableDigest(mode.document.nativeBase.identity), modeFingerprint: mode.fingerprint }, localLibrary: true });
+        this.officialPluginLedger = ledger;
+        this.officialPluginLedgerModeFingerprint = mode.fingerprint;
+        return ledger;
+    }
+    async prepareOfficialPluginServicesNow() {
+        const ledger = await this.ensureOfficialPluginLedger();
+        const mode = this.officialNativeMode();
+        if (!ledger || !mode || this.closed || this.officialPluginLedgerModeFingerprint !== mode.fingerprint) {
+            this.reportAdmissionFailure("ledger-unavailable");
+            return;
+        }
+        const source = this.nativeAccountBinding(mode.document.sourceAccountId);
+        if (!source) {
+            this.reportAdmissionFailure("ledger-source");
+            return;
+        }
+        const sourceSession = () => !this.closed && this.officialNativeMode()?.fingerprint === mode.fingerprint
+            && this.nativeHistoryWritersSafe() ? { actor: source.opaqueAccountId, authIdentity: source.authIdentityHmac, stamp: `${mode.fingerprint}:${source.authIdentityHmac}` } : null;
+        try {
+            if (!this.officialPluginGeneration || !ledger.verifyGeneration(this.officialPluginGeneration.fingerprint))
+                this.officialPluginGeneration = await (0, official_plugin_service_controller_1.hydrateOfficialSharedPluginLedgerV1)({ ledger, sourceHome: mode.document.nativeBase.path, session: sourceSession,
+                    authorize: () => sourceSession() !== null, localLibrary: true,
+                    readProvider: (path, query, signal) => (0, official_plugin_provider_read_1.readOfficialPluginProviderV1)({ upstreamBaseUrl: "https://chatgpt.com/backend-api", path, query, signal,
+                        credentials: () => (0, native_auth_binding_1.readNativeExternalTokensV1)(mode.document.nativeBase.path, source, this.secret) }) });
+        }
+        catch {
+            this.reportAdmissionFailure("ledger-hydration");
+            return;
+        }
+        for (const configured of this.config.accounts) {
+            const account = configured.opaqueAccountId;
+            if (!configured.included || this.closed || this.children.has(account) || this.activeAuthHelpers.has(account))
+                continue;
+            const prior = this.officialPluginServices.get(account);
+            if (prior?.verify())
+                continue;
+            if (prior && !await prior.close())
+                continue;
+            this.officialPluginServices.delete(account);
+            this.officialPluginSessionNonces.set(account, (0, node_crypto_1.randomBytes)(24).toString("hex"));
+            let admissionStage = "account-plan";
+            try {
+                const entry = this.nativeAccountBinding(account), home = this.officialExecutionHome(account), shared = this.officialAccountPlan(account);
+                if (!entry || !shared) {
+                    this.reportAdmissionFailure("account-plan");
+                    continue;
+                }
+                if (!this.officialPluginSession(account)) {
+                    this.reportAdmissionFailure("account-session");
+                    continue;
+                }
+                admissionStage = "service-create";
+                const root = (0, node_path_1.join)(this.stateRoot, "accounts", account, "plugin-service");
+                if (!(0, node_fs_1.existsSync)(root))
+                    (0, node_fs_1.mkdirSync)(root, { mode: 0o700 });
+                const upstream = this.officialPluginUpstream(account);
+                const credentials = () => (0, native_auth_binding_1.readNativeExternalTokensV1)(home, entry, this.secret);
+                const service = await (0, official_plugin_service_controller_1.prepareOfficialPluginAccountServiceV1)({ root, upstreamBaseUrl: upstream, ledger,
+                    session: () => this.officialPluginSession(account),
+                    preparationSession: () => this.officialPluginSession(account, true),
+                    readProvider: (path, query, signal) => (0, official_plugin_provider_read_1.readOfficialPluginProviderV1)({ upstreamBaseUrl: upstream, path, query, signal, credentials }),
+                    authorizeHeaders: headers => { try {
+                        return (0, official_plugin_provider_read_1.officialPluginAuthorizationMatchesV1)(headers, credentials());
+                    }
+                    catch {
+                        return false;
+                    } },
+                    policy: id => this.officialAccountPlan(account)?.plan.sourceEnablement[id] ?? false });
+                if (this.closed || !service.verify() || this.children.has(account)) {
+                    this.reportAdmissionFailure("service-final-authority");
+                    await service.close();
+                    continue;
+                }
+                this.officialPluginServices.set(account, service);
+            }
+            catch {
+                this.reportAdmissionFailure(admissionStage); /* Other accounts remain usable. */
+            }
+        }
+    }
+    officialNativeMutationAllowed(account, method, params) {
+        const mode = this.officialNativeMode();
+        if (!mode)
+            return true;
+        if ((0, official_bundled_adapter_1.officialFollowNativePluginMutationV1)(method, params))
+            return false;
+        if (["thread/start", "thread/resume", "thread/fork"].includes(method) && !(0, official_bundled_adapter_1.officialThreadPluginConfigAllowedV1)(params))
+            return false;
+        if (method === "config/value/write" || method === "config/batchWrite") {
+            try {
+                if (!(0, official_bundled_adapter_1.officialOwnedConfigMutationAllowedV1)(method, params, this.officialExecutionHome(account)))
+                    return false;
+            }
+            catch {
+                return false;
+            }
+        }
+        if (account === mode.document.sourceAccountId && ["account/login/start", "account/login/cancel", "account/logout"].includes(method))
+            return false;
+        if (method === "mcpServer/oauth/login") {
+            const shared = this.officialAccountPlan(account);
+            if (!shared || !(0, types_1.isPlainRecord)(params) || typeof params.name !== "string")
+                return false;
+            return shared.plan.oauthIsolation === "file" && [...this.connectionTargets.values()].some(target => target.opaqueAccountId === account && target.kind === "mcp" && target.name === params.name);
+        }
+        return true;
+    }
+    officialThreadParams(account, method, params) {
+        if (!["thread/start", "thread/resume", "thread/fork"].includes(method) || !this.officialNativeMode())
+            return params;
+        const shared = this.officialAccountPlan(account);
+        if (!shared)
+            throw new Error("stock source plugin inventory unavailable");
+        const desktop = (0, types_1.isPlainRecord)(params) && (0, types_1.isPlainRecord)(params.config) ? this.officialDesktopConfigs.get(params.config) : undefined;
+        if (desktop && (this.clients.get(desktop.client.rendererRef) !== desktop.client || (desktop.client.desktopAppTools ?? null) !== desktop.context)) {
+            throw new Error("Desktop tool binding changed");
+        }
+        const mapped = (0, official_bundled_adapter_1.officialThreadPluginParamsV1)(params, shared.plan, shared.inventory, this.officialExecutionHome(account), desktop?.native);
+        const service = this.officialPluginServices.get(account);
+        if (!service?.verify())
+            throw new Error("Shared plugin account service unavailable");
+        const config = desktop ? (0, official_bundled_adapter_1.officialDesktopAppToolsConfigV1)(mapped.config, desktop.context, false) : mapped.config;
+        return { ...mapped, config: { ...((0, types_1.isPlainRecord)(config) ? config : {}), chatgpt_base_url: service.baseUrl } };
+    }
+    officialPluginParams(account, method, params) {
+        if (method === "plugin/list" && (0, types_1.isPlainRecord)(params)) {
+            const { tweakersRuntimeOwnership: _ownership, ...stock } = params;
+            params = stock;
+        }
+        if (!this.officialNativeMode())
+            return params;
+        // officialThreadParams performs this translation once after policy checks.
+        if (["thread/start", "thread/resume", "thread/fork"].includes(method))
+            return params;
+        const shared = this.officialAccountInventory(account);
+        if (!shared)
+            throw new Error("Shared plugin request authority unavailable");
+        return (0, official_bundled_adapter_1.officialExecutionPluginParamsV1)(method, params, shared.inventory, shared.home);
+    }
+    officialPluginResponse(account, method, value, runtimeOwnershipRequested = false) {
+        // This reserved policy descriptor is broker-owned, never provider-supplied.
+        if (method === "plugin/list" && (0, types_1.isPlainRecord)(value)) {
+            const { tweakersPluginOwnership: _ownership, ...stock } = value;
+            value = stock;
+        }
+        if (!this.officialNativeMode() || !["plugin/installed", "plugin/list", "plugin/read", "skills/list", "hooks/list", "config/read"].includes(method))
+            return value;
+        const shared = ["plugin/installed", "plugin/list"].includes(method) ? this.officialAccountPlan(account) : this.officialAccountInventory(account);
+        if (!shared)
+            throw new Error("Shared plugin response authority unavailable");
+        const result = (0, official_bundled_adapter_1.officialCanonicalPluginResponseV1)(value, shared.inventory, method, "plan" in shared ? shared.plan : undefined);
+        if (method !== "plugin/list" || !runtimeOwnershipRequested)
+            return result;
+        const service = this.officialPluginServices.get(account), child = this.children.get(account);
+        if (!(0, types_1.isPlainRecord)(result) || !child?.ready || !service?.verify() || this.officialPluginServiceChildren.get(service) !== child
+            || !this.officialPluginLedger || this.officialPluginGeneration?.fingerprint !== service.ledgerFingerprint)
+            throw new Error("Native runtime plugin ownership unavailable");
+        const home = this.officialExecutionHome(account);
+        const plugins = this.officialPluginLedger.verifyAccountProjection({ stateRoot: this.stateRoot, account, home,
+            ids: ["documents", "pdf", "presentations", "spreadsheets", "template-creator"].map(name => `${name}@openai-primary-runtime`) });
+        if (!service.verify() || this.children.get(account) !== child || !child.ready)
+            throw new Error("Native runtime plugin ownership changed");
+        return { ...result, tweakersPluginOwnership: { version: 1, policy: "follow-native", home, plugins } };
     }
     nativeAccountOperationSafe(account, child) {
         if (!this.nativeHistory)
             return true;
         if (this.children.get(account) !== child || typeof child.pid !== "number")
             return false;
+        if (this.officialNativeMode())
+            return (0, native_history_1.observeNativeExecutionHomeOperationWritersV1)(this.nativeHistory, account, child.pid).ok;
         return (0, native_history_1.observeNativeAccountOperationWritersV1)(this.nativeHistory, account, child.pid).ok;
     }
     nativeThreadConflict(threadId) {
@@ -3990,13 +5415,58 @@ class AccountsBrokerOwnerV1 {
             return "conflict";
         return (0, native_history_1.observeNativeThreadWriterV1)(this.nativeHistory, threadId, this.nativeOwnedPids()).state;
     }
+    /** Share only simultaneous observations; never authorize from a completed cached clearance. */
+    async nativeThreadConflictAsync(threadId) {
+        const binding = this.nativeHistory;
+        if (!binding)
+            return "clear";
+        if (this.nativeTransfer?.hasPendingSourceRetirement(threadId))
+            return "conflict";
+        const ownedPids = this.nativeOwnedPids().sort((left, right) => left - right);
+        const key = `${threadId}:${ownedPids.join(",")}`;
+        let flight = this.nativeThreadChecks.get(key);
+        if (!flight || flight.binding !== binding) {
+            const check = (0, native_history_1.observeNativeThreadWritersV1)(binding, [threadId], ownedPids).then((observed) => observed.get(threadId)?.state ?? "unknown");
+            flight = { binding, check };
+            this.nativeThreadChecks.set(key, flight);
+            void check.finally(() => { if (this.nativeThreadChecks.get(key)?.check === check)
+                this.nativeThreadChecks.delete(key); });
+        }
+        const result = await flight.check;
+        if (this.closed || this.nativeHistory !== binding || !(0, native_history_1.nativeHistoryBindingSafeV1)(binding)
+            || this.nativeOwnedPids().sort((left, right) => left - right).join(",") !== ownedPids.join(","))
+            return "unknown";
+        if (this.nativeTransfer?.hasPendingSourceRetirement(threadId))
+            return "conflict";
+        return result;
+    }
     /** Synchronous account lease: no callback can interleave capture, preparation and spawn. */
     prepareAccountContinuity(account, codexHome, captureOnly = false) {
         const mode = this.sharedNativeMode();
         if (mode?.state === "blocked")
             return false;
         if (mode?.state === "ready") {
-            if (this.nativeAccountBinding(account)?.codexHome !== codexHome)
+            if (mode.document.resolverProtocol === "official-bundled-v1") {
+                try {
+                    if (this.officialExecutionHome(account) !== codexHome)
+                        return false;
+                    if (!captureOnly) {
+                        const shared = this.officialAccountPlan(account);
+                        if (!shared || this.children.has(account) || this.activeAuthHelpers.has(account)
+                            || [...this.enrollmentHelpers.values()].some(helper => helper.opaqueAccountId === account))
+                            return false;
+                        if (!this.officialPluginLedger || !this.officialPluginServices.get(account)?.verify())
+                            return false;
+                        this.officialPluginLedger.project({ stateRoot: this.stateRoot, account: { opaqueAccountId: account, codexHome },
+                            authorize: () => !this.closed && !this.children.has(account) && this.officialPluginServices.get(account)?.verify() === true,
+                            writeEvidence: { accountChildAbsent: true } });
+                    }
+                }
+                catch {
+                    return false;
+                }
+            }
+            else if (this.nativeAccountBinding(account)?.codexHome !== codexHome)
                 return false;
             this.nativeContinuityDeferred.delete(account);
             this.nativeContinuityReasons.delete(account);
@@ -4160,12 +5630,12 @@ class AccountsBrokerOwnerV1 {
         else if (params.sectionId !== null)
             return null;
         if (typeof params.beforeThreadId === "string") {
-            const beforeOwner = this.store.snapshot().threadOwners[params.beforeThreadId] ?? this.nativeReadHint(params.beforeThreadId);
+            const beforeOwner = this.store.ownerOf(params.beforeThreadId) ?? this.nativeReadHint(params.beforeThreadId);
             if (beforeOwner !== account) {
                 const localSection = typeof params.sectionId === "string" ? params.sectionId : null;
                 const order = localSection ? this.store.snapshot().nativeSectionOrders?.[this.nativeSectionOrderKey(localSection)] ?? [] : [];
                 const start = order.indexOf(params.beforeThreadId);
-                params.beforeThreadId = start < 0 ? null : order.slice(start + 1).find((threadId) => (this.store.snapshot().threadOwners[threadId] ?? this.nativeReadHint(threadId)) === account) ?? null;
+                params.beforeThreadId = start < 0 ? null : order.slice(start + 1).find((threadId) => (this.store.ownerOf(threadId) ?? this.nativeReadHint(threadId)) === account) ?? null;
             }
         }
         else if (params.beforeThreadId !== undefined && params.beforeThreadId !== null)
@@ -4233,6 +5703,8 @@ class AccountsBrokerOwnerV1 {
         });
     }
     async warmEnabledChildren() {
+        if (this.officialNativeMode() && !await this.ensureNativePluginInventory())
+            return;
         const accounts = this.config.accounts.filter((account) => account.included).map((account) => account.opaqueAccountId);
         for (let offset = 0; offset < accounts.length; offset += 4) {
             await Promise.allSettled(accounts.slice(offset, offset + 4).map(async (account) => {
@@ -4243,15 +5715,20 @@ class AccountsBrokerOwnerV1 {
         }
     }
     broadcastFeatureEnablement(client, request) {
-        if (!(0, types_1.isPlainRecord)(request.params) || typeof request.params.feature !== "string" || request.params.feature.length === 0
+        if (!(0, types_1.isPlainRecord)(request.params) || Object.keys(request.params).length !== 1 || !Object.hasOwn(request.params, "enablement")
+            || !(0, types_1.isPlainRecord)(request.params.enablement) || Object.values(request.params.enablement).some(value => typeof value !== "boolean")
             || Buffer.byteLength(JSON.stringify(request.params), "utf8") > 65_536) {
             this.sendDesktop(client, (0, redaction_1.redactedRouterError)(request.id, "invalid_correlation"));
             return;
         }
-        const feature = request.params.feature;
         const params = JSON.parse(JSON.stringify(request.params));
         client.outstanding += 1;
         const operation = this.featureBroadcastTail.then(async () => {
+            if (Object.keys(params.enablement).length === 0) {
+                this.sendDesktop(client, { jsonrpc: "2.0", id: request.id, result: { enablement: {} } });
+                return;
+            }
+            this.modelCatalogs.invalidate();
             const responses = [];
             let failures = 0;
             const accounts = this.config.accounts.filter((account) => account.included).map((account) => account.opaqueAccountId);
@@ -4272,8 +5749,13 @@ class AccountsBrokerOwnerV1 {
             }
             // Retain the requested state even when a peer fails. Its next readiness
             // check must retry this state, and newly started children must receive it.
-            this.featureEnablements.set(feature, params);
+            // Public maps are partial updates: omitted features keep their prior values.
+            // Singleton replay maps retain the last requested value even after peer failure.
+            for (const [feature, enabled] of Object.entries(params.enablement)) {
+                this.featureEnablements.set(feature, { enablement: { [feature]: enabled } });
+            }
             this.featureRevision += 1;
+            this.modelCatalogs.invalidate();
             for (const { account, child } of responses) {
                 if (this.children.get(account) === child)
                     this.childFeatureRevision.set(child, this.featureRevision);
@@ -4292,14 +5774,15 @@ class AccountsBrokerOwnerV1 {
         }).finally(() => { client.outstanding = Math.max(0, client.outstanding - 1); });
     }
     deferForModelCatalog(client, request) {
-        if (this.modelCheckedRequests.has(request) || !["thread/start", "turn/start", "thread/settings/update"].includes(request.method))
+        const revision = this.modelCatalogs.revision;
+        if (this.modelCheckedRequests.get(request) === revision || !["thread/start", "turn/start", "thread/settings/update"].includes(request.method))
             return false;
         const model = (0, models_1.requestedModelFromParamsV1)(request.params);
         if (!model) {
-            this.modelCheckedRequests.add(request);
+            this.modelCheckedRequests.set(request, revision);
             return false;
         }
-        this.modelCheckedRequests.add(request);
+        this.modelCheckedRequests.set(request, revision);
         client.outstanding += 1;
         const accounts = this.config.accounts.filter((account) => account.included).map((account) => account.opaqueAccountId);
         void this.modelCatalogs.support(model, accounts).then((support) => {
@@ -4313,17 +5796,33 @@ class AccountsBrokerOwnerV1 {
         }).finally(() => { client.outstanding = Math.max(0, client.outstanding - 1); });
         return true;
     }
+    retryInvalidatedModelCatalog(client, request, capacityKey) {
+        if (!["thread/start", "turn/start", "thread/settings/update"].includes(request.method)
+            || !(0, models_1.requestedModelFromParamsV1)(request.params)
+            || this.modelCheckedRequests.get(request) === this.modelCatalogs.revision)
+            return false;
+        this.modelEligibleRequests.delete(request);
+        this.receiveDesktop(client, request, capacityKey);
+        return true;
+    }
     async readAccountModels(account) {
+        if (this.officialNativeMode() && !await this.ensureNativePluginInventory())
+            throw new Error("stock source inventory unavailable");
         const child = this.broker.acquireChild(account);
         if (!child || !await this.initializeChild(child))
             throw new Error("model catalog unavailable");
+        requireAuthenticatedProvider(await this.requestBrokerChild(account, child, "account/read", { refreshToken: false }));
+        const revision = this.modelCatalogs.revision;
         const data = [];
         const seen = new Set();
         let cursor = null;
         let bytes = 0;
         for (let page = 0; page < 64; page += 1) {
-            const response = await this.requestBrokerChild(account, child, "model/list", cursor === null ? {} : { cursor });
-            if (!response || response.error || !(0, types_1.isPlainRecord)(response.result) || !Array.isArray(response.result.data))
+            // Picker visibility is not account support. Native desktop lookups also
+            // include hidden presets when resolving an existing or selected model.
+            const response = await this.requestBrokerChild(account, child, "model/list", { includeHidden: true, cursor, limit: 100 });
+            if (this.children.get(account) !== child || !child.ready || revision !== this.modelCatalogs.revision
+                || !response || response.error || !(0, types_1.isPlainRecord)(response.result) || !Array.isArray(response.result.data))
                 throw new Error("model catalog unavailable");
             bytes += Buffer.byteLength(JSON.stringify(response.result), "utf8");
             if (bytes > 2 * 1024 * 1024 || data.length + response.result.data.length > 10_000)
@@ -4380,10 +5879,14 @@ class AccountsBrokerOwnerV1 {
     authHelperQueued = new Map();
     activeAuthHelpers = new Map();
     authRefreshes = new Map();
-    async withAuthHelper(account, operation) {
+    async withAuthHelper(account, operation, context) {
         const home = this.isolatedAuthHome(account);
-        const initialization = this.desktopInitialization;
-        if (!home || !initialization || this.closed)
+        const initialization = context ?? this.desktopInitialization;
+        const current = () => !this.closed && (!context || context.isCurrent()) && this.isolatedAuthHome(account) === home;
+        if (!home || !initialization || !current())
+            return null;
+        const preparingChild = this.children.get(account);
+        if (preparingChild && (!await preparingChild.whenPrepared() || this.children.get(account) !== preparingChild || !current()))
             return null;
         const queued = this.authHelperQueued.get(account) ?? 0;
         if (queued >= 8 || [...this.enrollmentHelpers.values()].some((helper) => helper.opaqueAccountId === account && helper.isolatedReconnect))
@@ -4406,26 +5909,42 @@ class AccountsBrokerOwnerV1 {
                 clearTimeout(queueTimer);
             if (!admitted)
                 throw new NativeAuthHelperBusyError();
-            if (this.closed || this.isolatedAuthHome(account) !== home)
+            if (!current())
                 return null;
-            const helper = new BrokerProcessChild(account, (0, node_child_process_1.spawn)(this.command, credentialStoreArgs(this.args, "file"), {
+            // A failed teardown releases the request queue, but not the writer.
+            // Reconcile that exact owner before another helper can replace it.
+            const retained = this.activeAuthHelpers.get(account);
+            if (retained) {
+                if (!await retained.terminateAndWait())
+                    throw new NativeAuthHelperBusyError();
+                if (this.activeAuthHelpers.get(account) !== retained)
+                    throw new NativeAuthHelperBusyError();
+                this.activeAuthHelpers.delete(account);
+                if (!current())
+                    return null;
+            }
+            const helper = new BrokerProcessChild(account, (0, node_child_process_1.spawn)(this.command, isolatedAuthHelperArgs(this.args, Boolean(this.officialNativeMode())), {
                 cwd: home, env: brokerChildEnvironment(home, home), stdio: ["pipe", "pipe", "ignore"],
             }), () => { }, () => { });
             this.activeAuthHelpers.set(account, helper);
             const timer = setTimeout(() => { void helper.terminateAndWait(); }, 25_000);
             timer.unref();
             try {
-                if (!await helper.initialize(initialization.params, initialization.client) || this.isolatedAuthHome(account) !== home || this.closed)
-                    return null;
-                return await operation(helper, home);
+                if (!await helper.initialize(initialization.params, initialization.client))
+                    throw new NativeAccountProbeError(helper.initializationFailure ?? "connection");
+                if (!current())
+                    throw new NativeAccountProbeError("unavailable");
+                const result = await operation(helper, home);
+                if (!current())
+                    throw new NativeAccountProbeError("unavailable");
+                return result;
             }
-            catch {
-                return null;
+            catch (error) {
+                throw error instanceof NativeAccountProbeError || error instanceof NativeAuthHelperBusyError ? error : new NativeAccountProbeError("unavailable");
             }
             finally {
                 clearTimeout(timer);
-                await helper.terminateAndWait();
-                if (this.activeAuthHelpers.get(account) === helper)
+                if (await helper.terminateAndWait() && this.activeAuthHelpers.get(account) === helper)
                     this.activeAuthHelpers.delete(account);
             }
         }
@@ -4442,105 +5961,244 @@ class AccountsBrokerOwnerV1 {
                 this.authHelperTails.delete(account); });
         }
     }
-    refreshIsolatedAuth(account) {
+    refreshIsolatedAuth(account, context) {
         const existing = this.authRefreshes.get(account);
         if (existing)
             return existing;
+        this.modelCatalogs.invalidate(account);
         const pending = this.withAuthHelper(account, async (helper, home) => {
             const entry = this.nativeAccountBinding(account);
             if (!entry)
                 return null;
-            (0, native_auth_binding_1.readNativeExternalTokensV1)(home, entry, this.secret);
+            try {
+                (0, native_auth_binding_1.readNativeExternalTokensV1)(home, entry, this.secret);
+            }
+            catch {
+                throw new NativeAccountProbeError("authentication");
+            }
             const response = await helper.requestPrivate("account/read", { refreshToken: true });
-            if (!response || response.error || !providerAuthenticated(response.result) || this.isolatedAuthHome(account) !== home)
-                return null;
+            requireAuthenticatedProvider(response);
+            if (this.isolatedAuthHome(account) !== home)
+                throw new NativeAccountProbeError("unavailable");
             return (0, native_auth_binding_1.readNativeExternalTokensV1)(home, entry, this.secret);
-        }).catch((error) => { if (error instanceof NativeAuthHelperBusyError)
-            throw error; return null; });
+        }, context);
         this.authRefreshes.set(account, pending);
-        const cleanup = () => { if (this.authRefreshes.get(account) === pending)
-            this.authRefreshes.delete(account); };
+        const cleanup = () => {
+            if (this.authRefreshes.get(account) === pending) {
+                this.authRefreshes.delete(account);
+                this.modelCatalogs.invalidate(account);
+            }
+        };
         void pending.then(cleanup, cleanup);
         return pending;
     }
     createChild(account) {
-        if (this.nativeTransferHeldAccounts.has(account))
-            throw new Error("native account writer handoff in progress");
-        const existing = this.children.get(account);
-        if (existing)
-            return existing;
-        const nativeSource = this.nativeHistory ? this.nativeAccountBinding(account) : null;
-        if (this.nativeHistory && (!nativeSource || !this.nativeHistoryWritersSafe())) {
-            throw new Error("accounts broker refused child with native history writer conflict");
-        }
-        // Recheck the sealed shared source and every included account copy at the
-        // final child-spawn boundary. A mismatch is never repaired in place: that
-        // would silently overwrite account-local evidence.
-        if (!nativeSource && !(0, app_server_mux_1.preflightRouterHomes)(this.config, this.stateRoot)) {
-            throw new Error("accounts broker refused child with invalid shared Skills/plugins materialization");
-        }
-        const accountRoot = (0, node_path_1.join)(this.stateRoot, "accounts", account);
-        const codexHome = nativeSource?.codexHome ?? (0, node_path_1.join)(accountRoot, "codex-home");
-        const sqliteHome = nativeSource?.sqliteHome ?? (0, node_path_1.join)(accountRoot, "sqlite-home");
-        if (!this.prepareAccountContinuity(account, codexHome)) {
-            throw new Error("accounts broker refused child with unresolved account continuity");
-        }
-        // In-place native homes retain their own existing plugin/Skill state. The
-        // old generated shared-plugin override belongs only to adopted homes.
-        const authHome = this.isolatedAuthHome(account);
-        const childArgs = nativeSource ? authHome ? credentialStoreArgs(this.args, "ephemeral") : this.args : (0, app_server_mux_1.sharedPluginChildArgs)(this.stateRoot, this.args);
-        if (!childArgs)
-            throw new Error("accounts broker refused child with invalid shared plugin enablement");
-        const mode = this.sharedNativeMode();
-        if (mode?.state === "blocked")
-            throw new Error("accounts broker refused unresolved shared native mode");
-        if (mode?.state === "ready") {
-            const binary = (0, node_fs_1.lstatSync)(this.command);
-            if (!binary.isFile() || binary.isSymbolicLink()
-                || (0, node_crypto_1.createHash)("sha256").update((0, node_fs_1.readFileSync)(this.command)).digest("hex") !== mode.document.resolverBinarySha256) {
-                throw new Error("accounts broker refused unverified shared native resolver binary");
+        let admissionStage = "factory-handoff";
+        try {
+            if (this.nativeTransferHeldAccounts.has(account))
+                throw new Error("native account writer handoff in progress");
+            const existing = this.children.get(account);
+            if (existing)
+                return existing;
+            admissionStage = "factory-native-binding";
+            const nativeSource = this.nativeHistory ? this.nativeAccountBinding(account) : null;
+            const stockMode = this.officialNativeMode();
+            admissionStage = "factory-execution-home";
+            const stockExecutionHome = stockMode ? this.officialExecutionHome(account) : null;
+            admissionStage = "factory-service";
+            const stockService = stockMode ? this.officialPluginServices.get(account) : null;
+            if (stockMode && (!stockService?.verify() || !this.officialPluginLedger))
+                throw new Error(official_bundled_adapter_1.OFFICIAL_BUNDLED_PLUGIN_ADMISSION_HOLD_V1);
+            admissionStage = "factory-history";
+            if (this.nativeHistory && (!nativeSource || !this.nativeHistoryWritersSafe())) {
+                throw new Error("accounts broker refused child with native history writer conflict");
             }
+            // Recheck the sealed shared source and every included account copy at the
+            // final child-spawn boundary. A mismatch is never repaired in place: that
+            // would silently overwrite account-local evidence.
+            admissionStage = "factory-continuity";
+            if (!nativeSource && !(0, app_server_mux_1.preflightRouterHomes)(this.config, this.stateRoot)) {
+                throw new Error("accounts broker refused child with invalid shared Skills/plugins materialization");
+            }
+            const accountRoot = (0, node_path_1.join)(this.stateRoot, "accounts", account);
+            const codexHome = stockExecutionHome ?? nativeSource?.codexHome ?? (0, node_path_1.join)(accountRoot, "codex-home");
+            const sqliteHome = nativeSource?.sqliteHome ?? (0, node_path_1.join)(accountRoot, "sqlite-home");
+            if (!stockMode && !this.prepareAccountContinuity(account, codexHome)) {
+                throw new Error("accounts broker refused child with unresolved account continuity");
+            }
+            // In-place native homes retain their own existing plugin/Skill state. The
+            // old generated shared-plugin override belongs only to adopted homes.
+            admissionStage = "factory-arguments";
+            const authHome = this.isolatedAuthHome(account);
+            let childArgs = nativeSource ? authHome ? credentialStoreArgs(this.args, "ephemeral") : this.args : (0, app_server_mux_1.sharedPluginChildArgs)(this.stateRoot, this.args);
+            if (!childArgs)
+                throw new Error("accounts broker refused child with invalid shared plugin enablement");
+            admissionStage = "factory-mode";
+            const mode = this.sharedNativeMode();
+            if (mode?.state === "blocked")
+                throw new Error("accounts broker refused unresolved shared native mode");
+            if (mode?.state === "ready" && mode.document.resolverProtocol === "official-bundled-v1" && codexHome !== mode.document.nativeBase.path) {
+                admissionStage = "factory-plan";
+                const shared = this.officialAccountPlan(account);
+                if (!shared)
+                    throw new Error("stock source plugin inventory unavailable");
+                childArgs = (0, official_bundled_adapter_1.officialBundledAccountPlanV1)({ sourceHome: mode.document.nativeBase.path, accountHome: codexHome, settingsHome: nativeSource.codexHome, args: childArgs, inventory: shared.inventory, localLibrary: true }).args;
+                childArgs = [...childArgs, "-c", `chatgpt_base_url=${JSON.stringify(stockService.baseUrl)}`];
+            }
+            if (mode?.state === "ready") {
+                admissionStage = "factory-resolver";
+                const binary = (0, node_fs_1.lstatSync)(this.command);
+                if (!binary.isFile() || binary.isSymbolicLink()
+                    || (0, node_crypto_1.createHash)("sha256").update((0, node_fs_1.readFileSync)(this.command)).digest("hex") !== mode.document.resolverBinarySha256) {
+                    throw new Error("accounts broker refused unverified shared native resolver binary");
+                }
+            }
+            admissionStage = "factory-child";
+            const recoveryRevision = this.broker.accountRecoveryRevision(account);
+            const spawnProcess = () => (0, node_child_process_1.spawn)(this.command, childArgs, {
+                cwd: process.cwd(),
+                env: { ...brokerChildEnvironment(codexHome, sqliteHome), ...(mode?.state === "ready" ? mode.environment : {}), ...(stockService?.childEnvironment ?? {}) },
+                stdio: ["pipe", "pipe", "ignore"],
+            });
+            const ledger = this.officialPluginLedger;
+            const transferAuthority = stockMode ? this.nativeTransferSpawnAuthority.get(account) : undefined;
+            const priorAuthTail = stockMode ? this.authHelperTails.get(account) : undefined;
+            const prepareProcess = async () => {
+                let stage = "prior-auth", authorityFailure;
+                try {
+                    // Existing helpers finish first. New helpers await this placeholder's preparation.
+                    if (priorAuthTail)
+                        await priorAuthTail;
+                    const current = () => {
+                        const failure = this.closed || !child.preparationCurrent || child.pid !== undefined ? "child-session"
+                            : child.initializationClient && this.clients.get(child.initializationClient.rendererRef) !== child.initializationClient ? "client-session"
+                                : !(transferAuthority ? transferAuthority() : !this.nativeTransferHeldAccounts.has(account)) ? "handoff"
+                                    : this.children.get(account) !== child || this.officialPluginLedger !== ledger || this.officialPluginServices.get(account) !== stockService ? "ledger-service"
+                                        : (stockService?.verifyPreparation ?? stockService?.verify)?.() !== true ? "service-invalid"
+                                            : this.officialExecutionHome(account) !== codexHome || this.isolatedAuthHome(account) !== authHome || this.nativeAccountBinding(account)?.authIdentityHmac !== nativeSource?.authIdentityHmac ? "home-auth"
+                                                : this.activeAuthHelpers.has(account) || [...this.enrollmentHelpers.values()].some(helper => helper.opaqueAccountId === account) ? "helper-busy"
+                                                    : !this.config.accounts.some(entry => entry.included && entry.opaqueAccountId === account) ? "account-excluded" : undefined;
+                        if (failure && !authorityFailure)
+                            authorityFailure = failure;
+                        return failure === undefined;
+                    };
+                    stage = "parent-admission";
+                    if (!ledger || !current())
+                        throw new Error("accounts broker projection authority changed");
+                    await ledger.projectAsync({ stateRoot: this.stateRoot, account: { opaqueAccountId: account, codexHome },
+                        writeEvidence: { accountChildAbsent: true }, authorize: current });
+                    stage = "post-projection";
+                    if (stockService?.verify() !== true) {
+                        authorityFailure ??= "service-invalid";
+                        throw new Error("accounts broker strict plugin service authority changed");
+                    }
+                    if (!current() || !this.nativeHistoryWritersSafe()
+                        || this.broker.accountRecoveryRevision(account) !== recoveryRevision
+                        || this.sharedNativeMode()?.state !== "ready")
+                        throw new Error("accounts broker preparation authority changed");
+                    stage = "resolver-binary";
+                    const binary = (0, node_fs_1.lstatSync)(this.command);
+                    if (!binary.isFile() || binary.isSymbolicLink() || mode?.state !== "ready"
+                        || (0, node_crypto_1.createHash)("sha256").update((0, node_fs_1.readFileSync)(this.command)).digest("hex") !== mode.document.resolverBinarySha256)
+                        throw new Error("accounts broker resolver changed during preparation");
+                    stage = "spawn";
+                    return spawnProcess();
+                }
+                catch (error) {
+                    child.preparationFailureStage = authorityFailure ?? (0, shared_plugin_ledger_1.sharedPreparationStageV1)(error?.preparationStage) ?? stage;
+                    throw error;
+                }
+            };
+            const child = new BrokerProcessChild(account, stockMode ? prepareProcess : spawnProcess(), (message) => this.receiveChild(account, child, message), (expectedTermination, ownershipRetained) => {
+                if (this.children.get(account) === child)
+                    this.modelCatalogs.invalidate(account);
+                if (this.nativeProjectAuthorities.get(account)?.child === child || this.children.get(account) === child)
+                    this.invalidateNativeProjectAuthority(account, child);
+                if (!ownershipRetained && this.children.get(account) === child)
+                    this.children.delete(account);
+                if (!ownershipRetained && stockService && this.officialPluginServices.get(account) === stockService) {
+                    void stockService.close().then(closed => {
+                        if (closed && this.officialPluginServices.get(account) === stockService)
+                            this.officialPluginServices.delete(account);
+                        if (closed && !this.closed)
+                            void this.prepareOfficialPluginServices();
+                    });
+                }
+                // Capture closed-child edits without rewriting the home. If a foreign
+                // native writer has appeared, the next idle spawn boundary retries.
+                if (!ownershipRetained)
+                    this.prepareAccountContinuity(account, codexHome, true);
+                // A child can disappear after a request has crossed the write
+                // boundary but before its response or terminal notification.  Do not
+                // leave either the desktop request or the canonical writer lease
+                // hanging: settle that uncertain work exactly once and make it
+                // visibly ambiguous.  `expectedTermination` is used for ordinary
+                // idle/shutdown rotation too; in that case there should be no pending
+                // request, and this idempotent cleanup is a no-op.
+                this.failPendingForChild(account, child);
+                // Capacity/idle/shutdown eviction is normal pool rotation, not an
+                // account-health failure. Only an unsolicited child exit makes that
+                // account unavailable for future work.
+                if (!expectedTermination)
+                    this.broker.retireFailedChild(account, child, recoveryRevision);
+            }, authHome ? async (candidate, initialization) => {
+                const current = () => initialization.isCurrent() && this.children.get(account) === candidate
+                    && this.isolatedAuthHome(account) === authHome
+                    && this.nativeAccountBinding(account)?.authIdentityHmac === nativeSource?.authIdentityHmac;
+                if (!current() || !nativeSource)
+                    throw new NativeAccountProbeError("unavailable");
+                if (stockService) {
+                    const effective = await candidate.requestPrivate("config/read", { includeLayers: true });
+                    if (!stockService.verify() || !effective || effective.error || !(0, official_plugin_service_controller_1.officialPluginEffectiveConfigMatchesV1)(effective.result, stockService.baseUrl))
+                        throw new NativeAccountProbeError("unavailable");
+                }
+                // Quota reads do not trigger external-auth refresh on 401. Renew in
+                // the isolated file store before startup, otherwise an expired access
+                // token can make this account unavailable before its first turn.
+                const tokens = await this.refreshIsolatedAuth(account, { ...initialization, isCurrent: current });
+                if (!tokens || !current())
+                    throw new NativeAccountProbeError("unavailable");
+                const login = await candidate.requestPrivate("account/login/start", { type: "chatgptAuthTokens", ...tokens });
+                if (!login || login.error)
+                    throw new NativeAccountProbeError(login ? providerAccountFailure(login) : "connection");
+                const read = await candidate.requestPrivate("account/read", { refreshToken: false });
+                requireAuthenticatedProvider(read);
+                if (stockService) {
+                    // Workspace discovery can introduce managed layers after login.
+                    // Recheck before exposing this child or any plugin-capable thread.
+                    const effective = await candidate.requestPrivate("config/read", { includeLayers: true });
+                    if (!stockService.verify() || !effective || effective.error || !(0, official_plugin_service_controller_1.officialPluginEffectiveConfigMatchesV1)(effective.result, stockService.baseUrl))
+                        throw new NativeAccountProbeError("unavailable");
+                }
+                if (!current())
+                    throw new NativeAccountProbeError("unavailable");
+                return true;
+            } : undefined, (code) => {
+                if (this.children.get(account) === child
+                    && ["authentication_failed", "transport_failed", "child_exited", "protocol_error"].includes(code))
+                    this.modelCatalogs.invalidate(account);
+                if (code === "ready" && this.nativeHistory)
+                    queueMicrotask(() => { void this.refreshNativeProjectAuthority(account, child); });
+                else if (["authentication_failed", "transport_failed", "child_exited", "protocol_error"].includes(code)
+                    && (this.children.get(account) === child || this.nativeProjectAuthorities.get(account)?.child === child))
+                    this.invalidateNativeProjectAuthority(account, child);
+                this.reportStartup("child", code, child.preparationFailureStage);
+                if (code === "authentication_failed")
+                    this.broker.retireFailedChild(account, child, recoveryRevision, "authentication");
+                else if (["initialize_timeout", "transport_failed", "child_exited"].includes(code))
+                    this.broker.retireFailedChild(account, child, recoveryRevision, "connection");
+                else if (code === "protocol_error")
+                    this.broker.retireFailedChild(account, child, recoveryRevision, "unavailable");
+            });
+            this.children.set(account, child);
+            if (stockService)
+                this.officialPluginServiceChildren.set(stockService, child);
+            return child;
         }
-        const childProcess = (0, node_child_process_1.spawn)(this.command, childArgs, {
-            cwd: process.cwd(),
-            env: { ...brokerChildEnvironment(codexHome, sqliteHome), ...(mode?.state === "ready" ? mode.environment : {}) },
-            stdio: ["pipe", "pipe", "ignore"],
-        });
-        const child = new BrokerProcessChild(account, childProcess, (message) => this.receiveChild(account, child, message), (expectedTermination) => {
-            this.children.delete(account);
-            // Capture closed-child edits without rewriting the home. If a foreign
-            // native writer has appeared, the next idle spawn boundary retries.
-            this.prepareAccountContinuity(account, codexHome, true);
-            // A child can disappear after a request has crossed the write
-            // boundary but before its response or terminal notification.  Do not
-            // leave either the desktop request or the canonical writer lease
-            // hanging: settle that uncertain work exactly once and make it
-            // visibly ambiguous.  `expectedTermination` is used for ordinary
-            // idle/shutdown rotation too; in that case there should be no pending
-            // request, and this idempotent cleanup is a no-op.
-            this.failPendingForChild(account, child);
-            // Capacity/idle/shutdown eviction is normal pool rotation, not an
-            // account-health failure. Only an unsolicited child exit makes that
-            // account unavailable for future work.
-            if (!expectedTermination)
-                this.broker.markChildUnavailable(account);
-        }, authHome ? async (candidate) => {
-            if (this.isolatedAuthHome(account) !== authHome || !nativeSource)
-                return false;
-            // Quota reads do not trigger external-auth refresh on 401. Renew in
-            // the isolated file store before startup, otherwise an expired access
-            // token can make this account unavailable before its first turn.
-            const tokens = await this.refreshIsolatedAuth(account);
-            if (!tokens || this.isolatedAuthHome(account) !== authHome)
-                return false;
-            const login = await candidate.requestPrivate("account/login/start", { type: "chatgptAuthTokens", ...tokens });
-            if (!login || login.error)
-                return false;
-            const read = await candidate.requestPrivate("account/read", { refreshToken: false });
-            return !!read && !read.error && providerAuthenticated(read.result) && this.isolatedAuthHome(account) === authHome;
-        } : undefined);
-        this.children.set(account, child);
-        return child;
+        catch (error) {
+            this.reportAdmissionFailure(admissionStage);
+            throw error;
+        }
     }
     /**
      * Child-process failure is an uncertain transport outcome for anything
@@ -4551,7 +6209,7 @@ class AccountsBrokerOwnerV1 {
      */
     failPendingForChild(account, child) {
         for (const [id, pending] of [...this.pendingBrokerChild]) {
-            if (pending.account !== account)
+            if (pending.account !== account || pending.child !== child)
                 continue;
             this.pendingBrokerChild.delete(id);
             clearTimeout(pending.timer);
@@ -4592,7 +6250,7 @@ class AccountsBrokerOwnerV1 {
                 return;
             if (typeof message.id === "string") {
                 const pending = this.pendingBrokerChild.get(message.id);
-                if (pending && pending.account === account) {
+                if (pending && pending.account === account && pending.child === child && this.isRegisteredRequestChild(account, child)) {
                     this.pendingBrokerChild.delete(message.id);
                     clearTimeout(pending.timer);
                     pending.resolve(message);
@@ -4608,7 +6266,7 @@ class AccountsBrokerOwnerV1 {
         }
         if (this.captureEnrollmentNotification(account, message))
             return;
-        this.routeChildNotification(account, message);
+        this.routeChildNotification(account, message, child);
     }
     captureEnrollmentNotification(account, message) {
         if (!(0, protocol_1.isNotification)(message) || message.method !== "account/login/completed" || !(0, types_1.isPlainRecord)(message.params)
@@ -4687,6 +6345,7 @@ class AccountsBrokerOwnerV1 {
                     (0, node_fs_1.closeSync)(fd);
                 }
                 helper.completion = { success: true };
+                this.modelCatalogs.invalidate(account);
                 // Existing external-auth child may hold old in-memory access tokens.
                 // It refreshes through the same isolated helper on the next 401.
             }
@@ -4704,7 +6363,7 @@ class AccountsBrokerOwnerV1 {
             await helper.child.terminateAndWait();
         }
     }
-    resolveDesktopResponse(account, _child, response) {
+    resolveDesktopResponse(account, child, response) {
         if (typeof response.id !== "string")
             return;
         const pending = this.pendingDesktop.get(response.id);
@@ -4759,6 +6418,8 @@ class AccountsBrokerOwnerV1 {
         }
         const threadId = (0, protocol_1.threadIdFrom)(response.result);
         if (["thread/start", "thread/fork", "thread/resume", "thread/unarchive"].includes(pending.method) && threadId) {
+            if (!response.error && ["thread/start", "thread/fork", "thread/resume"].includes(pending.method))
+                this.recordThreadAppToolsBinding(child, threadId, pending.client, pending.desktopThreadParams);
             if (pending.method === "thread/start")
                 this.seedProvenNewThreadBalance(account, threadId);
             this.ensureTask(pending.client, account, threadId);
@@ -4774,8 +6435,15 @@ class AccountsBrokerOwnerV1 {
         const logicalResponse = wireThreadId
             ? this.nativeHistory ? withNativeResponseThreadId(response, wireThreadId) : withResponseThreadId(response, wireThreadId)
             : response;
-        const projectedResponse = this.nativeHistory ? this.withNativeHistoryProjectIds(account, logicalResponse) : logicalResponse;
-        this.sendDesktop(pending.client, { ...projectedResponse, id: pending.desktopId });
+        let terminalResponse;
+        try {
+            const projectedResponse = this.nativeHistory ? this.withNativeHistoryProjectIds(account, logicalResponse) : logicalResponse;
+            terminalResponse = { ...projectedResponse, ...(!projectedResponse.error ? { result: this.officialPluginResponse(account, pending.method, projectedResponse.result, pending.nativeRuntimeOwnershipRequested) } : {}), id: pending.desktopId };
+        }
+        catch {
+            terminalResponse = (0, redaction_1.redactedRouterError)(pending.desktopId, "post_start_failure");
+        }
+        this.sendDesktop(pending.client, terminalResponse);
     }
     /** Removes the one terminal watchdog retained after a turn/start acknowledgement. */
     settleTerminalTurn(account, taskRef) {
@@ -4792,9 +6460,10 @@ class AccountsBrokerOwnerV1 {
     }
     routeChildRequest(account, child, request) {
         if (request.method === "account/chatgptAuthTokens/refresh") {
+            const observation = { child, recoveryRevision: this.broker.accountRecoveryRevision(account) };
             const requests = this.pendingAuthRefreshRequests.get(child) ?? new Set();
             if (requests.has(request.id) || requests.size >= 8) {
-                this.broker.markChildUnavailable(account);
+                this.broker.markChildUnavailable(account, "connection", observation);
                 child.terminate("capacity");
                 return;
             }
@@ -4814,13 +6483,14 @@ class AccountsBrokerOwnerV1 {
                             throw new Error("unavailable");
                     }
                     const tokens = await this.refreshIsolatedAuth(account);
-                    if (!tokens || this.children.get(account) !== child)
+                    if (!tokens || this.children.get(account) !== child
+                        || this.broker.accountRecoveryRevision(account) !== observation.recoveryRevision)
                         throw new Error("unavailable");
                     child.send({ jsonrpc: "2.0", id: request.id, result: tokens });
                 }
                 catch (error) {
                     if (!(error instanceof NativeAuthHelperBusyError))
-                        this.broker.markChildUnavailable(account);
+                        this.broker.markChildUnavailable(account, error instanceof NativeAccountProbeError ? error.errorCode : "connection", observation);
                     try {
                         child.send((0, redaction_1.redactedRouterError)(request.id, "post_start_failure"));
                     }
@@ -4852,7 +6522,10 @@ class AccountsBrokerOwnerV1 {
         const taskRef = this.taskRefsByThread.get(threadId);
         const route = taskRef ? this.broker.routeAppTools(taskRef) : null;
         const client = route ? this.clients.get(route.ownerRendererRef) ?? null : null;
-        if (!client || route?.appToolsRef !== client.appToolsRef) {
+        const binding = this.threadAppToolsBindings.get(child)?.get(threadId);
+        if (!client || route?.appToolsRef !== client.appToolsRef
+            || this.children.get(account) !== child || this.store.ownerOf(threadId) !== account
+            || (client.desktopAppTools && binding !== desktopAppToolsBinding(client.desktopAppTools))) {
             try {
                 child.send((0, redaction_1.redactedRouterError)(request.id, "unknown_thread_owner"));
             }
@@ -4879,7 +6552,32 @@ class AccountsBrokerOwnerV1 {
         }
         catch { }
     }
-    routeChildNotification(account, notification) {
+    routeChildNotification(account, notification, sourceChild) {
+        if (this.children.get(account) === sourceChild && (0, protocol_1.isNotification)(notification)
+            && notification.method === "thread/status/changed" && (0, types_1.isPlainRecord)(notification.params)) {
+            const id = (0, protocol_1.threadIdFrom)(notification.params);
+            const observation = id ? this.appToolsRebindObservations.get(sourceChild)?.get(id) : null;
+            const status = notification.params.status;
+            if (observation && (0, types_1.isPlainRecord)(status)) {
+                if (status.type === "notLoaded") {
+                    observation.unloaded = true;
+                    observation.idle = false;
+                }
+                else if (status.type === "idle" && observation.unloaded)
+                    observation.idle = true;
+            }
+        }
+        if ((0, protocol_1.isNotification)(notification) && notification.method === "account/updated") {
+            if (this.children.get(account) !== sourceChild)
+                return;
+            this.modelCatalogs.invalidate(account);
+            if (this.nativeHistory) {
+                this.invalidateNativeProjectAuthority(account, sourceChild);
+                const child = this.children.get(account);
+                if (child?.ready)
+                    void this.refreshNativeProjectAuthority(account, child);
+            }
+        }
         if ((0, protocol_1.isNotification)(notification) && notification.method === "account/rateLimits/updated") {
             const quota = providerQuotaProjection(notification.params);
             if (quota)
@@ -4898,6 +6596,10 @@ class AccountsBrokerOwnerV1 {
             const projectId = nativeProjectChangedId(notification.params);
             if (!projectId)
                 return;
+            this.nativeProjectPages.clear();
+            this.nativeLegacyProjectsReady = false;
+            for (const client of this.clients.values())
+                this.sendDesktop(client, { jsonrpc: "2.0", method: "tweakers/desktopProjects/changed", params: { version: 1, authorityGeneration: this.nativeProjectAuthorityGeneration } });
             const publicNotification = this.withNativePublicProjectIdsNotification(account, notification);
             for (const client of this.clients.values())
                 this.sendDesktop(client, publicNotification);
@@ -4910,12 +6612,12 @@ class AccountsBrokerOwnerV1 {
             // error, timeout, or guessed response shape.
             const update = nativeThreadProjectUpdate(notification.params);
             const legacyProjectId = update ? this.nativeLegacyProjects.legacyPublicProjectIdForThread(update.threadId) : null;
-            if (update && legacyProjectId && update.projectId !== legacyProjectId && this.nativeHistoryWritersSafe()) {
+            if (update && legacyProjectId && update.projectId !== legacyProjectId && this.hasNativeProjectAuthority(account) && this.nativeHistoryWritersSafe()) {
                 this.nativeLegacyProjects.removeThreadFromProject(legacyProjectId, update.threadId);
             }
         }
         const threadId = (0, protocol_1.threadIdFrom)((0, protocol_1.isNotification)(notification) ? notification.params : undefined);
-        if (!threadId || this.store.snapshot().threadOwners[threadId] !== account)
+        if (!threadId || this.store.ownerOf(threadId) !== account)
             return;
         const taskRef = this.taskRefsByThread.get(threadId);
         const route = taskRef ? this.broker.routeAppTools(taskRef) : null;
@@ -4970,7 +6672,7 @@ class AccountsBrokerOwnerV1 {
                 this.canonicalHistory.markIncomplete(conversationId, account, threadId);
                 this.publishConversation(conversationId);
             }
-            if (taskRef)
+            if (taskRef && !this.appToolsRebindingTasks.has(taskRef))
                 this.broker.finishRun(taskRef);
         }
         if (!client)
@@ -4994,11 +6696,14 @@ class AccountsBrokerOwnerV1 {
         if (!transfer || !threadId || !held || !isJsonRpcMessage(delivery.continuation) || !(0, protocol_1.isRequest)(delivery.continuation)
             || delivery.continuation.method !== "turn/start" || this.remoteBlocksDesktop(delivery.toOpaqueAccountId)
             || this.remoteBlocksDesktop(delivery.fromOpaqueAccountId) || this.canonicalHistory.hasActiveTurn(delivery.conversationId)
-            || this.store.snapshot().threadOwners[threadId] !== delivery.fromOpaqueAccountId)
+            || this.store.ownerOf(threadId) !== delivery.fromOpaqueAccountId)
             return "rejected";
         const input = portableTurnStartInput(delivery.continuation.params);
         if (input.kind !== "portable")
             return "linked_continuation_required";
+        const capturedResume = this.desktopThreadParams(held.client, threadId, { threadId, excludeTurns: true });
+        if (!capturedResume)
+            return "rejected";
         if (!hasFreshPositiveQuota(this.broker.quota().find((quota) => quota.opaqueAccountId === delivery.toOpaqueAccountId)))
             return "rejected";
         const targetSchemaChild = this.broker.acquireChild(delivery.toOpaqueAccountId);
@@ -5031,8 +6736,17 @@ class AccountsBrokerOwnerV1 {
             // JS ownership is synchronous across this exact remove/acquire pair. The
             // new child is the only writer admitted after preparation.
             this.nativeTransferHeldAccounts.delete(delivery.toOpaqueAccountId);
-            const target = this.broker.acquireChild(delivery.toOpaqueAccountId);
-            this.nativeTransferHeldAccounts.add(delivery.toOpaqueAccountId);
+            this.nativeTransferSpawnAuthority.set(delivery.toOpaqueAccountId, () => this.nativeTransfer === transfer
+                && this.heldDesktopContinuations.get(delivery.handoffRef) === held && preparedOperationId === prepared.operationId
+                && this.clients.get(held.client.rendererRef) === held.client);
+            let target;
+            try {
+                target = this.broker.acquireChild(delivery.toOpaqueAccountId);
+            }
+            finally {
+                this.nativeTransferSpawnAuthority.delete(delivery.toOpaqueAccountId);
+                this.nativeTransferHeldAccounts.add(delivery.toOpaqueAccountId);
+            }
             if (!target || !await this.initializeChild(target))
                 return "rejected";
             const targetBeforeResume = await this.loadedNativeThreads(delivery.toOpaqueAccountId);
@@ -5040,7 +6754,7 @@ class AccountsBrokerOwnerV1 {
                 return "rejected";
             if (!await transfer.revalidatePrepared(prepared.operationId))
                 return "rejected";
-            const resumeParams = { threadId, path: prepared.targetPath, excludeTurns: true };
+            const resumeParams = { ...capturedResume, path: prepared.targetPath };
             // The prepared projection must be consumable by this exact initialized
             // target before the lease is released. While the coordinator lock is
             // still held, the provider's precise active-writer error is a side-effect
@@ -5066,6 +6780,8 @@ class AccountsBrokerOwnerV1 {
                 return "ambiguous";
             }
             const resumed = await this.requestBrokerChild(delivery.toOpaqueAccountId, target, "thread/resume", resumeParams);
+            if (resumed && !resumed.error && (0, protocol_1.threadIdFrom)(resumed.result) === threadId)
+                this.recordThreadAppToolsBinding(target, threadId, held.client, resumeParams);
             let settlement;
             if (!resumed) {
                 const loaded = new Map();
@@ -5191,6 +6907,9 @@ class AccountsBrokerOwnerV1 {
         }
         if (input.kind !== "portable")
             return "rejected";
+        const startParams = this.desktopThreadParams(held.client, threadId, {});
+        if (!startParams)
+            return "rejected";
         // Core checked this at confirmation time. Repeat it directly before the
         // one permitted child write so a quota event racing user confirmation
         // cannot dispatch to a stale or depleted target.
@@ -5223,7 +6942,7 @@ class AccountsBrokerOwnerV1 {
         // durable owner mapping is immutable and is never sent to another account.
         if (this.nativeHistory && !this.nativeHistoryWritersSafe())
             return "rejected";
-        const started = await this.requestBrokerChild(delivery.toOpaqueAccountId, child, "thread/start", {});
+        const started = await this.requestBrokerChild(delivery.toOpaqueAccountId, child, "thread/start", startParams);
         if (!started)
             return "ambiguous";
         if (started.error)
@@ -5231,6 +6950,7 @@ class AccountsBrokerOwnerV1 {
         const targetThreadId = (0, protocol_1.threadIdFrom)(started.result);
         if (!targetThreadId)
             return "ambiguous";
+        this.recordThreadAppToolsBinding(child, targetThreadId, held.client, startParams);
         if (this.nativeHistory && !this.nativeHistoryWritersSafe()) {
             // `thread/start` crossed a provider write boundary. Preserve that
             // unknown target as ambiguous; never retry it on a different account.
@@ -5351,10 +7071,13 @@ class AccountsBrokerOwnerV1 {
 exports.AccountsBrokerOwnerV1 = AccountsBrokerOwnerV1;
 class BrokerProcessChild {
     opaqueAccountId;
-    child;
     onMessage;
     onClose;
     authenticate;
+    onInitialization;
+    treeAccess;
+    child = null;
+    preparation = Promise.resolve();
     remoteControlDisabled = true;
     lines = null;
     expectedTermination = false;
@@ -5362,37 +7085,80 @@ class BrokerProcessChild {
     closed = false;
     closedPromise;
     resolveClosed;
+    ownedRootPromise;
+    capturedTree = null;
+    stopPromise = null;
+    ownershipReleased = false;
+    retentionReported = false;
     initialization = null;
     settleInitialization = null;
     initializationTimer = null;
     initializationFingerprint = null;
+    initializationContext = null;
     initializedResult;
     initializedReady = false;
+    failedInitialization;
     initializationClient = null;
+    preparationFailureStage;
     protocolReady = false;
     privateRequests = new Map();
     initializeId = `abi:${(0, node_crypto_1.randomBytes)(16).toString("hex")}`;
-    constructor(opaqueAccountId, child, onMessage, onClose, authenticate) {
+    constructor(opaqueAccountId, process, onMessage, onClose, authenticate, onInitialization, treeAccess = owned_process_tree_1.systemProcessTreeAccessV1) {
         this.opaqueAccountId = opaqueAccountId;
-        this.child = child;
         this.onMessage = onMessage;
         this.onClose = onClose;
         this.authenticate = authenticate;
+        this.onInitialization = onInitialization;
+        this.treeAccess = treeAccess;
+        this.closedPromise = new Promise((resolvePromise) => { this.resolveClosed = resolvePromise; });
+        this.ownedRootPromise = Promise.resolve(null);
+        if (typeof process === "function") {
+            this.preparation = Promise.resolve().then(process).then(child => {
+                this.attachProcess(child);
+                if (this.expectedTermination)
+                    this.terminate("capacity");
+                else if (this.initializationContext)
+                    this.startInitialization();
+            }).catch(() => {
+                this.closed = true;
+                const pendingInitialization = this.settleInitialization !== null;
+                const outcome = this.expectedTermination ? "cancelled" : "protocol_error";
+                this.finishInitialization(false, outcome);
+                // Cancellation settles callers promptly, but its stage is known only
+                // after preparation exits. Retain that final diagnostic without replaying RPCs.
+                if (!pendingInitialization && this.preparationFailureStage)
+                    this.reportInitialization(outcome);
+                this.releaseOwnership();
+            });
+        }
+        else
+            this.attachProcess(process);
+    }
+    /** A pending projection owns this child slot until it settles without a writer. */
+    get preparationCurrent() {
+        return !this.closed && !this.expectedTermination && !this.transportFailed
+            && (this.initializationContext?.isCurrent() ?? true);
+    }
+    async whenPrepared() {
+        await this.preparation;
+        return this.child !== null && this.preparationCurrent;
+    }
+    attachProcess(child) {
         if (!child.stdin || !child.stdout)
             throw new Error("accounts broker child lacks JSONL stdio");
-        this.closedPromise = new Promise((resolvePromise) => { this.resolveClosed = resolvePromise; });
+        this.child = child;
+        this.ownedRootPromise = (0, owned_process_tree_1.captureOwnedRootV1)(child.pid, this.treeAccess);
         this.lines = (0, node_readline_1.createInterface)({ input: child.stdout, crlfDelay: Infinity });
         const transportFailed = () => {
             if (this.transportFailed || this.closed)
                 return;
             this.transportFailed = true;
-            this.finishInitialization(false);
+            this.finishInitialization(false, "transport_failed");
             this.lines?.close();
             this.lines = null;
             // Keep ownership until the process exits; a broken pipe is not proof
             // that the native history writer has stopped.
-            if (child.exitCode === null && child.signalCode === null)
-                child.kill("SIGTERM");
+            this.terminate("capacity");
         };
         child.stdin.on("error", transportFailed);
         child.stdout.on("error", transportFailed);
@@ -5410,22 +7176,26 @@ class BrokerProcessChild {
                 if (!this.settleInitialization)
                     return;
                 if (message.error) {
-                    this.finishInitialization(false);
+                    this.finishInitialization(false, "protocol_error");
                     this.terminate("capacity");
                     return;
                 }
                 this.initializedResult = message.result;
-                this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized" })}\n`);
+                child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized" })}\n`);
                 this.protocolReady = true;
                 if (this.authenticate)
-                    void this.authenticate(this).then((ready) => {
+                    void this.authenticate(this, this.initializationContext).then((ready) => {
                         if (!ready || this.closed || this.transportFailed || this.expectedTermination) {
-                            this.finishInitialization(false);
+                            this.finishInitialization(false, "authentication_failed");
                             this.terminate("capacity");
                         }
                         else
                             this.finishInitialization(true);
-                    }).catch(() => { this.finishInitialization(false); this.terminate("capacity"); });
+                    }).catch((error) => {
+                        const failure = accountProbeFailure(error);
+                        this.finishInitialization(false, failure === "authentication" ? "authentication_failed" : failure === "connection" ? "transport_failed" : "protocol_error");
+                        this.terminate("capacity");
+                    });
                 else
                     this.finishInitialization(true);
             }
@@ -5433,8 +7203,10 @@ class BrokerProcessChild {
                 if (!this.authenticate || this.ready || (0, protocol_1.isRequest)(message))
                     this.onMessage(message);
             }
-            else
+            else {
+                this.finishInitialization(false, "protocol_error");
                 this.terminate("capacity");
+            }
         });
         const closed = () => {
             if (this.closed)
@@ -5445,9 +7217,13 @@ class BrokerProcessChild {
                 pending.resolve(null);
             }
             this.privateRequests.clear();
-            this.finishInitialization(false);
-            this.resolveClosed();
-            this.onClose(this.expectedTermination && !this.transportFailed);
+            this.finishInitialization(false, "child_exited");
+            if (!this.stopPromise) {
+                if (child.pid === undefined)
+                    this.releaseOwnership();
+                else
+                    this.reportRetainedOwnership();
+            }
         };
         child.on("error", () => {
             // Failed spawn has no writer. Failed signalling of an existing child
@@ -5459,15 +7235,30 @@ class BrokerProcessChild {
         });
         child.once("exit", closed);
     }
+    releaseOwnership() {
+        if (this.ownershipReleased)
+            return;
+        this.ownershipReleased = true;
+        this.resolveClosed();
+        this.onClose(this.expectedTermination && !this.transportFailed);
+    }
+    reportRetainedOwnership() {
+        if (this.retentionReported || this.ownershipReleased)
+            return;
+        this.retentionReported = true;
+        this.onClose(false, true);
+    }
     /** The owner records only direct source children; census expands this tree itself. */
     get pid() {
-        return this.child.pid;
+        return this.child?.pid;
     }
     get ready() { return this.initializedReady && !this.closed && !this.transportFailed && !this.expectedTermination; }
     get initializeResult() { return this.initializedResult; }
-    initialize(params, client) {
+    get initializationFailure() { return this.failedInitialization; }
+    initialize(params, client, authorized = () => true) {
         if (this.closed || this.transportFailed || this.expectedTermination)
             return Promise.resolve(false);
+        this.ownedRootPromise = this.ownedRootPromise.then(root => root ?? (0, owned_process_tree_1.captureOwnedRootV1)(this.child?.pid, this.treeAccess));
         const fingerprint = JSON.stringify(params);
         if (this.initializationFingerprint !== null && this.initializationFingerprint !== fingerprint)
             return Promise.resolve(false);
@@ -5476,21 +7267,36 @@ class BrokerProcessChild {
             return this.initialization.then((ready) => ready && this.ready);
         this.initializationFingerprint = fingerprint;
         this.initializationClient = client;
+        this.initializationContext = { params: JSON.parse(fingerprint), client,
+            isCurrent: () => !this.closed && !this.transportFailed && !this.expectedTermination && authorized() };
         this.initialization = new Promise((resolvePromise) => { this.settleInitialization = resolvePromise; });
-        this.initializationTimer = setTimeout(() => { this.finishInitialization(false); this.terminate("capacity"); }, this.authenticate ? 30_000 : 5_000);
+        if (this.child)
+            this.startInitialization();
+        return this.initialization;
+    }
+    startInitialization() {
+        if (!this.child || !this.initializationContext || !this.settleInitialization || this.initializationTimer)
+            return;
+        if (!this.initializationContext.isCurrent()) {
+            this.terminate("capacity");
+            return;
+        }
+        // Cold native startup can exceed five seconds even without an isolated
+        // authentication handshake. Keep the same bounded deadline for both.
+        this.initializationTimer = setTimeout(() => { this.finishInitialization(false, "initialize_timeout"); this.terminate("capacity"); }, 30_000);
         this.initializationTimer.unref();
+        this.reportInitialization("started");
         try {
-            this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: this.initializeId, method: "initialize", params })}\n`);
+            this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: this.initializeId, method: "initialize", params: this.initializationContext.params })}\n`);
         }
         catch {
-            this.finishInitialization(false);
+            this.finishInitialization(false, "transport_failed");
             this.terminate("capacity");
         }
-        return this.initialization;
     }
     /** Owner-private bootstrap RPCs; never routed through renderer correlation. */
     requestPrivate(method, params, timeoutMs = 10_000) {
-        if (!this.protocolReady || this.closed || this.transportFailed || this.expectedTermination || this.privateRequests.size >= 8)
+        if (!this.child || !this.protocolReady || this.closed || this.transportFailed || this.expectedTermination || this.privateRequests.size >= 8)
             return Promise.resolve(null);
         const id = `auth:${(0, node_crypto_1.randomBytes)(16).toString("hex")}`;
         return new Promise((resolvePromise) => {
@@ -5507,7 +7313,13 @@ class BrokerProcessChild {
             }
         });
     }
-    finishInitialization(ready) {
+    reportInitialization(code) {
+        try {
+            this.onInitialization?.(code);
+        }
+        catch { /* Diagnostics cannot affect readiness. */ }
+    }
+    finishInitialization(ready, outcome = ready ? "ready" : "cancelled") {
         if (this.initializationTimer)
             clearTimeout(this.initializationTimer);
         this.initializationTimer = null;
@@ -5515,11 +7327,14 @@ class BrokerProcessChild {
         this.settleInitialization = null;
         if (settle) {
             this.initializedReady = ready;
+            this.failedInitialization = ready ? undefined : outcome === "authentication_failed" ? "authentication"
+                : outcome === "protocol_error" ? "unavailable" : outcome === "cancelled" ? undefined : "connection";
+            this.reportInitialization(outcome);
             settle(ready);
         }
     }
     send(message) {
-        if (this.closed || this.transportFailed || this.expectedTermination || !this.child.stdin || this.child.exitCode !== null || this.child.signalCode !== null)
+        if (this.closed || this.transportFailed || this.expectedTermination || !this.child?.stdin || this.child.exitCode !== null || this.child.signalCode !== null)
             throw new Error("accounts broker child is unavailable");
         if (!(0, protocol_1.isResponse)(message) && !this.ready)
             throw new Error("accounts broker child is not initialized");
@@ -5530,21 +7345,110 @@ class BrokerProcessChild {
         this.finishInitialization(false);
         this.lines?.close();
         this.lines = null;
-        if (this.child.exitCode === null && this.child.signalCode === null)
-            this.child.kill("SIGTERM");
+        if (this.stopPromise)
+            return;
+        if (!this.child)
+            return;
+        // Synthetic test children have no OS PID. Real children require a root
+        // observed while parented to this owner before any descendant is signalled.
+        if (this.child.pid === undefined) {
+            if (this.child.exitCode === null && this.child.signalCode === null)
+                this.child.kill("SIGTERM");
+            return;
+        }
+        const attempt = this.stopOwnedTree().catch(() => false).then((stopped) => {
+            if (!stopped)
+                this.reportRetainedOwnership();
+            if (this.stopPromise === attempt)
+                this.stopPromise = null;
+            return stopped;
+        });
+        this.stopPromise = attempt;
     }
     async terminateAndWait() {
         this.terminate("capacity");
+        if (!this.child && !this.closed) {
+            // Never kill a copying worker or release its account slot early.
+            return Promise.race([this.preparation.then(() => this.closed && this.ownershipReleased), new Promise(resolvePromise => {
+                    const timer = setTimeout(() => resolvePromise(false), 8_000);
+                    timer.unref();
+                    void this.preparation.then(() => clearTimeout(timer));
+                })]);
+        }
+        if (this.stopPromise)
+            return this.stopPromise;
         if (this.closed)
-            return true;
+            return this.ownershipReleased;
         const force = setTimeout(() => { if (!this.closed)
-            this.child.kill("SIGKILL"); }, 1_000);
+            this.child?.kill("SIGKILL"); }, 1_000);
         const result = await Promise.race([this.closedPromise.then(() => true), new Promise((resolvePromise) => {
                 const timer = setTimeout(() => resolvePromise(false), 3_000);
                 this.closedPromise.then(() => clearTimeout(timer));
             })]);
         clearTimeout(force);
         return result;
+    }
+    async stopOwnedTree() {
+        const deadlineAt = Date.now() + 8_000;
+        const root = await this.ownedRootPromise;
+        // A readiness snapshot can predate newly spawned MCP descendants. Capture
+        // the full tree on every live-root teardown; reuse only a tree captured
+        // by an earlier teardown attempt after the root has exited.
+        const freshTree = !this.closed && root
+            ? await (0, owned_process_tree_1.captureOwnedTreeV1)(root, this.treeAccess, deadlineAt)
+            : this.capturedTree;
+        if (!freshTree) {
+            // A root that already exited before any teardown census leaves nothing
+            // provable to signal, and nothing will ever become provable later: its
+            // descendants were reparented away. Retaining ownership here would make
+            // every owner shutdown fail forever and wedge the broker socket, so
+            // release without signalling anything.
+            if (this.closed && this.capturedTree === null) {
+                this.releaseOwnership();
+                return true;
+            }
+            // No verified root means no process may be signalled. The broker keeps
+            // the exact child and its recovery ownership for a later safe attempt.
+            return false;
+        }
+        // An earlier attempt can reparent a surviving descendant before the root
+        // exits. Keep those previously proven identities alongside fresh children.
+        const tree = [...freshTree];
+        for (const prior of this.capturedTree ?? []) {
+            if (!tree.some(current => current.pid === prior.pid && current.started === prior.started))
+                tree.push(prior);
+        }
+        this.capturedTree = tree;
+        const termDeadline = Math.min(deadlineAt, Date.now() + 3_000);
+        if (!await (0, owned_process_tree_1.signalVerifiedTreeV1)(tree, this.treeAccess, "SIGTERM", termDeadline))
+            return false;
+        // Give descendants a full graceful window even when the direct child
+        // exits first; its exit alone does not prove its tree is gone.
+        // Up to 3 s lets Codex checkpoint its SQLite WAL files; stop waiting as
+        // soon as the whole verified tree is gone.
+        const graceUntil = Math.min(Date.now() + 3_000, deadlineAt - 1_000);
+        if (graceUntil <= Date.now())
+            return false;
+        let remaining = await (0, owned_process_tree_1.verifiedSurvivorsV1)(tree, this.treeAccess, deadlineAt);
+        while (remaining !== null && remaining.length > 0 && Date.now() < graceUntil) {
+            await new Promise(resolve => setTimeout(resolve, Math.min(100, graceUntil - Date.now())));
+            remaining = await (0, owned_process_tree_1.verifiedSurvivorsV1)(tree, this.treeAccess, deadlineAt);
+        }
+        if (remaining === null)
+            return false;
+        if (remaining.length && !await (0, owned_process_tree_1.signalVerifiedTreeV1)(remaining, this.treeAccess, "SIGKILL", deadlineAt))
+            return false;
+        while (Date.now() < deadlineAt) {
+            const survivors = await (0, owned_process_tree_1.verifiedSurvivorsV1)(tree, this.treeAccess, deadlineAt);
+            if (survivors === null)
+                return false;
+            if (survivors.length === 0 && this.closed) {
+                this.releaseOwnership();
+                return true;
+            }
+            await new Promise(resolve => setTimeout(resolve, Math.min(100, deadlineAt - Date.now())));
+        }
+        return false;
     }
     whenClosed() {
         return this.closedPromise;
@@ -5553,7 +7457,7 @@ class BrokerProcessChild {
 exports.BrokerProcessChild = BrokerProcessChild;
 /** Owner command environment: account-local homes plus a forced disable bit. */
 function brokerChildEnvironment(codexHome, sqliteHome, source = process.env) {
-    const allowed = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "SSL_CERT_FILE", "SSL_CERT_DIR"];
+    const allowed = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "SSL_CERT_DIR"];
     const environment = {};
     for (const key of allowed)
         if (typeof source[key] === "string")
@@ -5593,9 +7497,14 @@ async function runAccountsBrokerOwnerCli(argv = process.argv.slice(2)) {
         // performs a bounded reconnect; this process must not remove its socket.
         return;
     }
-    const shutdown = () => { void owner.close().finally(() => process.exit(0)); };
-    process.once("SIGTERM", shutdown);
-    process.once("SIGINT", shutdown);
+    const shutdown = () => {
+        void owner.close().then(() => process.exit(0), () => {
+            process.exitCode = 1;
+            process.stderr.write("[Tweakers Accounts] Shutdown incomplete; ownership retained for child reconciliation.\n");
+        });
+    };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
 }
 /** One bounded owner-private startup record; only enumerated codes and timing. */
 function createBrokerStartupDiagnostics(root) {
@@ -5607,17 +7516,26 @@ function createBrokerStartupDiagnostics(root) {
     const events = [];
     return (event) => {
         try {
-            if (events.length >= 16 || !["election", "probe", "recovery", "connect"].includes(event.stage)
+            if (!["election", "probe", "recovery", "connect", "child"].includes(event.stage)
                 || !["started", "ready", "unavailable", "failed", "invalid_probe_input", "spawn_failed", "initialize_failed",
-                    "paginated_history_missing", "writer_lock_missing", "probe_timeout", "probe_failed"].includes(event.code)
+                    "paginated_history_missing", "writer_lock_missing", "probe_timeout", "probe_failed", "initialize_timeout", "protocol_error",
+                    "transport_failed", "authentication_failed", "child_exited", "cancelled"].includes(event.code)
                 || !Number.isSafeInteger(event.elapsedMs) || event.elapsedMs < 0 || event.elapsedMs > 600_000)
                 return;
             const current = (0, node_fs_1.lstatSync)(root);
             if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== identity.dev || current.ino !== identity.ino
                 || current.uid !== identity.uid || (current.mode & 0o077) !== 0)
                 return;
-            events.push({ stage: event.stage, code: event.code, elapsedMs: event.elapsedMs });
+            const preparationStage = (0, shared_plugin_ledger_1.sharedPreparationStageV1)(event.preparationStage);
+            const admissionStage = (0, admission_diagnostics_1.brokerAdmissionStageV1)(event.admissionStage);
+            if (events.length >= 16) {
+                if (event.stage !== "child" || (!preparationStage && !admissionStage))
+                    return;
+                events.shift();
+            }
+            events.push({ stage: event.stage, code: event.code, elapsedMs: event.elapsedMs, ...(preparationStage ? { preparationStage } : {}), ...(admissionStage ? { admissionStage } : {}) });
             (0, state_store_1.writePrivateJsonAtomic)(root, file, { version: 1, pid: process.pid, events });
+            pruneBrokerDiagnostics(root, "startup", file);
         }
         catch { /* Diagnostics must not mask or replace a startup failure. */ }
     };
@@ -5654,11 +7572,44 @@ function installBrokerTerminationDiagnostics(root) {
             const errorName = error && ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError"].includes(error.name) ? error.name : null;
             (0, node_fs_1.writeFileSync)(path, JSON.stringify({ version: 1, observedAt: new Date().toISOString(), pid: process.pid,
                 kind, exitCode, errorName, locations }) + "\n", { mode: 0o600, flag: "wx" });
+            pruneBrokerDiagnostics(root, "termination", path);
         }
         catch { /* Diagnostics must never mask or replace the original failure. */ }
     };
     process.once("uncaughtExceptionMonitor", (error) => record("uncaught_exception", 1, error));
     process.once("exit", (code) => record("exit", code));
+}
+function pruneBrokerDiagnostics(root, category, currentFile) {
+    const pattern = new RegExp(`^broker-${category}-(\\d+)-[a-f0-9]{16}\\.json$`);
+    const entries = (0, node_fs_1.readdirSync)(root).flatMap((name) => {
+        const match = pattern.exec(name);
+        if (!match)
+            return [];
+        const path = (0, node_path_1.join)(root, name);
+        const stat = (0, node_fs_1.lstatSync)(path);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
+            return [];
+        return [{ name, path, pid: Number(match[1]), mtimeMs: stat.mtimeMs }];
+    }).sort((left, right) => right.mtimeMs - left.mtimeMs);
+    let retained = 0;
+    for (const entry of entries) {
+        let active = entry.pid === process.pid;
+        if (!active) {
+            try {
+                process.kill(entry.pid, 0);
+                active = true;
+            }
+            catch (error) {
+                active = error.code === "EPERM";
+            }
+        }
+        if (active || entry.name === currentFile || entry.path === currentFile || retained++ < 20)
+            continue;
+        try {
+            (0, node_fs_1.unlinkSync)(entry.path);
+        }
+        catch { /* Diagnostics retention is best effort. */ }
+    }
 }
 /** Connect a per-desktop stdio adapter to the global app-server bridge. */
 async function connectAccountsBrokerAppServerClient(options, onMessage) {
@@ -5704,7 +7655,7 @@ async function connectAccountsBrokerAppServerClient(options, onMessage) {
                     return;
                 const line = buffered.slice(0, newline);
                 buffered = buffered.slice(newline + 1);
-                bytes = Buffer.byteLength(buffered, "utf8");
+                bytes -= Buffer.byteLength(line, "utf8") + 1;
                 if (Buffer.byteLength(line, "utf8") > exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES) {
                     socket.destroy();
                     return;
@@ -5739,6 +7690,16 @@ async function connectAccountsBrokerAppServerClient(options, onMessage) {
             }
         });
         socket.once("connect", () => {
+            if (options.startupPolicyHandshake) {
+                if (!(0, startup_policy_1.verifyStartupPolicyHandshake)(options.secret, options.startupPolicyHandshake)
+                    || !writeAppFrame(socket, options.startupPolicyHandshake, exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES))
+                    socket.destroy();
+                return;
+            }
+            if (!options.rendererRef || !options.appToolsRef) {
+                socket.destroy();
+                return;
+            }
             const unsigned = {
                 version: 1,
                 clientKind: options.clientKind,
@@ -5747,7 +7708,16 @@ async function connectAccountsBrokerAppServerClient(options, onMessage) {
                 nonce: (0, node_crypto_1.randomBytes)(24).toString("base64url"),
             };
             const handshake = { ...unsigned, proof: (0, broker_1.createBrokerHandshakeProof)(options.secret, unsigned) };
-            if (!writeAppFrame(socket, { version: 1, kind: "handshake", handshake }, exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES))
+            const frame = { version: 1, kind: "handshake", handshake };
+            if (options.desktopAppTools) {
+                if (!(0, desktop_app_tools_1.isDesktopAppToolsContext)(options.desktopAppTools)) {
+                    socket.destroy();
+                    return;
+                }
+                frame.desktopAppTools = options.desktopAppTools;
+                frame.desktopAppToolsProof = createDesktopAppToolsProof(options.secret, handshake, options.desktopAppTools);
+            }
+            if (!writeAppFrame(socket, frame, exports.ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES))
                 socket.destroy();
         });
     });
@@ -5990,7 +7960,11 @@ function nativeLegacyProjectListInput(params, expectedProjectId) {
     if (rawLimit !== undefined && rawLimit !== null && (typeof rawLimit !== "number" || !Number.isSafeInteger(rawLimit) || rawLimit < 1 || rawLimit > 256))
         return null;
     const { cursor: _cursor, ...withoutCursor } = params;
-    return { params: withoutCursor, cursor: typeof cursor === "string" ? cursor : null, limit: typeof rawLimit === "number" ? rawLimit : 100 };
+    const sortKey = params.sortKey ?? "created_at", sortDirection = params.sortDirection ?? "desc";
+    if (typeof sortKey !== "string" || !["created_at", "updated_at", "recency_at", "section_position"].includes(sortKey)
+        || typeof sortDirection !== "string" || !["asc", "desc"].includes(sortDirection))
+        return null;
+    return { params: withoutCursor, cursor: typeof cursor === "string" ? cursor : null, limit: typeof rawLimit === "number" ? rawLimit : 100, sortKey, sortDirection };
 }
 function nativeProjectReference(params) {
     if (!(0, types_1.isPlainRecord)(params) || !Object.prototype.hasOwnProperty.call(params, "projectId") || params.projectId === null || params.projectId === undefined) {
@@ -6737,12 +8711,20 @@ function providerConnectionRows(value, kind) {
         if (!name || name.length > 256 || /[\u0000-\u001f\u007f]/.test(name) || seen.has(name))
             return null;
         seen.add(name);
-        const status = row.status === "connected" || row.status === "connecting" || row.status === "blocked" || row.status === "unavailable"
-            ? row.status
-            : kind === "app" && (row.enabled === false || row.callable === false || row.isEnabled === false || row.isAccessible === false) ? "blocked"
-                : kind === "mcp" && row.authStatus === "notLoggedIn" ? "blocked"
-                    : row.enabled === true || row.callable === true || (kind === "app" && row.isAccessible === true)
-                        || (kind === "mcp" && (row.authStatus === "oAuth" || row.authStatus === "bearerToken")) ? "connected" : "unknown";
+        const runtimeStatus = kind === "mcp" ? row.runtimeStatus : undefined;
+        // Stock MCP authStatus describes available credentials, not a working
+        // connection. The current runtime state takes precedence over saved auth.
+        const status = runtimeStatus === "failed" || runtimeStatus === "unavailable" || runtimeStatus === "cancelled" ? "unavailable"
+            : runtimeStatus === "disabled" || runtimeStatus === "authenticationRequired" ? "blocked"
+                : row.enabled === false || row.callable === false
+                    || (kind === "app" && (row.isEnabled === false || row.isAccessible === false)) ? "blocked"
+                    : runtimeStatus === "connected" ? "connected"
+                        : runtimeStatus === "starting" ? "connecting"
+                            : kind === "mcp" && row.authStatus === "notLoggedIn" ? "blocked"
+                                : runtimeStatus !== undefined && runtimeStatus !== null ? "unknown"
+                                    : row.status === "connected" || row.status === "connecting" || row.status === "blocked" || row.status === "unavailable"
+                                        ? row.status
+                                        : kind !== "mcp" && (row.enabled === true || row.callable === true || (kind === "app" && row.isAccessible === true)) ? "connected" : "unknown";
         const displayLabel = (kind === "plugin" && (0, types_1.isPlainRecord)(row.interface) ? (0, broker_1.safeConnectionDisplayLabel)(row.interface.displayName) : undefined)
             ?? (0, broker_1.safeConnectionDisplayLabel)(row.displayName) ?? (0, broker_1.safeConnectionDisplayLabel)(row.name)
             ?? (kind === "app" ? (0, broker_1.safeConnectionDisplayLabel)(row.runtimeName) : undefined);
@@ -7086,9 +9068,28 @@ function flagValue(flags, name) {
     const index = flags.indexOf(name);
     return index >= 0 && typeof flags[index + 1] === "string" ? flags[index + 1] : null;
 }
+function desktopAppToolsBinding(context) {
+    return context ? (0, desktop_app_tools_1.desktopAppToolsFingerprint)(context) : "none";
+}
+function createDesktopAppToolsProof(secret, handshake, context) {
+    return (0, node_crypto_1.createHmac)("sha256", secret).update(JSON.stringify(["desktop-app-tools:v1", handshake.version,
+        handshake.clientKind, handshake.rendererRef, handshake.appToolsRef, handshake.nonce, (0, desktop_app_tools_1.desktopAppToolsFingerprint)(context)])).digest("hex");
+}
+function verifyDesktopAppToolsProof(secret, frame) {
+    if (!frame.desktopAppTools)
+        return frame.desktopAppToolsProof === undefined;
+    if (!(0, desktop_app_tools_1.isDesktopAppToolsContext)(frame.desktopAppTools) || typeof frame.desktopAppToolsProof !== "string"
+        || !/^[a-f0-9]{64}$/.test(frame.desktopAppToolsProof))
+        return false;
+    return (0, node_crypto_1.timingSafeEqual)(Buffer.from(frame.desktopAppToolsProof, "hex"), Buffer.from(createDesktopAppToolsProof(secret, frame.handshake, frame.desktopAppTools), "hex"));
+}
 function isAppHandshake(value) {
-    return (0, types_1.isPlainRecord)(value) && Object.keys(value).sort().join("\0") === ["handshake", "kind", "version"].join("\0")
-        && value.version === 1 && value.kind === "handshake" && (0, types_1.isPlainRecord)(value.handshake);
+    if (!(0, types_1.isPlainRecord)(value) || value.version !== 1 || value.kind !== "handshake" || !(0, types_1.isPlainRecord)(value.handshake))
+        return false;
+    const keys = Object.keys(value).sort().join("\0");
+    return keys === ["handshake", "kind", "version"].join("\0")
+        || (keys === ["desktopAppTools", "desktopAppToolsProof", "handshake", "kind", "version"].join("\0")
+            && (0, desktop_app_tools_1.isDesktopAppToolsContext)(value.desktopAppTools) && typeof value.desktopAppToolsProof === "string");
 }
 function isAppHandshakeResult(value) {
     return (0, types_1.isPlainRecord)(value) && Object.keys(value).sort().join("\0") === ["kind", "ok", "version"].join("\0")
@@ -7191,6 +9192,23 @@ function credentialStoreArgs(args, store) {
     }
     return [...result, "-c", `cli_auth_credentials_store="${store}"`];
 }
+/** Account-only helpers must not consult the OS-wide MCP credential store. Their
+ * private homes contain no MCP credentials; real conversation children retain
+ * the user's configured MCP storage policy. */
+function isolatedAuthHelperArgs(args, official = false) {
+    const result = [];
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if ((arg === "-c" || arg === "--config") && /^mcp_oauth_credentials_store\s*=/.test(args[i + 1] ?? "")) {
+            i += 1;
+            continue;
+        }
+        if (/^--config=mcp_oauth_credentials_store\s*=/.test(arg))
+            continue;
+        result.push(arg);
+    }
+    return [...credentialStoreArgs(result, "file"), "-c", 'mcp_oauth_credentials_store="file"', ...(official ? ["-c", "features.plugins=false", "-c", "features.codex_hooks=false", "-c", "features.hooks=false"] : [])];
+}
 function isolatedAuthMutation(method, params) {
     if (["account/login/start", "account/login/cancel", "account/logout"].includes(method))
         return true;
@@ -7203,5 +9221,37 @@ function isolatedAuthMutation(method, params) {
 }
 class NativeAuthHelperBusyError extends Error {
     constructor() { super("native authentication helper busy"); }
+}
+/** Only this bounded category survives the private helper boundary. */
+class NativeAccountProbeError extends Error {
+    errorCode;
+    constructor(errorCode) {
+        super("account probe failed");
+        this.errorCode = errorCode;
+    }
+}
+function accountProbeFailure(error) {
+    return error instanceof NativeAccountProbeError ? error.errorCode : "connection";
+}
+function providerAccountFailure(response) {
+    if (!response.error)
+        return "unavailable";
+    const { code, message, data } = response.error;
+    const status = (0, types_1.isPlainRecord)(data) ? data.httpStatusCode ?? data.statusCode ?? data.status : null;
+    if (code === 401 || code === 403 || status === 401 || status === 403
+        || /unauthorized|invalid[_ -]grant|refresh[_ -]token[_ -](?:expired|reused|invalid)|token (?:has expired|refresh failed|could not be refreshed)|log out and sign in again|authentication (?:failed|required)|not (?:logged|signed) in/i.test(message))
+        return "authentication";
+    if (code === 408 || code === 429 || code >= 500 || (typeof status === "number" && (status === 408 || status === 429 || status >= 500))
+        || /timed? out|timeout|failed to (?:connect|send request)|connection|network|temporarily unavailable/i.test(message))
+        return "connection";
+    return "unavailable";
+}
+function requireAuthenticatedProvider(response) {
+    if (!response)
+        throw new NativeAccountProbeError("connection");
+    if (response.error)
+        throw new NativeAccountProbeError(providerAccountFailure(response));
+    if (!providerAuthenticated(response.result))
+        throw new NativeAccountProbeError("authentication");
 }
 //# sourceMappingURL=broker-host.js.map

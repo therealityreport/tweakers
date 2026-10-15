@@ -3,7 +3,6 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   MANAGER_PROTOCOL_VERSION,
-  MANAGER_REFRESH_TIMING_PHASES_V1,
   MANAGER_STATUS_SCHEMA_VERSION,
   TWEAKERS_MANAGER_ID,
   canonicalManagerJson,
@@ -28,17 +27,25 @@ import {
   type TweakersManagerStatusSnapshotV1,
   TWEAKERS_MANAGER_ACTION_IDS_V1,
 } from "./manager-contract.js";
-import { isCandidateCopyPrecutoverFailure, isManagerOperationId, parsePreparedOperation } from "./manager-operation-store.js";
+import { isManagerOperationId, parsePreparedOperation } from "./manager-operation-store.js";
 import { parseManagerStrictJsonObject } from "./manager-strict-json.js";
+import { managerOperationHasSafePrepublicationFailure, managerOperationRecoveryIsVerified, managerRecoveryBindingPath, readManagerRecoveryBinding, type RecoveryEvidenceDependencies } from "./manager-recovery-evidence.js";
 import {
   readRegisteredOfficialSource,
   readRegisteredOfficialSourceStatusProjection,
   type RegisteredOfficialSourceStatus,
 } from "./official-source-registration.js";
 import { userPaths } from "./paths.js";
+import { inspectHistoricalManagerReconciliation, type HistoricalManagerObservedOperation } from "./manager-historical-reconciliation.js";
+import { authenticateSupersededAcceptedRuntimeRepairPromotion, readAcceptedRuntimeRepairRecord } from "./accepted-runtime-repair.js";
+import { canonicalTweakersManagerRoot } from "./manager-descriptor.js";
 
 const UPDATE_MODE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const MAX_CODEX_DERIVED_RECEIPTS = 64;
+// Operations retain durable recovery history, including terminal failures.
+// Keep the reader bounded without exhausting normal retained history after 64
+// actions. Each record remains individually validated and bound into the token.
+const MAX_MANAGER_OPERATION_RECORDS = 1024;
 const RFC3339_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export interface ManagerStatusPaths {
@@ -78,6 +85,7 @@ export type ManagerStatusDirectoryRead =
  */
 export interface ManagerStatusDependencies {
   now?: () => string;
+  recoveryEvidence?: Pick<RecoveryEvidenceDependencies, "fingerprint" | "absent">;
   readText?: (path: string) => ManagerStatusTextRead;
   readDirectory?: (path: string) => ManagerStatusDirectoryRead;
   /** Source-store verification is injectable for strict status fixtures. The
@@ -200,6 +208,7 @@ export function createTweakersManagerStatusSnapshot(
     observations.chatgptAppUpdate,
     observations.updater,
     input.excludeOperationId,
+    dependencies.recoveryEvidence,
   );
   const enabledActionIds = compiledEnabledActionIds(input.enabledActionIds);
   return createManagerStatusSnapshotProjection(
@@ -909,27 +918,32 @@ function observeManagerOperations(
   chatgptAppUpdate: ManagerDashboardUpdaterV1,
   legacyUpdater: ManagerDashboardUpdaterV1,
   excludeOperationId: string | undefined,
+  recoveryEvidence?: Pick<RecoveryEvidenceDependencies, "fingerprint" | "absent">,
 ): ManagerDashboardOperationsV1 {
   const directory = readDirectory(root);
   if (directory.state === "missing") {
+    const historical = inspectHistoricalManagerReconciliation(managerRoot, [], readText === defaultReadText ? {} : { readText, readDirectory });
+    if (historical.problems.length) return { state: "malformed", revision: historical.revision, activeOperationId: null, preparedCount: 0, detail: null, problem: historical.problems.join("; ") };
     return { state: "missing", revision: "missing", activeOperationId: null, preparedCount: 0, detail: null, problem: null };
   }
   if (directory.state === "unreadable") {
     return { state: "unreadable", revision: "unreadable", activeOperationId: null, preparedCount: 0, detail: null, problem: directory.problem };
   }
 
-  const names = directory.entries.filter((name) => name.endsWith(".json")).sort((left, right) => left.localeCompare(right));
-  if (names.length > 64) {
+  const names = directory.entries.filter((name) => name.endsWith(".json")
+    && (excludeOperationId === undefined || name !== `${excludeOperationId}.json`)).sort((left, right) => left.localeCompare(right));
+  if (names.length > MAX_MANAGER_OPERATION_RECORDS) {
     return {
       state: "malformed",
       revision: `sha256:${createHash("sha256").update(names.join("\n"), "utf8").digest("hex")}`,
       activeOperationId: null,
       preparedCount: 0,
       detail: null,
-      problem: "too many manager operation records (maximum 64)",
+      problem: `too many manager operation records (maximum ${MAX_MANAGER_OPERATION_RECORDS})`,
     };
   }
 
+  const historicalInputs: HistoricalManagerObservedOperation[] = [];
   const observed: Array<ManagerOperationDetailV1 & { revision: string; settledByDurableEvidence: boolean }> = [];
   for (const name of names) {
     const operationId = name.slice(0, -".json".length);
@@ -943,7 +957,6 @@ function observeManagerOperations(
         problem: `manager operation filename is invalid: ${name}`,
       };
     }
-    if (excludeOperationId === operationId) continue;
     const document = readText(join(root, name));
     if (document.state === "missing") {
       return { state: "malformed", revision: "missing-record", activeOperationId: null, preparedCount: 0, detail: null, problem: `manager operation disappeared: ${operationId}` };
@@ -970,14 +983,18 @@ function observeManagerOperations(
         managerRoot,
         readText,
         readDirectory,
+        recoveryEvidence,
       )
         || operationReachedBoundReceipt(record, receipts, chatgptAppUpdate, legacyUpdater);
+      historicalInputs.push({ record, rawText: document.text });
+      const bindingRead = readText(managerRecoveryBindingPath(managerRoot, operationId));
+      const boundRevision = bindingRead.state === "present" ? sha256(bindingRead.text) : bindingRead.state;
       observed.push({
         operationId,
         actionId: record.actionId,
         phase: record.phase,
         timing: record.timing ?? null,
-        revision,
+        revision: `${revision}:${boundRevision}`,
         settledByDurableEvidence,
       });
     } catch (error) {
@@ -985,15 +1002,20 @@ function observeManagerOperations(
     }
   }
 
-  if (observed.length === 0) {
-    return { state: "missing", revision: "missing", activeOperationId: null, preparedCount: 0, detail: null, problem: null };
-  }
-  const active = observed.filter((record) => (
+  const historical = inspectHistoricalManagerReconciliation(managerRoot, historicalInputs,
+    readText === defaultReadText ? {} : { readText, readDirectory });
+  if (historical.problems.length) return {
+    state: "malformed", revision: historical.revision, activeOperationId: null,
+    preparedCount: 0, detail: null, problem: historical.problems.join("; "),
+  };
+  if (observed.length === 0) return { state: "missing", revision: "missing", activeOperationId: null, preparedCount: 0, detail: null, problem: null };
+  const historicalIds = new Set(historical.classifiedOperationIds);
+  const active = observed.filter((record) => !historicalIds.has(record.operationId) && (
     record.phase === "prepared"
     || (record.phase === "consumed" && !record.settledByDurableEvidence)
     || (record.phase === "recovery-required" && !record.settledByDurableEvidence)
   ));
-  const revision = `sha256:${createHash("sha256").update(canonicalManagerJson(observed), "utf8").digest("hex")}`;
+  const revision = `sha256:${createHash("sha256").update(canonicalManagerJson({ observed, historicalRevision: historical.revision }), "utf8").digest("hex")}`;
   if (active.length > 1) {
     return {
       state: "malformed",
@@ -1017,7 +1039,7 @@ function observeManagerOperations(
         phase: active[0].phase,
         timing: active[0].timing,
       },
-    problem: null,
+    problem: historicalIds.size ? `${historicalIds.size} inactive historical operations retain unknown outcomes` : null,
   };
 }
 
@@ -1029,110 +1051,37 @@ function observeManagerOperations(
  * prepared retry; it never re-executes the consumed operation and never hides
  * post-promotion or ambiguous failures.
  */
-function independentRefreshHasProvenRetryableFailure(
+export function independentRefreshHasProvenRetryableFailure(
   record: ReturnType<typeof parsePreparedOperation>,
   managerRoot: string,
-  readText: (path: string) => ManagerStatusTextRead,
-  readDirectory: (path: string) => ManagerStatusDirectoryRead,
+  readText: (path: string) => ManagerStatusTextRead = defaultReadText,
+  _readDirectory: (path: string) => ManagerStatusDirectoryRead = defaultReadDirectory,
+  recoveryEvidence?: Pick<RecoveryEvidenceDependencies, "fingerprint" | "absent">,
 ): boolean {
-  if (record.phase !== "recovery-required"
-    || record.actionId !== "refresh.independent"
-    || record.consumedAt === null
-    || record.receiptRefs.length !== 1
-    || !record.receiptRefs[0]?.startsWith("independent-tweakers-patch:")
-    || record.error === null) return false;
-  if (isCandidateCopyPrecutoverFailure(record)) return true;
-  // The exact recovery preflight rejection occurs before candidate staging or
-  // cutover. Preserve the raw failure, but do not treat it as unfinished recovery.
-  if (record.error.startsWith("Independent Tweakers refresh requires a source-bound validated Accounts recovery receipt in the sealed runtime.")) {
-    return !!record.timing && MANAGER_REFRESH_TIMING_PHASES_V1.every(key => {
-      const phase = record.timing!.phases[key];
-      return phase.state === "skipped" && phase.startedAt === null && phase.completedAt === null;
-    });
-  }
-  if (record.error === "Independent Tweakers refresh failed and the rollback/reopen path was incomplete.") {
-    return recoveredIndependentPromotionSetIsTerminal(record.operationId, managerRoot, readText, readDirectory);
-  }
-  return record.error === "The exact /Applications/Tweakers.app process did not quiesce before refresh."
-    || /^Exact captured Tweakers helpers did not stop: [0-9]+(?:, [0-9]+)*$/.test(record.error)
-    || /^Exact Tweakers helper quiescence is not proven: [0-9]+(?:, [0-9]+)*$/.test(record.error)
-    || /^loader\.cjs not found at \/.+\/managers\/com\.thomashulihan\.tweakers\/assets\/loader\.cjs or \/.+\/loader\/loader\.cjs$/.test(record.error)
-    || /^Tweakers Manager Launcher asset is missing: \/.+\/managers\/com\.thomashulihan\.tweakers\/generations\/assets\/manager-launcher\/Tweakers Manager Launcher$/.test(record.error)
-    // This exact bootstrap mismatch is thrown after promotion only when the
-    // create-variant compensating rollback completed.  An incomplete rollback
-    // is wrapped in AggregateError and recorded with a different outer error,
-    // so the diagnostic is sufficient durable evidence for a fresh approval.
-    || /^Canonical manager official ChatGPT officialBackend(?:Version|Fingerprint) does not match the revalidated app$/.test(record.error)
-    // Both runtime-ready timeout diagnostics are thrown only before commit.
-    // The sealed executor records them only after it has quiesced the failed
-    // candidate and completed the deferred transaction's rollback; an
-    // incomplete rollback is wrapped in AggregateError with a different outer
-    // diagnostic and remains blocking.
-    || record.error === "The exact /Applications/Tweakers.app reopen did not produce a new visible main PID with an operation-bound runtime-ready receipt."
-    || record.error === "The exact /Applications/Tweakers.app reopen produced a new visible main PID, but did not publish an operation-bound runtime-ready receipt before the readiness deadline."
-    || record.error === "The exact /Applications/Tweakers.app reopen did not produce a new visible main PID before the process deadline."
-    || record.error === "The exact /Applications/Tweakers.app reopen did not produce a new main PID before the process deadline."
-    || /^Runtime assets not found\. Expected at \/.+\/managers\/com\.thomashulihan\.tweakers\/assets\/runtime \(built package\) or \/.+\/runtime\/dist \(dev\)\.\nRun `npm run build` from the workspace root\.$/.test(record.error);
-}
-
-/**
- * A generic rollback-incomplete diagnostic remains blocking until the exact
- * variant journals prove that recovery subsequently finished. Status never
- * performs that recovery: it only observes owner-private journals. Requiring
- * every journal to be terminal prevents an unrelated historical recovery from
- * hiding the still-interrupted generation that produced this manager record.
- */
-function recoveredIndependentPromotionSetIsTerminal(
-  operationId: string,
-  managerRoot: string,
-  readText: (path: string) => ManagerStatusTextRead,
-  readDirectory: (path: string) => ManagerStatusDirectoryRead,
-): boolean {
-  const variantRoot = join(managerRoot, "variants", "tweakers");
-  for (const evidence of ["runtime-ready-expectation.json", "runtime-ready.json"]) {
-    const document = readText(join(variantRoot, evidence));
-    if (document.state === "missing") continue;
-    if (document.state !== "present") return false;
-    let ready: Record<string, unknown>;
+  if(record.phase==="failed"&&record.actionId==="refresh.independent"&&record.outcome==="superseded-for-official-bundled-replacement") {
+    // A label cannot release a consumed failure. Only the independently signed
+    // handoff, exact failed projection and preserved old history permit retry.
+    if(managerRoot!==canonicalTweakersManagerRoot())return false;
     try {
-      ready = parseManagerStrictJsonObject(document.text, {
-        maxBytes: 64 * 1024,
-        label: `independent ${evidence}`,
-      });
-    } catch {
-      return false;
-    }
-    // A later refresh is allowed to retain its own readiness receipt. Only
-    // readiness evidence for this failed operation keeps its recovery open.
-    if (ready.operationId === operationId) return false;
+      const repair=readAcceptedRuntimeRepairRecord(record.operationId);
+      const promotionId=repair?.head.promotionId??readManagerRecoveryBinding(managerRoot,record.operationId)?.promotionId;
+      return !!promotionId&&authenticateSupersededAcceptedRuntimeRepairPromotion(join(managerRoot,"variants","tweakers"),promotionId,record.operationId);
+    } catch{return false;}
   }
-  const journalRoot = join(variantRoot, "transactions", "variant-promotion");
-  const directory = readDirectory(journalRoot);
-  if (directory.state !== "present") return false;
-  const names = directory.entries.filter((name) => name.endsWith(".json") && name !== "active.json");
-  if (names.length === 0 || names.length > 128) return false;
-  let recovered = false;
-  for (const name of names) {
-    const id = name.slice(0, -".json".length);
-    if (!isManagerOperationId(id)) return false;
-    const document = readText(join(journalRoot, name));
-    if (document.state !== "present") return false;
-    let journal: Record<string, unknown>;
-    try {
-      journal = parseManagerStrictJsonObject(document.text, {
-        maxBytes: 64 * 1024,
-        label: `variant promotion journal ${id}`,
-      });
-    } catch {
-      return false;
-    }
-    if (journal.id !== id
-      || journal.userRoot !== variantRoot
-      || journal.target !== "/Applications/Tweakers.app"
-      || (journal.phase !== "committed" && journal.phase !== "recovered")) return false;
-    if (journal.phase === "recovered") recovered = true;
-  }
-  return recovered;
+  // Settlement freezes a verified recovery before later installations replace
+  // its bytes. Doctor must not turn that terminal history back into a blocker.
+  if (record.phase === "failed" && record.actionId === "refresh.independent"
+    && record.consumedAt !== null && record.failedAt !== null && record.recoveryRequiredAt === null
+    && (record.outcome === "verified-promotion-recovered" || record.outcome === "verified-prepublication-failure")) return true;
+  if ((record.phase !== "consumed" && record.phase !== "recovery-required")
+    || record.actionId !== "refresh.independent" || record.consumedAt === null) return false;
+  if (managerOperationRecoveryIsVerified(managerRoot, record.operationId, {
+    ...(readText === defaultReadText ? {} : { readText }), ...recoveryEvidence,
+    expectedReceiptRefs: record.receiptRefs, consumedAt: record.consumedAt,
+  })) return true;
+  // Once publication is bound, only that exact verified journal can release it.
+  if (readText(managerRecoveryBindingPath(managerRoot, record.operationId)).state !== "missing") return false;
+  return managerOperationHasSafePrepublicationFailure(record);
 }
 
 /**

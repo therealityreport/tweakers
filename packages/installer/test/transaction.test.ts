@@ -81,19 +81,19 @@ function adapters(overrides: Record<string, unknown> = {}) {
   const calls: string[] = [];
   const base = {
     isAppRunning: () => false,
-    copyApp: () => calls.push("copyApp"),
-    removeApp: () => calls.push("removeApp"),
-    buildCandidate: () => calls.push("buildCandidate"),
+    copyApp: () => { calls.push("copyApp"); },
+    removeApp: () => { calls.push("removeApp"); },
+    buildCandidate: () => { calls.push("buildCandidate"); },
     validateCandidate: () => true,
     probeCandidateHealth: (): Health => ({ host: "pass", session: "pass", permissions: { accessibility: "pass" } }),
     fingerprintApp: () => ({ version: "1.0.0", build: "fixture", hash: "fixture-hash" }),
     isAppComplete: () => true,
-    snapshotRuntime: () => calls.push("snapshotRuntime"),
-    promoteCandidate: () => calls.push("promoteCandidate"),
-    restoreApp: () => calls.push("restoreApp"),
-    restoreRuntime: () => calls.push("restoreRuntime"),
+    snapshotRuntime: () => { calls.push("snapshotRuntime"); },
+    promoteCandidate: () => { calls.push("promoteCandidate"); },
+    restoreApp: () => { calls.push("restoreApp"); },
+    restoreRuntime: () => { calls.push("restoreRuntime"); },
     probeHealth: (): Health => ({ host: "pass", session: "pass", permissions: { accessibility: "pass" } }),
-    openApp: () => calls.push("openApp"),
+    openApp: () => { calls.push("openApp"); },
   };
   return { adapters: { ...base, ...overrides }, calls };
 }
@@ -111,10 +111,17 @@ function prebuiltAuthority(
       path: "/private/tmp/accepted-build.json",
       sha256: "1".repeat(64),
       acceptedAt: "2026-07-10T11:00:00.000Z",
+      verification: { level: "isolated-canary", installedAcceptance: "required" },
       sourceCommit: "2".repeat(40),
       sourceTree: "3".repeat(40),
       cargoLockSha256: "4".repeat(64),
       reviewedDiffSha256: "5".repeat(64),
+      upstream: {
+        repository: "https://github.com/openai/codex.git",
+        tag: "rust-v0.146.0-alpha.3.1",
+        commit: "2".repeat(40),
+      },
+      patchSeriesSha256: "0".repeat(64),
       buildCommand: "cargo build --locked --release --package codex-cli --bin codex",
       toolchain: "rustc fixture",
       testEvidence: [{
@@ -128,6 +135,24 @@ function prebuiltAuthority(
       sha256: "7".repeat(64),
       version: "0.146.0-alpha.3.1",
       architecture: "arm64",
+      signature: {
+        identity: "Developer ID Application: Fixture",
+        teamIdentifier: "FIXTURETEAM",
+        designatedRequirement: "fixture requirement",
+      },
+    },
+    closure: {
+      codeModeHost: {
+        path: "/private/tmp/codex-code-mode-host",
+        sha256: "c".repeat(64),
+        architecture: "arm64",
+        signature: {
+          identity: "Developer ID Application: Fixture",
+          teamIdentifier: "FIXTURETEAM",
+          designatedRequirement: "fixture helper requirement",
+        },
+      },
+      resources: [],
     },
     runtime: {
       sourceRoot: "/private/tmp/runtime",
@@ -148,6 +173,8 @@ function preparedPrebuiltEvidence(): PreparedPrebuiltCombinedCandidateEvidence {
     candidateAppFingerprint: "b".repeat(64),
     embeddedBackendSha256: "7".repeat(64),
     embeddedBackendVersion: "0.146.0-alpha.3.1",
+    embeddedCodeModeHostSha256: "c".repeat(64),
+    embeddedResources: [],
     stagedRuntime: {
       fingerprint: "8".repeat(64),
       fileCount: 209,
@@ -1079,10 +1106,15 @@ test("schema-v2 production health accepts only the exact eight surfaces and cano
     writeFileSync(receipt, JSON.stringify(missingRendererProof), { mode: 0o600 });
     assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "unknown");
 
-    const failedRendererProof = structuredClone(valid);
+    const failedRendererProof = {
+      ...structuredClone(valid),
+      rendererProof: {
+        ...valid.rendererProof,
+        failureReason: "canonical renderer process exited",
+      },
+    };
     failedRendererProof.hostReady = "fail";
     failedRendererProof.rendererProof.rendererExited = true;
-    failedRendererProof.rendererProof.failureReason = "canonical renderer process exited";
     failedRendererProof.promotionReady = "fail";
     writeFileSync(receipt, JSON.stringify(failedRendererProof), { mode: 0o600 });
     assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "fail");
@@ -1316,6 +1348,7 @@ test("receipt-bound prebuilt prepare and promotion reuse one exact candidate wit
     const reorderedAuthority: PrebuiltCombinedCandidateAuthority = {
       sourceApp: authority.sourceApp,
       runtime: authority.runtime,
+      closure: authority.closure,
       backend: authority.backend,
       acceptedBuildReceipt: authority.acceptedBuildReceipt,
       installerPayloadHash: authority.installerPayloadHash,

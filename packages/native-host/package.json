@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "macOS native AppKit/Metal host for Tweaker Owl bridge",
+  "description": "macOS native addon and launch helpers for Tweakers overlays, directory swaps, and process coordination",
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node ../../scripts/local-work.mjs workspace-build native-host"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "tweakersBuildCommand": "node scripts/build.mjs"
 }

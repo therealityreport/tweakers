@@ -1,6 +1,7 @@
 import { doctorImplementationScopes, sameDoctorCandidateImplementation, verifyDoctorImplementationAssets } from "./doctor-implementation.js";
 import { assertDoctorCompatibility, doctorConfigurationFingerprint, readCompatibilityRecord } from "./doctor-compatibility.js";
 import { acquireProcessLock } from "./process-lock.js";
+import { assertAcceptedSharedNativeBackendTransitionPrior, assertAcceptedSharedNativeBackendTransitionRequestBinding } from "./shared-native-backend-transition.js";
 import { assertDoctorAdoptionReady, changeReportFingerprint } from "./doctor-adoption.js";
 import { existsSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -51,7 +52,7 @@ export function verifyDoctorPreparedCandidate(root: string, job = readDoctorUpda
 }
 function verifyCandidateBinding(root: string, job: DoctorUpdateJobV1 | null, deep: boolean, preparationOnly: boolean): { job: DoctorUpdateJobV1; receipt: TweakersVariantCandidateReceipt } {
   if (!job || (job.result.state !== "compatible" && !(preparationOnly && job.result.state === "review_required")) || job.result.phase !== "candidate_verified" || !job.candidatePackage
-    || !job.candidateReceipt || !job.result.reviewFingerprint || !job.result.candidateFingerprint) throw new Error("Open Tweakers Doctor: a compatible review and verified candidate are required");
+    || !job.candidateReceipt || !job.result.reviewFingerprint || !job.result.candidateFingerprint) throw new Error("Open Tweakers Manager → Doctor: a compatible review and verified candidate are required");
   if (deep) verifyDoctorImplementationAssets();
   const input = readDoctorIndependentInputs(root);
   if (input.installedIdentity !== job.installedIdentity || (job.workflowVersion !== 2 && input.nativeIdentity !== job.nativeIdentity) || !sameDoctorCandidateImplementation(job.implementationScopes, doctorImplementationScopes())) throw new Error("Doctor approval inputs changed");
@@ -59,6 +60,24 @@ function verifyCandidateBinding(root: string, job: DoctorUpdateJobV1 | null, dee
   if (registered.state !== "ready" || registered.generationId !== job.sourceGenerationId || registered.receiptDigest !== job.sourceReceiptDigest
     || registered.artifactPath !== job.sourcePath) throw new Error("Doctor reviewed source changed");
   const expected = job.candidateReceipt as TweakersVariantCandidateReceipt;
+  const candidateInputs = readDoctorPrivateJson(join(doctorDirectory(root), "jobs", job.id, "candidate-inputs.json")) as {
+    fingerprint?: string; sourceFingerprint?: unknown; configurationFingerprint?: string; patchRepairs?: unknown;
+    implementationScopes?: {construction: string}; acceptedBackendTransition?: unknown; candidateReceiptFingerprint?: string;
+  } | null;
+  if (job.acceptedBackendTransition || expected.acceptedBackendTransition) {
+    if (!job.acceptedBackendTransition || !expected.acceptedBackendTransition || !candidateInputs
+      || doctorDigest(candidateInputs.acceptedBackendTransition) !== doctorDigest(job.acceptedBackendTransition)
+      || candidateInputs.candidateReceiptFingerprint !== doctorDigest(expected)
+      || candidateInputs.fingerprint !== doctorDigest({sourceFingerprint: candidateInputs.sourceFingerprint,
+        configurationFingerprint: candidateInputs.configurationFingerprint, construction: candidateInputs.implementationScopes?.construction,
+        patchRepairs: candidateInputs.patchRepairs, acceptedBackendTransition: job.acceptedBackendTransition})
+      || expected.acceptedBackendTransition.priorRegistrationFingerprint !== job.acceptedBackendTransition.priorRegistrationFingerprint
+      || expected.acceptedBackendTransition.priorResolverBinarySha256 !== job.acceptedBackendTransition.priorResolverBinarySha256) {
+      throw new Error("Doctor backend transition inputs changed");
+    }
+    assertAcceptedSharedNativeBackendTransitionRequestBinding(job.acceptedBackendTransition, expected.acceptedBackendTransition);
+    if (deep) assertAcceptedSharedNativeBackendTransitionPrior(expected.acceptedBackendTransition);
+  }
   if (resolve(job.candidatePackage) !== join(doctorDirectory(root), "jobs", job.id, "candidate")
     || expected.identity.appTarget !== DOCTOR_APP || expected.identity.userRoot !== input.variantRoot
     || expected.identity.appUserDataRoot !== join(input.variantRoot, "app-data") || expected.identity.codexHomeRoot !== join(input.variantRoot, "codex-home")
@@ -105,7 +124,7 @@ export function consumeDoctorCandidateApproval(root: string, operationId: string
   const path = join(doctorDirectory(root), "approval.json");
   const approval = readDoctorPrivateJson(path) as DoctorApprovalV1 | null;
   if (!operationId || !approval || approval.schemaVersion !== 1 || approval.operationId !== operationId || Date.parse(approval.expiresAt) <= Date.now()
-    || !Number.isFinite(Date.parse(approval.expiresAt))) throw new Error("Open Tweakers Doctor and approve the reviewed candidate before refreshing independent Tweakers");
+    || !Number.isFinite(Date.parse(approval.expiresAt))) throw new Error("Open Tweakers Manager → Doctor and approve the reviewed candidate before refreshing independent Tweakers");
   if (approval.promotionFingerprint !== doctorImplementationScopes().promotion) throw new Error("Doctor promotion implementation changed; approve the verified candidate again");
   const checked = verifyDoctorCandidate(root);
   const adoption = assertDoctorAdoptionReady(root, checked.job);

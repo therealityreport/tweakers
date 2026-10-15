@@ -725,6 +725,96 @@ test("enhancement renderer rejects ambiguous, incompatible, and inherited choice
   await harness.stop();
 });
 
+test("enhancement renderer leaves unsupported text validation to the standard form", async () => {
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  for (const [index, constraint] of [
+    { enum: ["allowed"] }, { pattern: "^allowed$" }, { minLength: 2 }, { maxLength: 2 }, { format: "email" },
+  ].entries()) {
+    harness.deliverEnhancement({
+      version: 1, type: "deliver", id: `unsupported-text-${index}`, session_id: `unsupported-text-${index}`,
+      route_fingerprint: "a".repeat(64), input_fingerprint: "b".repeat(64),
+      elicitation: { mode: "form", message: "Constrained text", requestedSchema: {
+        type: "object", properties: { text: { type: "string", title: "Text", ...constraint } },
+      } },
+    });
+    await flushDom();
+    assert.equal(harness.enhancementAcks.length, 0, "unsupported validation must never be acknowledged as an enhanced form");
+    assert.equal(harness.enhancementCard(), null);
+    assert.equal(harness.enhancementResponses.length, 0);
+  }
+  await harness.stop();
+});
+
+test("enhancement renderer leaves unsupported choice validation and restored defaults to the standard form", async () => {
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  const schemas = [
+    { type: "string", title: "Choice", oneOf: [{ const: "a", title: "A" }], default: "a" },
+    { type: "string", title: "Choice", oneOf: [{ const: "a", title: "A" }], pattern: "^b$" },
+    { type: "array", title: "Choices", items: { anyOf: [{ const: "a", title: "A" }] }, default: ["a"] },
+    { type: "array", title: "Choices", items: { anyOf: [{ const: "a", title: "A" }], enum: ["b"] } },
+    { type: "string", title: "Choice", oneOf: [{ const: "a", title: "A", pattern: "^b$" }] },
+  ];
+  for (const [index, choice] of schemas.entries()) {
+    harness.deliverEnhancement({
+      version: 1, type: "deliver", id: `unsupported-choice-${index}`, session_id: `unsupported-choice-${index}`,
+      route_fingerprint: "a".repeat(64), input_fingerprint: "b".repeat(64),
+      elicitation: { mode: "form", message: "Restored or constrained choice", requestedSchema: {
+        type: "object", properties: { choice },
+      } },
+    });
+    await flushDom();
+    assert.equal(harness.enhancementAcks.length, 0, "the standard form retains restored choices and validation the enhancement cannot represent");
+    assert.equal(harness.enhancementCard(), null);
+  }
+  await harness.stop();
+});
+
+test("enhancement renderer must not deliver a choice that violates an unsupported pattern", async () => {
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  harness.deliverEnhancement({
+    version: 1, type: "deliver", id: "choice-pattern", session_id: "choice-pattern",
+    route_fingerprint: "a".repeat(64), input_fingerprint: "b".repeat(64),
+    elicitation: { mode: "form", message: "Constrained choice", requestedSchema: {
+      type: "object", required: ["choice"], properties: {
+        choice: { type: "string", title: "Choice", oneOf: [{ const: "a", title: "A" }], pattern: "^b$" },
+      },
+    } },
+  });
+  await flushDom();
+  const card = harness.enhancementCard();
+  if (card) {
+    card.querySelectorAll("input").find((input) => input.value === "a").click();
+    findByText(card, "button", "Submit").click();
+    await flushDom();
+  }
+  assert.equal(harness.enhancementResponses.length, 0, "choice a violates the requested pattern and must never become an accepted response");
+  assert.equal(harness.enhancementAcks.length, 0, "the standard form owns this unsupported schema");
+  await harness.stop();
+});
+
+test("enhancement renderer leaves unsupported object validation to the standard form", async () => {
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  harness.deliverEnhancement({
+    version: 1, type: "deliver", id: "object-validation", session_id: "object-validation",
+    route_fingerprint: "a".repeat(64), input_fingerprint: "b".repeat(64),
+    elicitation: { mode: "form", message: "Required choice", requestedSchema: {
+      type: "object", allOf: [{ required: ["choice"] }], properties: {
+        choice: { type: "string", title: "Choice", oneOf: [{ const: "a", title: "A" }] },
+      },
+    } },
+  });
+  await flushDom();
+  const card = harness.enhancementCard();
+  if (card) { findByText(card, "button", "Submit").click(); await flushDom(); }
+  assert.equal(harness.enhancementResponses.length, 0, "an object-level required constraint cannot be discarded");
+  assert.equal(harness.enhancementAcks.length, 0);
+  await harness.stop();
+});
+
 test("enhancement socket delivers to its registered renderer and returns only that renderer's submitted response", async (t) => {
   if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
   const root = fs.mkdtempSync(join(tmpdir(), "uq-renderer-bridge-"));
@@ -1165,3 +1255,25 @@ function view(token, input, state, draft) {
     },
   };
 }
+
+
+test("stop requested during renderer registration prevents later native carrier claims", async () => {
+  const harness = rendererHarness();
+  const invoke = harness.api.ipc.invoke;
+  let finishRegistration;
+  let claims = 0;
+  harness.api.ipc.invoke = async (channel, ...args) => {
+    if (channel === "enhancement.register") return new Promise((resolve) => { finishRegistration = resolve; });
+    if (channel === "claim") claims += 1;
+    return invoke(channel, ...args);
+  };
+  const starting = harness.start();
+  await Promise.resolve();
+  const stopping = harness.stop();
+  finishRegistration({ registered: true });
+  await Promise.all([starting, stopping]);
+  assert.equal(claims, 0, "a stopping tweak must not claim new native forms");
+  assert.equal(harness.card(), null);
+  assert.equal(harness.unobserved, 1);
+  assert.equal(harness.unregistered, 1);
+});

@@ -52,6 +52,9 @@ import {
   portableSettingsMigrationCommand,
   type PortableSettingsMigrationCliOptions,
 } from "./portable-settings-migration.js";
+import { maintainTerminalOperationResults, reconcileFailedOfficialSource } from "./artifact-maintenance.js";
+import { localOperationRoot } from "./local-operation.js";
+import { canonicalTweakersManagerRoot } from "./manager-descriptor.js";
 
 interface InstallCliOpts {
   app?: string;
@@ -142,7 +145,7 @@ async function runDevTweak(target: string | undefined, opts: never): Promise<voi
   return devTweak(target, opts);
 }
 
-async function runDevSync(opts: { off?: boolean; quiet?: boolean; watch?: boolean }): Promise<void> {
+async function runDevSync(opts: { off?: boolean; quiet?: boolean; watch?: boolean; commit?: boolean }): Promise<void> {
   const { devSync } = await import("./commands/dev-sync.js");
   return devSync(opts);
 }
@@ -312,6 +315,8 @@ prog
   .option("--force", "Bypass the daily advisory throttle (detect only)")
   .option("--frontend-source-app", "Exact pristine internal ChatGPT.app source (build only)")
   .option("--patch-series", "Comma-separated exact absolute patch files (build only)")
+  .option("--build-only", "Compile and verify backend/helpers without staging a desktop application (build only)")
+  .option("--backend-signing-identity", "Existing Developer ID Application identity for the source-built backend (build only)")
   .option("--chrome-plugin-root", "Exact Chrome DevTools plugin release root (build only)")
   .option("--playwright-plugin-root", "Exact Playwright plugin release root (build only)")
   .option("--fleet-manifest", "Exact full-fleet lifecycle/catalog/artifact manifest (build only)")
@@ -330,6 +335,7 @@ prog
   .describe("Review and explicitly accept one exact frozen codex-source build")
   .option("--transaction", "Exact codex-source transaction ID (review only)")
   .option("--derived-receipt", "Exact schema-v2 codex-derived receipt path (review only)")
+  .option("--source-candidate", "Exact source-verified build-only candidate state path (review only)")
   .option("--review-manifest", "Exact owner-private review manifest path (accept only)")
   .option(
     "--accept-reviewed-manifest-sha256",
@@ -371,6 +377,29 @@ prog
   .action(wrap(runMode));
 
 prog
+  .command("independent-backend-recover <operation-id>")
+  .describe("Resume the original accepted Tweakers backend transition under closed app and broker admission")
+  .action(wrap(async (operationId: string) => {
+    const { resumeSealedIndependentBackendTransition } = await import("./manager-action-adapter.js");
+    await resumeSealedIndependentBackendTransition(operationId);
+  }));
+
+for(const action of ["scan","scan-successor","recover","prepare-native-replacement"] as const) {
+  prog.command(`accepted-runtime-repair-${action} <operation-id>`)
+    .describe(`Use the verified sealed Manager to ${action} the original accepted runtime repair`)
+    .action(wrap(async(operationId:string)=>{
+      const {dispatchAcceptedRuntimeRepairOperatorAction}=await import("./accepted-runtime-repair.js");
+      console.log(JSON.stringify(dispatchAcceptedRuntimeRepairOperatorAction({kind:"tweakers-accepted-runtime-repair-action",version:1,action,operationId})));
+    }));
+}
+prog.command("accepted-runtime-repair-approve <job-id> <report-fingerprint>")
+  .describe("Approve the exact signed Doctor runtime-only repair review")
+  .action(wrap(async(jobId:string,reportFingerprint:string)=>{
+    const {dispatchAcceptedRuntimeRepairOperatorAction}=await import("./accepted-runtime-repair.js");
+    console.log(JSON.stringify(dispatchAcceptedRuntimeRepairOperatorAction({kind:"tweakers-accepted-runtime-repair-action",version:1,action:"approve",jobId,reportFingerprint})));
+  }));
+
+prog
   .command("environment <action>")
   .describe("Inspect, prepare, complete, and recover a durable Stable/Alpha and ChatGPT/Tweakers environment transaction")
   .option("--app-experience", "App experience: chatgpt or tweakers")
@@ -390,6 +419,56 @@ prog
   .command("status")
   .describe("Show patch status, paths, version")
   .action(status);
+
+prog
+  .command("artifact-maintenance")
+  .describe("Preview or reconcile terminal records and exact failed official sources under lifecycle ownership")
+  .option("--apply", "Move eligible records or failed-source payload to recoverable Trash")
+  .option("--failed-source-id", "Exact failed official-source reservation ID to reconcile")
+  .action(wrap(async (opts: {apply?: boolean;failedSourceId?:string;"failed-source-id"?:string}) => {
+    const id=opts.failedSourceId??opts["failed-source-id"];
+    if(id) {
+      console.log(JSON.stringify(await reconcileFailedOfficialSource(canonicalTweakersManagerRoot(),id,opts.apply===true)));
+      return;
+    }
+    const result = await maintainTerminalOperationResults(localOperationRoot(), opts.apply === true);
+    console.log(JSON.stringify({retained:result.retained.length, eligible:result.eligible.length, retired:result.retired.length}));
+  }));
+
+prog
+  .command("recover-missing-artifact <reservation-id>")
+  .describe("Preview or resume verified archive recovery for one missing partial artifact")
+  .option("--apply", "Restore into one private noexec APFS proof image and reconcile a successor receipt")
+  .option("--transaction", "Exact existing recovery transaction UUID; resume the same allocation")
+  .action(wrap(async (reservationId:string,opts:{apply?:boolean;transaction?:string})=>{
+    const {recoverMissingArtifact}=await import("./missing-artifact-recovery.js");
+    console.log(JSON.stringify(await recoverMissingArtifact(canonicalTweakersManagerRoot(),reservationId,{apply:opts.apply===true,transactionId:opts.transaction})));
+  }));
+
+prog
+  .command("maintenance <action>")
+  .describe("Two-version generation retention: `retain` previews (default) or, with --apply, archives superseded generations")
+  .option("--apply", "Archive retirable generations to the configured archive volume (recoverable Trash fallback per policy)")
+  .option("--json", "Print the full plan or result as JSON")
+  .option("--max-bytes", "Optional per-run byte budget for --apply")
+  .action(wrap(async (action: string, opts: {apply?: boolean; json?: boolean; "max-bytes"?: number | string; maxBytes?: number | string}) => {
+    if (action !== "retain") throw new Error(`Unknown maintenance action: ${action}. Use: tweaker maintenance retain [--apply]`);
+    const { planGenerationRetention, applyGenerationRetention, summarizeGenerationRetentionPlan } = await import("./generation-retention.js");
+    const root = canonicalTweakersManagerRoot();
+    const plan = planGenerationRetention(root);
+    if (opts.apply !== true) {
+      console.log(JSON.stringify(opts.json === true ? plan : summarizeGenerationRetentionPlan(plan), null, 2));
+      return;
+    }
+    const limit = opts["max-bytes"] ?? opts.maxBytes;
+    const maxBytes = limit === undefined ? undefined : Number(limit);
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)) throw new Error("--max-bytes must be a positive integer");
+    const result = await applyGenerationRetention(root, plan, { maxBytes });
+    console.log(JSON.stringify(opts.json === true ? result : {
+      retired: result.retired.length, retiredBytes: result.retired.reduce((sum, row) => sum + row.bytes, 0),
+      skipped: result.skipped.map(row => ({ family: row.family, name: row.name, reason: row.reason })),
+    }, null, 2));
+  }));
 
 prog
   .command("doctor")
@@ -452,6 +531,7 @@ prog
   .command("dev-sync")
   .describe("Validate, build, and publish the development checkout without changing Git state")
   .option("--watch", "Watch the checkout and publish each successful validated build")
+  .option("--commit", "Promote the validated build as a committed independent Tweakers generation (quit Tweakers first)")
   .option("--off", "Disable dev mode and restore the bundled tweak copies")
   .option("--quiet", "Suppress output")
   .action(wrap(runDevSync));

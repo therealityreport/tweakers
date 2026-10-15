@@ -1,3 +1,4 @@
+import { consolidateTweakTopics } from "../src/tweak-topic-migration";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -206,4 +207,68 @@ test("promotion storage self-test removes a deterministic archive after commit f
 
   assert.equal(verifyRendererStorageRollback(storage, nonce), "fail");
   assert.deepEqual([...values.keys()], []);
+});
+
+
+test("topic migration preserves destination overrides and legacy data, and never suppresses after write failure", () => {
+  const owner = "co.tweakers.ui-improvements";
+  const legacy = "co.tweakers.shadcn-codex-ui";
+  const key = (id: string) => `tweaker:storage:${id}`;
+  const tweaks = [{ manifest: { id: owner, version: "0.3.0" }, enabled: true }, { manifest: { id: legacy, version: "0.2.6" }, enabled: true }];
+  const original = JSON.stringify({ enabled: true, retained: "legacy" });
+  const { storage, values } = fakeStorage([[key(legacy), original], [key(owner), JSON.stringify({ enabledImprovements: { version: 4, enabled: { "rich-blocks": false } } })]]);
+  assert.deepEqual([...consolidateTweakTopics(tweaks, storage)], [legacy]);
+  assert.equal(createRendererStorage(owner, storage).get<any>("enabledImprovements").enabled["rich-blocks"], false);
+  assert.equal(values.get(key(legacy)), original);
+  assert.deepEqual([...consolidateTweakTopics(tweaks, storage)], [legacy]);
+  const failed = fakeStorage([[key(legacy), original]], { failWrites: true });
+  assert.equal(consolidateTweakTopics(tweaks, failed.storage).size, 0);
+  assert.equal(consolidateTweakTopics([{ ...tweaks[0], enabled: false }, tweaks[1]], storage).size, 0);
+});
+
+
+test("topic migration creates a recognized UI schema for a fresh owner", () => {
+  const { storage } = fakeStorage([]);
+  const owner = "co.tweakers.ui-improvements", legacy = "co.tweakers.titlebar-controls";
+  assert.equal(consolidateTweakTopics([
+    { manifest: { id: owner, version: "0.3.0" }, enabled: true },
+    { manifest: { id: legacy, version: "0.2.6" }, enabled: true },
+  ], storage).has(legacy), true);
+  assert.deepEqual(createRendererStorage(owner, storage).get("enabledImprovements"), { version: 4, enabled: { "titlebar-controls": true } });
+});
+
+
+test("explicit owner toggle suppresses legacy activation despite conflicted legacy storage", () => {
+  const owner = "co.tweakers.ui-improvements", legacy = "co.tweakers.shadcn-codex-ui";
+  const { storage } = fakeStorage([
+    [`tweaker:storage:${owner}`, JSON.stringify({ enabledImprovements: { version: 4, enabled: { "rich-blocks": true } } })],
+    [`tweaker:storage:${legacy}`, JSON.stringify({ enabled: true })],
+    [`codexpp:storage:${legacy}`, JSON.stringify({ enabled: false })],
+  ]);
+  assert.equal(consolidateTweakTopics([
+    { manifest: { id: owner, version: "0.3.0" }, enabled: true },
+    { manifest: { id: legacy, version: "0.2.6" }, enabled: true },
+  ], storage).has(legacy), true);
+});
+
+
+test("malformed destination child toggles do not silently disable an enabled legacy feature", () => {
+  const owner = "co.tweakers.ui-improvements", legacy = "co.tweakers.titlebar-controls";
+  const { storage } = fakeStorage([[`tweaker:storage:${owner}`, JSON.stringify({ enabledImprovements: { version: 4, enabled: { "titlebar-controls": "invalid" } } })]]);
+  const tweaks = [{ manifest: { id: owner, version: "0.3.0" }, enabled: true }, { manifest: { id: legacy, version: "0.2.6" }, enabled: true }];
+  assert.equal(consolidateTweakTopics(tweaks, storage).has(legacy), true);
+  assert.equal(createRendererStorage(owner, storage).get<any>("enabledImprovements").enabled["titlebar-controls"], true);
+  assert.equal(consolidateTweakTopics(tweaks, storage).has(legacy), true);
+});
+
+
+test("malformed Projects profile toggles migrate without losing legacy enablement", () => {
+  const owner = "co.tweakers.projects", legacy = "co.tweakers.thread-summary-profiles";
+  const { storage } = fakeStorage([[`tweaker:storage:${owner}`, JSON.stringify({ threadSummaryProfiles: "invalid" })]]);
+  const tweaks = [{ manifest: { id: owner, version: "0.8.0" }, enabled: true }, { manifest: { id: legacy, version: "0.2.6" }, enabled: true }];
+  assert.equal(consolidateTweakTopics(tweaks, storage).has(legacy), true);
+  assert.equal(createRendererStorage(owner, storage).get("threadSummaryProfiles"), true);
+  createRendererStorage(owner, storage).set("threadSummaryProfiles", false);
+  assert.equal(consolidateTweakTopics(tweaks, storage).has(legacy), true);
+  assert.equal(createRendererStorage(owner, storage).get("threadSummaryProfiles"), false);
 });

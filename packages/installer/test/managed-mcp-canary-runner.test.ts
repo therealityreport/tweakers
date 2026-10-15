@@ -241,6 +241,8 @@ class FakeObservationAdapter implements ManagedMcpCanaryObservationAdapterImplem
       executable: "/usr/bin/node",
       executableSha256: "c".repeat(64),
       argv: ["fixture-mcp"],
+      commandLine: "/usr/bin/node fixture-mcp",
+      artifactIdentities: [{ path: "/usr/bin/node", sha256: "c".repeat(64), source: "executable" }],
       routeKey,
       taskId,
     };
@@ -363,6 +365,7 @@ function createFixture(): Fixture {
     declarationFingerprint: entry.declarationFingerprint,
     catalogSha256: entry.catalog.sha256,
     artifactSha256: ["c".repeat(64)],
+    artifacts: [{ path: "/usr/bin/node", sha256: "c".repeat(64) }],
     representativeTool: `${entry.server}_tool`,
     representativeArguments: {},
   }));

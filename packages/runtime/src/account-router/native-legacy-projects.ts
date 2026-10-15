@@ -11,8 +11,11 @@ const MAX_REMOVAL_BYTES = 1024 * 1024;
 
 export interface NativeDesktopProjectsProjectionV1 {
   version: 1;
+  access: "read_only" | "read_write";
+  source: "saved_local" | "app_server";
+  authorityGeneration: number;
   values: {
-    "local-projects": Record<string, { id: string; name: string; rootPaths: string[]; createdAt: number; updatedAt: number }>;
+    "local-projects": Record<string, { id: string; name: string; rootPaths: string[]; createdAt: number; updatedAt: number; metadata?: Record<string, unknown> }>;
     "thread-project-assignments": Record<string, { projectKind: "local"; projectId: string }>;
     "project-order": string[];
     "pinned-project-ids": string[];
@@ -120,11 +123,11 @@ export class NativeLegacyProjectsV1 {
   unresolvedMembershipCount(): number | null { return this.ready && !this.failed ? this.unresolved : null; }
 
   /** Read a bounded, data-only snapshot for the native desktop project UI. */
-  desktopProjection(nativeProjects: readonly unknown[]): NativeDesktopProjectsProjectionV1 | null {
+  desktopProjection(nativeProjects: readonly unknown[], authority: Pick<NativeDesktopProjectsProjectionV1, "access" | "source" | "authorityGeneration"> = { access: "read_write", source: "app_server", authorityGeneration: 0 }): NativeDesktopProjectsProjectionV1 | null {
     this.ready = false; this.unresolved = 0; this.assignments.clear(); this.ordered.clear();
-    if (this.failed || nativeProjects.length > MAX_PROJECTS) return null;
+    if (this.failed || nativeProjects.length > MAX_PROJECTS || !Number.isSafeInteger(authority.authorityGeneration) || authority.authorityGeneration < 0) return null;
     try {
-      const current = nativeProjects.map(currentNativeProject);
+      const current = nativeProjects.map((project) => currentNativeProject(project, authority.source));
       if (current.some((project) => project === null)) return null;
       const currentProjects = current as CurrentNativeProject[];
       const valid = new Set(currentProjects.map((project) => project.id));
@@ -158,7 +161,8 @@ export class NativeLegacyProjectsV1 {
         const publicId = publicIds.get(project.id)!;
         const saved = savedProjects.get(publicId);
         projectIdMap[publicId] = project.id;
-        projects[publicId] = { id: publicId, name: project.name, rootPaths: [...project.rootPaths], createdAt: saved?.createdAt ?? 0, updatedAt: saved?.updatedAt ?? 0 };
+        projects[publicId] = { id: publicId, name: project.name, rootPaths: [...project.rootPaths], createdAt: project.createdAt ?? saved?.createdAt ?? 0, updatedAt: project.updatedAt ?? saved?.updatedAt ?? 0,
+          ...(project.metadata === undefined ? {} : { metadata: structuredClone(project.metadata) }) };
         if (project.appearance !== undefined) appearances[publicId] = structuredClone(project.appearance);
       }
 
@@ -168,9 +172,15 @@ export class NativeLegacyProjectsV1 {
         if (!id(threadId) || !isPlainRecord(value)) return null;
         if (value.projectKind !== "local") continue;
         if (!id(value.projectId)) return null;
+        if (this.removals.has(threadId)) continue;
         const publicProjectId = publicProjectIdFor(value.projectId, projectIdMap);
-        if (!publicProjectId) { this.unresolved += 1; continue; }
-        if (!this.removals.has(threadId)) assignments[threadId] = { projectKind: "local", projectId: publicProjectId };
+        if (!publicProjectId) {
+          if (!jsonData(value, 0)) return null;
+          this.unresolved += 1;
+          assignments[threadId] = structuredClone(value) as { projectKind: "local"; projectId: string };
+          continue;
+        }
+        assignments[threadId] = { projectKind: "local", projectId: publicProjectId };
       }
 
       const projectOrder = reconciledProjectIdList(data["project-order"] ?? [], projects, projectIdMap, [...publicIds.values()]);
@@ -210,7 +220,7 @@ export class NativeLegacyProjectsV1 {
       const grouped = new Map<string, string[]>();
       for (const [threadId, assignment] of Object.entries(assignments)) {
         const nativeProjectId = projectIdMap[assignment.projectId];
-        if (!nativeProjectId) return null;
+        if (!nativeProjectId) continue;
         this.assignments.set(threadId, nativeProjectId);
         const rows = grouped.get(nativeProjectId) ?? []; rows.push(threadId); grouped.set(nativeProjectId, rows);
       }
@@ -225,6 +235,7 @@ export class NativeLegacyProjectsV1 {
       this.ready = true;
       return {
         version: 1,
+        ...authority,
         values: {
           "local-projects": projects,
           "thread-project-assignments": assignments,
@@ -264,11 +275,11 @@ export class NativeLegacyProjectsV1 {
 function id(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\s/\\\u0000-\u001f\u007f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value); }
 function safeTime(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
 function pathList(value: unknown, max: number): value is string[] {
-  return Array.isArray(value) && value.length <= max && value.every((entry) => typeof entry === "string" && entry.length > 0 && entry.length <= 4096 && isAbsolute(entry));
+  return Array.isArray(value) && value.length <= max && value.every((entry) => typeof entry === "string" && entry.length > 0 && entry.length <= 4096 && isAbsolute(entry) && normalize(entry) === entry && !/[\u0000-\u001f\u007f]/.test(entry));
 }
-interface CurrentNativeProject { id: string; name: string; rootPaths: string[]; appearance?: unknown }
+interface CurrentNativeProject { id: string; name: string; rootPaths: string[]; appearance?: unknown; metadata?: Record<string, unknown>; createdAt?: number; updatedAt?: number }
 interface SavedLegacyProject { id: string; name: string; rootPaths: string[]; createdAt: number; updatedAt: number }
-function currentNativeProject(value: unknown): CurrentNativeProject | null {
+function currentNativeProject(value: unknown, source: NativeDesktopProjectsProjectionV1["source"]): CurrentNativeProject | null {
   if (!isPlainRecord(value) || !id(value.id) || typeof value.name !== "string" || value.name.length < 1 || value.name.length > 4096
     || /[\u0000-\u001f\u007f]/.test(value.name) || !Array.isArray(value.roots) || value.roots.length > MAX_PROJECTS) return null;
   const rootPaths: string[] = [];
@@ -278,6 +289,11 @@ function currentNativeProject(value: unknown): CurrentNativeProject | null {
     rootPaths.push(root.path);
   }
   if (new Set(rootPaths).size !== rootPaths.length) return null;
+  if ((value.createdAt !== undefined && !safeTime(value.createdAt)) || (value.updatedAt !== undefined && !safeTime(value.updatedAt))) return null;
+  const multiplier = source === "app_server" ? 1000 : 1;
+  const createdAt = value.createdAt === undefined ? undefined : (value.createdAt as number) * multiplier;
+  const updatedAt = value.updatedAt === undefined ? undefined : (value.updatedAt as number) * multiplier;
+  if ((createdAt !== undefined && !safeTime(createdAt)) || (updatedAt !== undefined && !safeTime(updatedAt))) return null;
   let appearance: unknown;
   if (value.metadata !== undefined) {
     if (!isPlainRecord(value.metadata) || !jsonData(value.metadata, 0) || Buffer.byteLength(JSON.stringify(value.metadata), "utf8") > 1024 * 1024) return null;
@@ -289,7 +305,9 @@ function currentNativeProject(value: unknown): CurrentNativeProject | null {
     }
     if (Object.keys(parsed).length > 0) { if (!jsonData(parsed, 0)) return null; appearance = parsed; }
   }
-  return appearance === undefined ? { id: value.id, name: value.name, rootPaths } : { id: value.id, name: value.name, rootPaths, appearance };
+  return { id: value.id, name: value.name, rootPaths, ...(appearance === undefined ? {} : { appearance }),
+    ...(value.metadata === undefined ? {} : { metadata: structuredClone(value.metadata) as Record<string, unknown> }),
+    ...(createdAt === undefined ? {} : { createdAt }), ...(updatedAt === undefined ? {} : { updatedAt }) };
 }
 function savedLegacyProject(legacyId: string, value: unknown): SavedLegacyProject | null {
   return id(legacyId) && isPlainRecord(value) && value.id === legacyId && typeof value.name === "string" && value.name.length > 0 && value.name.length <= 4096

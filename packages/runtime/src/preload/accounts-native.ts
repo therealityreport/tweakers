@@ -190,6 +190,13 @@ export function createAccountsNativeBridge(): AccountsNativeBridgeController {
 
   const api: AccountsNativeApi = Object.freeze({
     status,
+    // Data-only change notification so the Accounts tweak can tell the user
+    // when compatibility is revoked after startup. Handlers receive the same
+    // frozen `{ surface, generation }` event as the transport and read
+    // `status()` themselves; they never receive native elements.
+    subscribe(handler: (event: { surface: AccountsNativeSlotSurface | null; generation: number }) => void): () => void {
+      return transport.subscribe(handler);
+    },
     register(next: AccountsNativeAdapter): () => void {
       if (!next || typeof next.request !== "function" || disposed) return () => {};
       if (adapter !== next) clearOauthBindings();

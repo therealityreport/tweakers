@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { ownEntrypoint } from "./owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
@@ -73,7 +75,9 @@ export function runTweakTests(root, options = {}) {
   const preload = new URL("./test-root-preload.mjs", import.meta.url).href;
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
-  const result = spawnSync(process.execPath, ["--import", preload, "--test", ...tests], {
+  const workers = Number(process.env.TWEAKERS_TEST_WORKERS ?? 2);
+  if (!Number.isInteger(workers) || workers < 1 || workers > 8) throw new Error("TWEAKERS_TEST_WORKERS must be between 1 and 8");
+  const result = spawnSync(process.execPath, ["--import", preload, "--test", `--test-concurrency=${workers}`, ...tests], {
     cwd: resolve(root),
     env,
     stdio: "inherit",

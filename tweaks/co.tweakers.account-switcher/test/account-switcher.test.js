@@ -995,6 +995,25 @@ test("native Usage projects the pooled remaining bar and hides single-account ex
   assert.match(noFreshMessage, /Pooled usage is incomplete.*not reported fresh usage/i);
 });
 
+test("Usage history context follows the selected account and accepts only fresh weekly readings", () => {
+  const first = brokerAccountId("history-first"), second = brokerAccountId("history-second");
+  const state = { selectedAccountId: first, usageSelectionId: first, profile: { accounts: [
+    { accountId: first, label: "First", quota: { remainingPercent: 72, freshness: "fresh", resetAt: "2026-09-29T15:00:00Z" } },
+    { accountId: second, label: "Second", quota: { remainingPercent: 51, freshness: "fresh", resetAt: "2026-09-29T15:00:00Z" } },
+  ] } };
+  assert.deepEqual(_test.projectAccountsNativeValue(state, "usage", "history-context", null), {
+    accountId: first, label: "First", remainingPercent: 72, resetAt: "2026-09-29T15:00:00Z",
+  });
+  state.usageSelectionId = second;
+  assert.deepEqual(_test.projectAccountsNativeValue(state, "usage", "history-context", null), {
+    accountId: second, label: "Second", remainingPercent: 51, resetAt: "2026-09-29T15:00:00Z",
+  });
+  state.profile.accounts[1].quota.freshness = "stale";
+  assert.deepEqual(_test.projectAccountsNativeValue(state, "usage", "history-context", null), {
+    accountId: second, label: "Second", remainingPercent: null, resetAt: null,
+  });
+});
+
 test("the native reset modal keeps subscription billing facts while showing fresh pool availability", () => {
   const title = { textContent: "You’re out of usage", children: [] };
   const weekly = { textContent: "Weekly usage limit", children: [] };
@@ -2562,11 +2581,16 @@ test("legacy analytics cleanup neutralizes only the exact trusted fixture throug
   const legacyFile = path.join(legacyDir, "account-analytics.v1.json");
   const unrelatedFile = path.join(legacyDir, "unrelated-state.json");
   const codexHomeLookalike = path.join(setup.paths.codexDir, "account-analytics.v1.json");
+  const stateDatabase = path.join(setup.paths.codexDir, "state_5.sqlite");
+  const rollout = path.join(setup.paths.codexDir, "sessions", "2026", "09", "18", "rollout.jsonl");
   fs.mkdirSync(legacyDir, { recursive: true, mode: 0o700 });
   // Owner-write only proves the helper does not need to read the legacy bytes.
   fs.writeFileSync(legacyFile, "opaque legacy bytes", { mode: 0o200 });
   fs.writeFileSync(unrelatedFile, "keep", { mode: 0o600 });
   fs.writeFileSync(codexHomeLookalike, "keep", { mode: 0o600 });
+  fs.writeFileSync(stateDatabase, "database", { mode: 0o600 });
+  fs.mkdirSync(path.dirname(rollout), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(rollout, "rollout", { mode: 0o600 });
   const before = fs.lstatSync(legacyFile);
 
   _test.cleanupLegacyAnalytics(setup.deps);
@@ -2576,6 +2600,8 @@ test("legacy analytics cleanup neutralizes only the exact trusted fixture throug
   assert.equal(after.size, 0, "only its retained analytics bytes are neutralized");
   assert.equal(fs.readFileSync(unrelatedFile, "utf8"), "keep");
   assert.equal(fs.readFileSync(codexHomeLookalike, "utf8"), "keep");
+  assert.equal(fs.readFileSync(stateDatabase, "utf8"), "database");
+  assert.equal(fs.readFileSync(rollout, "utf8"), "rollout");
 });
 
 test("legacy analytics cleanup is nonfatal and leaves its fixture unchanged when the helper is unavailable", (t) => {
@@ -3679,6 +3705,12 @@ test("device sign-in opens only the fixed external page in broker and legacy mod
   await button.listeners.get("click")();
   assert.deepEqual(requests, [{ action: "open-device-sign-in" }]);
   assert.equal(button.disabled, false);
+  nodes.length = 0;
+  state.activeEnrollment = { state: "complete", kind: "reconnect" };
+  _test.brokerEnrollmentStatusCard(state);
+  assert.ok(nodes.some((node) => node.textContent === "Subscription reconnected"));
+  assert.ok(nodes.some((node) => node.textContent === "Sign-in is complete."));
+  assert.equal(nodes.some((node) => /Preparing|Open sign-in/.test(node.textContent || "")), false);
 });
 
 test("device-login cancellation sends only the sealed provider login handle and never publishes it", () => {
@@ -4234,6 +4266,7 @@ test("fork-parity Accounts controls use strict account-scoped broker projections
     quota: { remainingPercent: 71, freshness: "fresh", resetAt: null, resetCredits: 0 },
   };
   const requests = [];
+  let preferenceSave = null;
   const response = (request, result) => ({ version: 1, requestId: request.requestId, ok: true, result });
   const state = {
     disposed: false, brokerRequestNonce: 0, profile: { accounts: [account], selectedAccountId: accountId }, selectedAccountId: accountId,
@@ -4242,7 +4275,12 @@ test("fork-parity Accounts controls use strict account-scoped broker projections
     menuExpandedBrokerAccountId: null, brokerStatus: { textContent: "" },
     api: { ipc: { async invoke(_channel, request) {
       requests.push(request);
-      if (request.command === "preferences.update") return response(request, { ...preferences, ...request.params });
+      if (request.command === "preferences.update") {
+        if (preferenceSave) return preferenceSave(request);
+        return response(request, { ...state.preferences, ...request.params });
+      }
+      if (request.command === "preferences.read") return response(request, state.preferences);
+      if (request.command === "reconnect.start") return { version: 1, requestId: request.requestId, ok: false, error: { code: "internal_error" } };
       if (request.command === "profile.email") return response(request, { accountId, email: "reader@example.test" });
       if (request.command === "remote.status") return response(request, remote({ enabled: false, state: "disabled", devices: [] }));
       if (request.command === "remote.enable") return response(request, remote({ devices: [] }));
@@ -4252,7 +4290,8 @@ test("fork-parity Accounts controls use strict account-scoped broker projections
       if (request.command === "remote.devices.revoke") return response(request, remote({ devices: [] }));
       if (request.command === "connection.list") return response(request, { accountId, connections: [] });
       if (request.command === "profile.read") return response(request, state.profile);
-      if (request.command === "quota.read") return response(request, { accountId, quota: account.quota });
+      if (request.command === "quota.read") return response(request, request.params?.accountId
+        ? { accountId, quota: account.quota } : { accounts: [{ accountId, quota: account.quota }] });
       if (request.command === "history.read") return response(request, { conversation: null, turns: [] });
       if (["events.subscribe", "events.unsubscribe"].includes(request.command)) return response(request, {});
       throw new Error(`unexpected command ${request.command}`);
@@ -4264,6 +4303,55 @@ test("fork-parity Accounts controls use strict account-scoped broker projections
   preferenceSelector.value = "ask";
   await preferenceSelector.listeners.get("change")();
   assert.deepEqual(requests.find((request) => request.command === "preferences.update").params, { failoverMode: "ask" });
+
+  // Sharing saves are observable through the switch and broker boundary. A
+  // failed write must retain the old preference even after a fresh render.
+  const sharingSwitch = (card) => find(card, (entry) => entry.attrs.role === "switch");
+  const sharing = sharingSwitch(_test.brokerRoutingPreferencesCard(state));
+  assert.ok(sharing, "sharing is exposed as an accessible switch");
+  assert.equal(sharing.tagName, "button", "native button supplies Enter and Space activation");
+  assert.equal(sharing.attrs["aria-checked"], "false");
+  let finishSave;
+  preferenceSave = (request) => new Promise((resolve) => { finishSave = (ok) => resolve(ok
+    ? response(request, { ...state.preferences, ...request.params })
+    : { version: 1, requestId: request.requestId, ok: false, error: { code: "internal_error" } }); });
+  const failedSave = sharing.listeners.get("click")();
+  assert.equal(sharing.disabled, true);
+  assert.equal(sharing.attrs["aria-busy"], "true");
+  const duringSave = sharingSwitch(_test.brokerRoutingPreferencesCard(state));
+  assert.equal(duringSave.disabled, true, "rerenders retain pending state");
+  const savesBeforeDuplicate = requests.filter((request) => request.command === "preferences.update").length;
+  await duringSave.listeners.get("click")();
+  assert.equal(requests.filter((request) => request.command === "preferences.update").length, savesBeforeDuplicate);
+  finishSave(false);
+  await failedSave;
+  assert.equal(sharing.disabled, false);
+  assert.equal(sharing.attrs["aria-checked"], "false");
+  assert.equal(state.preferences.unifiedCatalogEnabled, false);
+  const successfulSave = sharing.listeners.get("click")();
+  finishSave(true);
+  await successfulSave;
+  assert.equal(sharing.attrs["aria-checked"], "true");
+  assert.equal(sharing.attrs["aria-busy"], "false");
+  assert.equal(state.preferences.failoverMode, "ask", "sharing leaves routing preference intact");
+  assert.equal(sharingSwitch(_test.brokerRoutingPreferencesCard(state)).attrs["aria-checked"], "true");
+  preferenceSave = null;
+
+  const authentication = _test.brokerAccountDisclosure(state, { ...account, status: "reauth_required" });
+  assert.ok(buttonsNamed(authentication, "Sign in again"));
+  assert.equal(buttonsNamed(authentication, "Reconnect"), null);
+  buttonsNamed(authentication, "Sign in again").listeners.get("click")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests.find((request) => request.command === "reconnect.start").params, { accountId });
+  const unavailable = _test.brokerAccountDisclosure(state, { ...account, status: "unavailable" });
+  assert.equal(buttonsNamed(unavailable, "Sign in again"), null);
+  const recoveryStart = requests.length;
+  await buttonsNamed(unavailable, "Retry").listeners.get("click")();
+  assert.deepEqual(requests.slice(recoveryStart, recoveryStart + 2).map((request) => [request.command, request.params]), [
+    ["quota.read", { accountId }], ["profile.read", undefined],
+  ]);
+  assert.equal(requests.slice(recoveryStart).some((request) => request.command === "reconnect.start"), false,
+    "temporary unavailability does not replace account authentication");
 
   const disclosure = _test.brokerAccountDisclosure(state, account);
   assert.doesNotMatch(text(disclosure), /existing settings while it is active/);
@@ -4440,4 +4528,146 @@ test("profile activity keeps pooled and per-subscription statistics public, cach
   picker.listeners.get("change")();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(requests.length, requestCount, "forged private selections never reach the broker");
+
+  const native = {
+    profile: {
+      display_name: "Native user", username: "native-user", email: "native-user@example.test",
+      profile_picture_url: "https://example.test/native-profile.png", plan: "Native plan",
+      unknown_native_field: { preserved: true },
+    },
+    stats: { lifetime_tokens: 1 }, metadata: { stats_as_of: "native" }, native_extension: "preserved",
+  };
+  const nativeBytes = JSON.stringify(native);
+  for (const accountId of [primaryId, null]) {
+    const projected = await _test.requestAccountsNativeValue(state, "profile", "profile.statistics", { native }, { accountId, generation: 1 });
+    assert.equal(projected.profile, native.profile, "the complete native identity object is retained without substitution");
+    assert.equal(JSON.stringify(native), nativeBytes, "the native baseline is never mutated");
+    assert.equal(projected.stats.lifetime_tokens, 124_500);
+    assert.equal(projected.native_extension, "preserved");
+    assert.deepEqual(requests.at(-1).params, { selection: accountId || "pooled" }, "native identity never crosses the broker request boundary");
+    assert.equal(JSON.stringify(requests.at(-1)).includes(native.profile.email), false);
+  }
+  const beforeInvalid = requests.length;
+  for (const params of [{}, { native: null }, { native: { profile: null } }, { native, extra: true }]) {
+    await assert.rejects(_test.requestAccountsNativeValue(state, "profile", "profile.statistics", params, { accountId: primaryId, generation: 1 }), /invalid-native-request/);
+  }
+  assert.equal(requests.length, beforeInvalid, "invalid identity baselines are rejected before broker access");
+});
+
+
+test("account enrollment stops its retry and ignores late status after renderer disposal", async (t) => {
+  const previousDocument = global.document;
+  const previousWindow = global.window;
+  const node = (tagName) => ({
+    tagName, children: [], listeners: new Map(), textContent: "", style: {},
+    append(...children) { this.children.push(...children); },
+    addEventListener(type, listener) { this.listeners.set(type, listener); },
+    setAttribute() {},
+  });
+  const timers = new Map();
+  let nextTimer = 0;
+  global.document = { createElement: node, querySelectorAll: () => [] };
+  global.window = { setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; }, clearTimeout(id) { timers.delete(id); } };
+  t.after(() => { global.document = previousDocument; global.window = previousWindow; });
+  let finishStatus;
+  const state = {
+    disposed: false, cleanups: [], enrollmentTimers: new Map(), remoteTimers: new Map(),
+    remoteByAccountId: new Map(), remoteErrors: new Map(), brokerRoots: new Set(),
+    nativeSettingsTargets: new Map(), nativeConnectionSelections: new Map(), sharedHistoryAdapterRevision: 0,
+    api: { ipc: { async invoke(_channel, request) {
+      if (request.action === "account-enroll-start") return { ok: true, enrollment: { id: "enrollment-one" } };
+      if (request.action === "account-enroll-status") return new Promise((resolve) => { finishStatus = resolve; });
+      throw new Error(`Unexpected request ${request.action}`);
+    } } },
+  };
+  const status = node("div");
+  const card = _test.accountRecoveryCard(state, [], 0, null, status);
+  const descendants = (root) => [root, ...root.children.flatMap(descendants)];
+  const add = descendants(card).find((entry) => entry.textContent === "Add another subscription");
+  await add.listeners.get("click")();
+  _test.disposeRenderer(state);
+  finishStatus({ ok: true, enrollment: { state: "preparing" } });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(timers.size, 0, "late enrollment status cannot create an orphan retry timer");
+  assert.equal(status.textContent, "Starting secure device-code sign-in…", "disposed UI must not be rewritten by a late status");
+  const retryState = { ...state, disposed: false, cleanups: [], enrollmentTimers: new Map() };
+  const retryCard = _test.accountRecoveryCard(retryState, [], 0, null, node("div"));
+  const retryAdd = descendants(retryCard).find((entry) => entry.textContent === "Add another subscription");
+  await retryAdd.listeners.get("click")();
+  finishStatus({ ok: true, enrollment: { state: "preparing" } });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(timers.size, 1, "an active enrollment schedules its next status read");
+  _test.disposeRenderer(retryState);
+  assert.equal(timers.size, 0, "stop cancels an already scheduled enrollment retry");
+});
+
+test("Profile activity scope preserves the native signed-in header and releases owned controls on bridge disable", (t) => {
+  const previousDocument = global.document;
+  const node = (tagName) => ({
+    tagName, children: [], dataset: {}, attrs: {}, style: {}, textContent: "",
+    append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } },
+    setAttribute(name, value) { this.attrs[name] = String(value); },
+    addEventListener() {},
+    replaceWith(next) { const parent = this.parentElement; parent.children.splice(parent.children.indexOf(this), 1, next); next.parentElement = parent; },
+    remove() { const parent = this.parentElement; parent?.children.splice(parent.children.indexOf(this), 1); },
+  });
+  const host = node("div");
+  const nativeAvatar = node("img");
+  nativeAvatar.src = "https://example.test/native-admin.png";
+  const nativeHeader = node("div");
+  nativeHeader.textContent = "admin@example.test";
+  const slot = node("div");
+  host.append(nativeAvatar, nativeHeader, slot);
+  global.document = {
+    createElement: node,
+    querySelectorAll(selector) {
+      if (selector === '[data-tweakers-native-surface="profile"]') return [slot];
+      if (selector === "[data-tweakers-account-native-slot-content]") return slot.children;
+      return [];
+    },
+  };
+  t.after(() => { global.document = previousDocument; });
+  const accountId = brokerAccountId("codex-profile-activity");
+  const account = { accountId, label: "c••••@example.test", avatarUrl: "https://example.test/codex.png", enabled: true };
+  const state = { disposed: false, profile: { accounts: [account] }, profileStatisticsSelection: accountId,
+    api: { accountsNative: { status: () => ({ compatible: true }) } } };
+  const descendants = (value) => [value, ...value.children.flatMap(descendants)];
+  for (const selection of [accountId, "pooled"]) {
+    state.profileStatisticsSelection = selection;
+    _test.renderAccountsNativeSlots(state);
+    assert.deepEqual(host.children, [nativeAvatar, nativeHeader, slot]);
+    assert.equal(nativeHeader.textContent, "admin@example.test");
+    assert.equal(nativeAvatar.src, "https://example.test/native-admin.png");
+    const content = descendants(slot);
+    assert.equal(content.filter((entry) => entry.tagName === "select")[0].value, selection);
+    assert.equal(content.some((entry) => entry.tagName === "img" || entry.tagName === "button"), false,
+      "activity controls never substitute subscription avatars or identity buttons");
+  }
+  state.api.accountsNative.status = () => ({ compatible: false });
+  _test.renderAccountsNativeSlots(state);
+  assert.equal(slot.children.length, 0);
+  assert.equal(nativeHeader.textContent, "admin@example.test");
+  assert.equal(nativeAvatar.src, "https://example.test/native-admin.png");
+});
+
+test("saved broker rows keep account-bound masked identity and explicit unavailable identity with stale usage", (t) => {
+  const previousDocument = global.document;
+  const node = (tagName) => ({ tagName, children: [], attrs: {}, dataset: {}, style: {}, textContent: "",
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attrs[name] = String(value); }, addEventListener() {},
+  });
+  global.document = { createElement: node };
+  t.after(() => { global.document = previousDocument; });
+  const accounts = _test.projectAccountBrokerResult("profile.read", { accounts: [
+    { accountId: brokerAccountId("codex-row"), label: "Saved codex", email: "codex@example.test", plan: "Pro", quota: { freshness: "fresh", remainingPercent: 60 } },
+    { accountId: brokerAccountId("unknown-row"), label: "Saved account", plan: "Plus", quota: { freshness: "stale", remainingPercent: 99 } },
+  ] }).accounts;
+  const card = _test.brokerAccountPoolCard({}, accounts);
+  const text = (value) => `${value.textContent}${value.children.map(text).join("")}`;
+  assert.match(text(card.children[1]), /c••••@example.test/);
+  assert.doesNotMatch(text(card), /codex@example.test|admin@example.test/);
+  assert.match(text(card.children[2]), /Masked identity unavailable · Plus/);
+  assert.match(text(card.children[2]), /Usage not available/);
+  assert.doesNotMatch(text(card.children[2]), /99%/);
+  assert.equal(card.children[1].attrs["aria-expanded"], "false");
 });

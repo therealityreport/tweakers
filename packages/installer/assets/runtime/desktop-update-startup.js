@@ -8,6 +8,9 @@ exports.createDesktopUpdateStartupReconciler = createDesktopUpdateStartupReconci
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
+const node_util_1 = require("node:util");
+const accepted_runtime_repair_bootstrap_1 = require("./accepted-runtime-repair-bootstrap");
+const tweakers_sdk_1 = require("@therealityreport/tweakers-sdk");
 /**
  * Publish the runtime half of the manager-owned readiness challenge.
  *
@@ -87,7 +90,7 @@ function assertPrivateRegularFile(path, label) {
         throw new Error(`Derived variant bootstrap requires a private ${label}.`);
     }
 }
-function assertNoSymlinkPathWithin(root, path, label) {
+function assertNoSymlinkPathWithin(root, path, label, allowMissingSuffix = false) {
     const suffix = (0, node_path_1.relative)((0, node_path_1.resolve)(root), (0, node_path_1.resolve)(path));
     if (suffix === "")
         return;
@@ -97,7 +100,15 @@ function assertNoSymlinkPathWithin(root, path, label) {
     let current = (0, node_path_1.resolve)(root);
     for (const segment of suffix.split("/")) {
         current = (0, node_path_1.join)(current, segment);
-        const stat = (0, node_fs_1.lstatSync)(current);
+        let stat;
+        try {
+            stat = (0, node_fs_1.lstatSync)(current);
+        }
+        catch (error) {
+            if (allowMissingSuffix && error.code === "ENOENT")
+                return;
+            throw error;
+        }
         if (stat.isSymbolicLink()) {
             throw new Error(`Derived variant bootstrap found a symlinked ${label} path component.`);
         }
@@ -168,7 +179,7 @@ function fingerprintTweakersVariantGeneration(path, fileSystem = nodeVariantFile
     visit(path, "");
     return { kind, mode: permissionBits(root), sha256: hash.digest("hex") };
 }
-function expectedPromotionEntries(userRoot, target, id) {
+function expectedPromotionEntries(userRoot, target, id, candidate) {
     const buildRoot = (0, node_path_1.join)(userRoot, "builds", id);
     const archiveRoot = (0, node_path_1.join)(userRoot, "previous", id);
     const failedRoot = (0, node_path_1.join)(buildRoot, "failed-promotion");
@@ -203,7 +214,7 @@ function expectedPromotionEntries(userRoot, target, id) {
         },
         {
             name: "app",
-            source: (0, node_path_1.join)((0, node_path_1.dirname)(target), `.${(0, node_path_1.basename)(target)}.candidate-${id}.app`),
+            source: candidate,
             destination: target,
             archive: (0, node_path_1.join)(archiveRoot, "app", (0, node_path_1.basename)(target)),
             failed: (0, node_path_1.join)(failedRoot, "app", (0, node_path_1.basename)(target)),
@@ -258,9 +269,25 @@ function parseActiveReceipt(value, expected) {
         entries,
     };
 }
+function assertPromotionCandidatePath(userRoot, target, id, candidate) {
+    if (candidate === (0, node_path_1.join)((0, node_path_1.dirname)(target), `.${(0, node_path_1.basename)(target)}.candidate-${id}.app`))
+        return;
+    const managerRoot = (0, node_path_1.dirname)((0, node_path_1.dirname)(userRoot));
+    const suffix = (0, node_path_1.relative)((0, node_path_1.join)(managerRoot, "doctor", "jobs"), candidate);
+    if (userRoot !== (0, node_path_1.join)(managerRoot, "variants", "tweakers")
+        || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/candidate\/Tweakers\.app$/.test(suffix)) {
+        throw new Error("Derived variant bootstrap journal candidate path binding is invalid.");
+    }
+    // Promotion consumes this path by rename; retired historical staging may also
+    // be absent. Existing ancestors must still be real directories, never aliases.
+    assertNoSymlinkPathWithin(managerRoot, candidate, "promotion candidate", true);
+}
 function parseJournal(value, userRoot, target) {
+    const hasAcceptedTransition = value !== null && typeof value === "object"
+        && Object.hasOwn(value, "acceptedBackendTransition");
     assertExactObjectKeys(value, [
         "version", "id", "userRoot", "target", "candidate", "buildRoot", "phase", "entries", "activeReceipt",
+        ...(hasAcceptedTransition ? ["acceptedBackendTransition"] : []),
     ], "promotion journal");
     if ((value.version !== VARIANT_PROMOTION_JOURNAL_VERSION
         && value.version !== LEGACY_VARIANT_PROMOTION_JOURNAL_VERSION)
@@ -274,6 +301,19 @@ function parseJournal(value, userRoot, target) {
         throw new Error("Derived variant bootstrap found an unsupported promotion journal.");
     }
     assertVariantPromotionId(value.id);
+    let acceptedBackendTransition;
+    if (hasAcceptedTransition) {
+        (0, tweakers_sdk_1.assertAcceptedBackendTransitionJournalBindingContract)(value.acceptedBackendTransition, {
+            isCanonicalAbsolutePath,
+            sha256: text => (0, node_crypto_1.createHash)("sha256").update(text).digest("hex"),
+        });
+        acceptedBackendTransition = value.acceptedBackendTransition;
+        if (value.version !== VARIANT_PROMOTION_JOURNAL_VERSION
+            || acceptedBackendTransition.lane.identity.target !== target
+            || acceptedBackendTransition.lane.identity.userRoot !== userRoot) {
+            throw new Error("Derived variant bootstrap accepted backend transition does not bind its journal.");
+        }
+    }
     if (value.userRoot !== userRoot
         || value.target !== target
         || !isCanonicalAbsolutePath(value.userRoot)
@@ -281,11 +321,11 @@ function parseJournal(value, userRoot, target) {
         || !isCanonicalAbsolutePath(value.candidate)
         || !isCanonicalAbsolutePath(value.buildRoot)
         || value.buildRoot !== (0, node_path_1.join)(userRoot, "builds", value.id)
-        || value.candidate !== (0, node_path_1.join)((0, node_path_1.dirname)(target), `.${(0, node_path_1.basename)(target)}.candidate-${value.id}.app`)
         || !knownPromotionPhase(value.phase)) {
         throw new Error("Derived variant bootstrap journal path binding is invalid.");
     }
-    const expectedEntries = expectedPromotionEntries(userRoot, target, value.id);
+    assertPromotionCandidatePath(userRoot, target, value.id, value.candidate);
+    const expectedEntries = expectedPromotionEntries(userRoot, target, value.id, value.candidate);
     if (value.entries.length !== expectedEntries.length) {
         throw new Error("Derived variant bootstrap journal generation count is invalid.");
     }
@@ -338,6 +378,7 @@ function parseJournal(value, userRoot, target) {
     }
     parseActiveReceipt(value.activeReceipt.expected, expectedActive);
     return {
+        ...(acceptedBackendTransition ? { acceptedBackendTransition } : {}),
         version: value.version,
         id: value.id,
         userRoot,
@@ -356,10 +397,12 @@ function parseJournal(value, userRoot, target) {
     };
 }
 function parseProvisionalRuntimeReadyExpectation(value, target) {
+    (0, tweakers_sdk_1.assertAcceptedRuntimeRepairReadinessVersionContract)(value);
     assertExactObjectKeys(value, [
         "schemaVersion", "kind", "operationId", "promotionId", "activePromotionReceiptSha256", "appRoot", "bundleId",
         "appAsarHeaderHash", "runtimeFingerprint", "appUserDataRoot", "codexHomeRoot", "accountsBrokerRoot",
         "brokerAuthorityExpectation", "appearanceExpectation", "expectedTweakIds", "createdAt",
+        ...(value.schemaVersion === 6 ? ["runtimeRepair"] : []),
     ], "runtime-ready expectation");
     const validId = (candidate) => typeof candidate === "string"
         && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(candidate);
@@ -378,7 +421,7 @@ function parseProvisionalRuntimeReadyExpectation(value, target) {
     const appearanceExpectation = value.appearanceExpectation;
     const validAppearanceExpectation = appearanceExpectation.status === "normal"
         && appearanceExpectation.normalized === true;
-    if (value.schemaVersion !== 5
+    if ((value.schemaVersion !== 5 && value.schemaVersion !== 6)
         || value.kind !== "tweakers-independent-runtime-ready-expectation"
         || !validId(value.operationId)
         || !validId(value.promotionId)
@@ -421,8 +464,15 @@ function assertProvisionalPendingGeneration(journal, activePath, userRoot, targe
         throw new Error("Derived variant bootstrap runtime-ready expectation is corrupt.");
     }
     const expectation = parseProvisionalRuntimeReadyExpectation(rawExpectation, target);
+    if (expectation.schemaVersion !== 5)
+        throw new Error("Derived variant bootstrap repair challenge has no authenticated child.");
     if (expectation.promotionId !== journal.id) {
         throw new Error("Derived variant bootstrap runtime-ready expectation does not bind the pending promotion.");
+    }
+    if (journal.acceptedBackendTransition
+        && (journal.acceptedBackendTransition.operationId !== expectation.operationId
+            || journal.acceptedBackendTransition.lane.identity.brokerRoot !== expectation.accountsBrokerRoot)) {
+        throw new Error("Derived variant bootstrap accepted backend transition does not bind its runtime-ready expectation.");
     }
     assertPrivateRegularFile(journal.activeReceipt.source, "derived variant staged active receipt");
     let stagedActiveRaw;
@@ -465,7 +515,7 @@ function assertProvisionalPendingGeneration(journal, activePath, userRoot, targe
 function assertTweakersVariantBootstrap(options = {}) {
     const environment = options.environment ?? process.env;
     if (environment.TWEAKERS_DERIVED_VARIANT !== "1")
-        return;
+        return null;
     const fileSystem = options.fileSystem ?? nodeVariantFilesystem;
     const userRoot = environment.TWEAKERS_USER_ROOT ?? environment.TWEAKER_USER_ROOT;
     const runtime = environment.TWEAKERS_RUNTIME ?? environment.TWEAKER_RUNTIME;
@@ -511,13 +561,129 @@ function assertTweakersVariantBootstrap(options = {}) {
             throw new Error("Derived variant bootstrap journal filename does not match its transaction ID.");
         journals.set(journal.id, journal);
     }
-    const pending = [...journals.values()].filter((journal) => journal.phase !== "committed" && journal.phase !== "recovered");
+    const supersededHistory = new Map();
+    for (const journal of journals.values()) {
+        if (!journal.acceptedBackendTransition)
+            continue;
+        const historical = (options.nativeReplacementHistoricalVerifier ?? accepted_runtime_repair_bootstrap_1.readSupersededNativeReplacementHistoricalBootstrap)({
+            managerRoot: (0, node_path_1.dirname)((0, node_path_1.dirname)(userRoot)), userRoot, target, operationId: journal.acceptedBackendTransition.operationId, promotionId: journal.id,
+        }, { fingerprint: path => fingerprintTweakersVariantGeneration(path, fileSystem) });
+        if (historical) {
+            if (!(0, node_util_1.isDeepStrictEqual)(historical.originalJournal, journal))
+                throw new Error("Derived variant bootstrap superseded journal changed.");
+            supersededHistory.set(journal.id, historical);
+        }
+    }
+    let pending = [...journals.values()].filter((journal) => journal.phase !== "committed" && journal.phase !== "recovered");
+    const publishedActive = activePath === null ? null : JSON.parse((0, node_fs_1.readFileSync)(activePath, "utf8"));
+    const publishedActiveId = publishedActive !== null && typeof publishedActive === "object" ? publishedActive.id : null;
+    const currentJournal = typeof publishedActiveId === "string" ? journals.get(publishedActiveId) : undefined;
+    const expectationPath = (0, node_path_1.join)(userRoot, "runtime-ready-expectation.json");
+    if (activePath !== null && currentJournal?.phase === "committed" && pending.length === 1
+        && pending[0].id !== currentJournal.id && (0, node_fs_1.existsSync)(expectationPath)) {
+        assertNoSymlinkPathWithin(userRoot, expectationPath, "runtime-ready expectation");
+        assertPrivateRegularFile(expectationPath, "derived variant runtime-ready expectation");
+        const expectation = parseProvisionalRuntimeReadyExpectation(JSON.parse((0, node_fs_1.readFileSync)(expectationPath, "utf8")), target);
+        if (expectation.schemaVersion === 6) {
+            const provisional = pending[0];
+            if (!provisional.acceptedBackendTransition || expectation.promotionId !== provisional.id
+                || expectation.operationId !== provisional.acceptedBackendTransition.operationId) {
+                throw new Error("Derived variant bootstrap repair challenge does not bind the sole pending promotion.");
+            }
+            // The retained active receipt describes the prior runtime. Authenticate the
+            // challenged repair and its prior receipt before comparing live generations.
+            const repair = (options.runtimeRepairVerifier ?? accepted_runtime_repair_bootstrap_1.readAcceptedRuntimeRepairBootstrap)({
+                managerRoot: (0, node_path_1.dirname)((0, node_path_1.dirname)(userRoot)), userRoot, target,
+                operationId: provisional.acceptedBackendTransition.operationId, promotionId: provisional.id,
+            }, { fingerprint: path => fingerprintTweakersVariantGeneration(path, fileSystem) });
+            if (!repair || repair.phase !== "challenge:published" || repair.head.operationId !== expectation.operationId
+                || repair.head.promotionId !== provisional.id) {
+                throw new Error("Derived variant bootstrap repair challenge has no authenticated current child.");
+            }
+            assertRuntimeRepairProjection(repair, provisional, userRoot, target, activePath, fileSystem);
+            return repair;
+        }
+    }
+    if (pending.length > 0 && activePath !== null && (0, node_fs_1.existsSync)(expectationPath)) {
+        assertNoSymlinkPathWithin(userRoot, expectationPath, "runtime-ready expectation");
+        assertPrivateRegularFile(expectationPath, "derived variant runtime-ready expectation");
+        const expectation = parseProvisionalRuntimeReadyExpectation(JSON.parse((0, node_fs_1.readFileSync)(expectationPath, "utf8")), target);
+        const current = expectation.schemaVersion === 5 ? pending.find(journal => journal.id === expectation.promotionId) : undefined;
+        if (current && current.id !== publishedActiveId) {
+            assertProvisionalPendingGeneration(current, activePath, userRoot, target, fileSystem);
+            pending = pending.filter(journal => {
+                if (journal.id === current.id || !journal.acceptedBackendTransition)
+                    return true;
+                const superseded = supersededHistory.get(journal.id);
+                if (superseded) {
+                    if (!(0, node_util_1.isDeepStrictEqual)(superseded.originalJournal, journal))
+                        throw new Error("Derived variant bootstrap superseded journal changed.");
+                    return false;
+                }
+                const historical = (options.runtimeRepairHistoricalVerifier ?? accepted_runtime_repair_bootstrap_1.readAcceptedRuntimeRepairHistoricalBootstrap)({
+                    managerRoot: (0, node_path_1.dirname)((0, node_path_1.dirname)(userRoot)), userRoot, target,
+                    operationId: journal.acceptedBackendTransition.operationId, promotionId: journal.id,
+                }, { fingerprint: path => fingerprintTweakersVariantGeneration(path, fileSystem) });
+                if (!historical)
+                    return true;
+                assertHistoricalRepairJournal(historical, journal);
+                if (journal.id === publishedActiveId) {
+                    if (!(0, node_util_1.isDeepStrictEqual)(publishedActive, historical.effectiveActiveReceipt)
+                        || (0, node_crypto_1.createHash)("sha256").update((0, node_fs_1.readFileSync)(activePath)).digest("hex") !== historical.intent.effectiveActiveReceipt.sha256) {
+                        throw new Error("Derived variant bootstrap future promotion does not retain the authenticated prior child receipt.");
+                    }
+                }
+                return false;
+            });
+            if (pending.length !== 1)
+                throw new Error("Derived variant bootstrap refuses multiple pending promotion journals.");
+            // The staged generation, its real promoted bytes and the retained prior
+            // receipt were verified above. The older receipt describes history and
+            // must not be compared with the newly promoted runtime.
+            return null;
+        }
+    }
+    if (activePath !== null && currentJournal?.phase === "committed" && pending.length > 0
+        && pending.every(journal => journal.id !== currentJournal.id)) {
+        assertOrdinaryCommittedGeneration(publishedActive, activePath, currentJournal, fileSystem);
+        pending = pending.filter(journal => {
+            if (!journal.acceptedBackendTransition)
+                return true;
+            const input = { managerRoot: (0, node_path_1.dirname)((0, node_path_1.dirname)(userRoot)), userRoot, target, operationId: journal.acceptedBackendTransition.operationId, promotionId: journal.id };
+            const deps = { fingerprint: (path) => fingerprintTweakersVariantGeneration(path, fileSystem) };
+            const superseded = supersededHistory.get(journal.id);
+            if (superseded) {
+                if (!(0, node_util_1.isDeepStrictEqual)(superseded.originalJournal, journal))
+                    throw new Error("Derived variant bootstrap superseded journal changed.");
+                return false;
+            }
+            const historical = (options.runtimeRepairHistoricalVerifier ?? accepted_runtime_repair_bootstrap_1.readAcceptedRuntimeRepairHistoricalBootstrap)(input, deps);
+            if (!historical)
+                return true;
+            assertHistoricalRepairJournal(historical, journal);
+            return false;
+        });
+    }
+    const repairJournal = pending.length === 1 ? pending[0] : typeof publishedActiveId === "string" ? journals.get(publishedActiveId) : undefined;
+    if (repairJournal?.acceptedBackendTransition) {
+        const repair = (options.runtimeRepairVerifier ?? accepted_runtime_repair_bootstrap_1.readAcceptedRuntimeRepairBootstrap)({
+            managerRoot: (0, node_path_1.dirname)((0, node_path_1.dirname)(userRoot)), userRoot, target,
+            operationId: repairJournal.acceptedBackendTransition.operationId, promotionId: repairJournal.id,
+        }, { fingerprint: path => fingerprintTweakersVariantGeneration(path, fileSystem) });
+        if (repair) {
+            if (pending.length > 1 || (pending.length === 1 && pending[0].id !== repair.head.promotionId)) {
+                throw new Error("Derived variant bootstrap repair does not own every pending generation.");
+            }
+            assertRuntimeRepairProjection(repair, repairJournal, userRoot, target, activePath, fileSystem);
+            return repair;
+        }
+    }
     if (pending.length > 0) {
         if (pending.length !== 1) {
             throw new Error("Derived variant bootstrap refuses multiple pending promotion journals.");
         }
         assertProvisionalPendingGeneration(pending[0], activePath, userRoot, target, fileSystem);
-        return;
+        return null;
     }
     if (activePath === null)
         throw new Error("Derived variant bootstrap has no committed active generation receipt.");
@@ -528,13 +694,19 @@ function assertTweakersVariantBootstrap(options = {}) {
     catch {
         throw new Error("Derived variant bootstrap active generation receipt is corrupt.");
     }
-    assertExactObjectKeys(activeRaw, ["version", "id", "userRoot", "target", "entries"], "active receipt");
-    const activeId = activeRaw.id;
+    const activeId = activeRaw?.id;
     assertVariantPromotionId(activeId);
     const journal = journals.get(activeId);
     if (!journal || journal.phase !== "committed") {
         throw new Error("Derived variant bootstrap active receipt has no matching committed journal.");
     }
+    assertOrdinaryCommittedGeneration(activeRaw, activePath, journal, fileSystem);
+    return null;
+}
+function assertOrdinaryCommittedGeneration(activeRaw, activePath, journal, fileSystem) {
+    assertExactObjectKeys(activeRaw, ["version", "id", "userRoot", "target", "entries"], "active receipt");
+    if (activeRaw.id !== journal.id || journal.phase !== "committed")
+        throw new Error("Derived variant bootstrap current ordinary journal is not committed.");
     const active = parseActiveReceipt(activeRaw, journal.activeReceipt.expected);
     const activeReceiptFingerprint = fingerprintTweakersVariantGeneration(activePath, fileSystem);
     if (!fingerprintsMatch(activeReceiptFingerprint, journal.activeReceipt.desired)) {
@@ -549,6 +721,71 @@ function assertTweakersVariantBootstrap(options = {}) {
         const actual = fingerprintTweakersVariantGeneration(entry.path, fileSystem);
         if (!fingerprintsMatch(actual, entry.fingerprint)) {
             throw new Error(`Derived variant bootstrap generation fingerprint mismatch: ${entry.name}`);
+        }
+    }
+}
+function assertHistoricalRepairJournal(historical, journal) {
+    if (historical.phase !== "committed" || !historical.originalOperationCompleted
+        || historical.head.promotionId !== journal.id || historical.head.operationId !== journal.acceptedBackendTransition?.operationId
+        || !(0, node_util_1.isDeepStrictEqual)(historical.originalJournal, journal)) {
+        throw new Error("Derived variant bootstrap historical repair is not its fully settled original journal.");
+    }
+}
+function assertRuntimeRepairProjection(repair, journal, userRoot, target, activePath, fileSystem) {
+    const original = parseJournal(repair.originalJournal, userRoot, target);
+    if (original.id !== journal.id || original.phase !== "app:promoted"
+        || !original.activeReceipt.hadDestination || !original.activeReceipt.previous
+        || !(0, node_util_1.isDeepStrictEqual)({ ...journal, phase: "app:promoted" }, original)) {
+        throw new Error("Derived variant bootstrap repair changed its original journal body.");
+    }
+    const authority = repair.intent.authority;
+    const entries = original.entries.map(entry => entry.name === "runtime" ? { ...entry, desired: authority.repairedRuntime.generation } : entry);
+    const effectiveActive = {
+        ...original.activeReceipt.expected, version: 4,
+        runtimeRepair: { repairId: repair.head.repairId, authorityReceiptSha256: repair.runtimeRepair.authorityReceiptSha256 },
+        entries: original.activeReceipt.expected.entries.map(entry => entry.name === "runtime" ? { ...entry, fingerprint: authority.repairedRuntime.generation } : entry),
+    };
+    if (!(0, node_util_1.isDeepStrictEqual)(repair.effectiveActiveReceipt, effectiveActive))
+        throw new Error("Derived variant bootstrap repair active receipt projection changed.");
+    const effectivePaths = {
+        source: (0, node_path_1.join)(repair.childRoot, "effective-active-receipt.json"), destination: original.activeReceipt.destination,
+        archive: (0, node_path_1.join)(repair.childRoot, "prior-active-receipt.json"), failed: (0, node_path_1.join)(repair.childRoot, "failed-active-receipt.json"),
+    };
+    const stagedOrPublished = repair.phase === "committed" ? activePath : effectivePaths.source;
+    if (stagedOrPublished === null)
+        throw new Error("Derived variant bootstrap repair lost its active receipt.");
+    const desired = fingerprintTweakersVariantGeneration(stagedOrPublished, fileSystem);
+    const effectiveJournal = {
+        ...repair.originalJournal, phase: "committed", entries,
+        activeReceipt: { ...original.activeReceipt, ...effectivePaths, desired, expected: effectiveActive },
+    };
+    if (!(0, node_util_1.isDeepStrictEqual)(repair.effectiveJournal, effectiveJournal))
+        throw new Error("Derived variant bootstrap repair journal projection changed.");
+    if (!(0, node_util_1.isDeepStrictEqual)(JSON.parse((0, node_fs_1.readFileSync)(stagedOrPublished, "utf8")), effectiveActive))
+        throw new Error("Derived variant bootstrap repair published a different receipt.");
+    if (repair.phase === "challenge:published") {
+        if (activePath === null || !(0, node_util_1.isDeepStrictEqual)(fingerprintTweakersVariantGeneration(activePath, fileSystem), original.activeReceipt.previous)) {
+            throw new Error("Derived variant bootstrap repair lost its retained prior active receipt.");
+        }
+        const expectationPath = (0, node_path_1.join)(userRoot, "runtime-ready-expectation.json");
+        assertPrivateRegularFile(expectationPath, "repair runtime-ready expectation");
+        const expectation = parseProvisionalRuntimeReadyExpectation(JSON.parse((0, node_fs_1.readFileSync)(expectationPath, "utf8")), target);
+        if (expectation.schemaVersion !== 6 || !(0, node_util_1.isDeepStrictEqual)(expectation.runtimeRepair, repair.runtimeRepair)
+            || expectation.operationId !== repair.head.operationId || expectation.promotionId !== repair.head.promotionId
+            || expectation.accountsBrokerRoot !== original.acceptedBackendTransition.lane.identity.brokerRoot
+            || expectation.activePromotionReceiptSha256 !== desired.sha256
+            || expectation.runtimeFingerprint !== authority.repairedRuntime.evidence.fingerprint) {
+            throw new Error("Derived variant bootstrap repair readiness challenge changed.");
+        }
+    }
+    for (const entry of entries) {
+        if (entry.name === "config.json" && repair.phase === "committed" && repair.originalOperationCompleted) {
+            assertPrivateRegularFile(entry.destination, "settled repair mutable config");
+            (0, accepted_runtime_repair_bootstrap_1.assertAcceptedRuntimeRepairMutableConfig)(JSON.parse((0, node_fs_1.readFileSync)(entry.destination, "utf8")));
+            continue;
+        }
+        if (!(0, node_util_1.isDeepStrictEqual)(fingerprintTweakersVariantGeneration(entry.destination, fileSystem), entry.desired)) {
+            throw new Error(`Derived variant bootstrap repair generation changed: ${entry.name}`);
         }
     }
 }

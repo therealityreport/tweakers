@@ -1,4 +1,11 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.rendererStorage = void 0;
+exports.startTweakHost = startTweakHost;
+exports.teardownTweakHost = teardownTweakHost;
+const tweak_topic_migration_1 = require("../tweak-topic-migration");
+const native_capture_1 = require("./native-capture");
+const tweak_resources_1 = require("../tweak-resources");
 /**
  * Renderer-side tweak host. We:
  *   1. Ask main for the tweak list (with resolved entry path).
@@ -12,10 +19,6 @@
  * source string from main and evaluate it with `new Function` inside the
  * preload context. Tweak authors who need npm deps must bundle them in.
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.rendererStorage = void 0;
-exports.startTweakHost = startTweakHost;
-exports.teardownTweakHost = teardownTweakHost;
 const electron_1 = require("electron");
 const settings_injector_1 = require("./settings-injector");
 const react_hook_1 = require("./react-hook");
@@ -24,8 +27,18 @@ const accounts_native_1 = require("./accounts-native");
 const tweak_lifecycle_1 = require("../tweak-lifecycle");
 const renderer_storage_1 = require("../renderer-storage");
 const loaded = new Map();
+let hostGeneration = 0;
+let lifecycleToken = null;
 let cachedPaths = null;
-async function startTweakHost() {
+async function startTweakHost(requiredId) {
+    const readyIds = new Set();
+    const generation = ++hostGeneration;
+    const token = await electron_1.ipcRenderer.invoke("tweaker:renderer-lifecycle-begin");
+    if (generation !== hostGeneration)
+        return;
+    if (typeof token !== "string")
+        throw new Error("Renderer lifecycle admission is unavailable");
+    lifecycleToken = token;
     // Revalidate at startup and re-enable even when Accounts was disabled when
     // this payload was prepared. This never initializes an unreviewed wrapper.
     try {
@@ -34,7 +47,14 @@ async function startTweakHost() {
     catch {
         accounts_native_1.accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts compatibility could not be checked.", hookSetSha256: "" });
     }
-    const tweaks = (await electron_1.ipcRenderer.invoke("tweaker:list-tweaks"));
+    const listed = (await electron_1.ipcRenderer.invoke("tweaker:list-tweaks"));
+    const suppressed = (0, tweak_topic_migration_1.consolidateTweakTopics)(listed, localStorage);
+    if (lifecycleToken)
+        electron_1.ipcRenderer.send("tweaker:renderer-topic-delegations", {
+            token: lifecycleToken,
+            delegations: [...suppressed].map(id => ({ id, owner: (0, tweak_topic_migration_1.topicMigrationOwner)(id, listed) })),
+        });
+    const tweaks = listed.filter(tweak => !suppressed.has(tweak.manifest.id));
     const paths = (await electron_1.ipcRenderer.invoke("tweaker:user-paths"));
     cachedPaths = paths;
     // Push the list to the settings injector so the Tweaks page can render
@@ -44,7 +64,10 @@ async function startTweakHost() {
     // Stash for the settings injector's empty-state message.
     window.__tweaker_tweaks_dir__ =
         paths.tweaksDir;
-    for (const t of tweaks) {
+    // Accounts may wait up to 30 s for its native bridge; load it last so that
+    // wait never delays every other renderer tweak.
+    const ordered = [...tweaks].sort((a, b) => Number(a.manifest.id === "co.tweakers.account-switcher") - Number(b.manifest.id === "co.tweakers.account-switcher"));
+    for (const t of ordered) {
         if (t.manifest.scope === "main") {
             sendLifecycle(t.manifest.id, "disabled", "main-scoped tweak");
             continue;
@@ -67,22 +90,34 @@ async function startTweakHost() {
         }
         sendLifecycle(t.manifest.id, "starting");
         try {
-            const result = await (0, tweak_lifecycle_1.runWithStartupTimeout)(() => loadTweak(t, paths), tweak_lifecycle_1.DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+            const result = await (0, tweak_lifecycle_1.runWithStartupTimeout)(() => loadTweak(t, paths, generation), tweak_lifecycle_1.DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+            if (generation !== hostGeneration)
+                return;
             if (result.status === "timed_out") {
+                await stopRendererTweak(t.manifest.id).catch(error => console.warn("[tweaker] activation held for cleanup:", t.manifest.id, error));
                 sendLifecycle(t.manifest.id, "timed_out", `startup exceeded ${tweak_lifecycle_1.DEFAULT_TWEAK_STARTUP_TIMEOUT_MS}ms`);
                 console.error("[tweaker] tweak startup timed out:", t.manifest.id);
             }
             else {
+                readyIds.add(t.manifest.id);
                 sendLifecycle(t.manifest.id, "ready");
             }
         }
         catch (e) {
+            await stopRendererTweak(t.manifest.id).catch(error => console.warn("[tweaker] activation held for cleanup:", t.manifest.id, error));
             sendLifecycle(t.manifest.id, "failed", e);
             console.error("[tweaker] tweak load failed:", t.manifest.id, e);
             try {
                 electron_1.ipcRenderer.send("tweaker:preload-log", "error", "tweak load failed: " + t.manifest.id + ": " + String(e?.stack ?? e));
             }
             catch { }
+        }
+    }
+    if (requiredId) {
+        const required = listed.find(tweak => tweak.manifest.id === requiredId);
+        const owner = suppressed.has(requiredId) ? (0, tweak_topic_migration_1.topicMigrationOwner)(requiredId, listed) : requiredId;
+        if (required?.enabled && required.manifest.scope !== "main" && (!owner || !readyIds.has(owner))) {
+            throw new Error(`Tweak ${requiredId} activation was not acknowledged`);
         }
     }
     console.info(`[tweaker] renderer host loaded ${loaded.size} tweak(s):`, [...loaded.keys()].join(", ") || "(none)");
@@ -100,6 +135,7 @@ function sendLifecycle(id, status, error) {
         electron_1.ipcRenderer.send("tweaker:tweak-lifecycle", {
             id,
             process: "renderer",
+            token: lifecycleToken,
             status,
             ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
         });
@@ -113,24 +149,35 @@ function sendLifecycle(id, status, error) {
  * re-evaluate fresh source. Module cache isn't relevant since we eval
  * source strings directly — each load creates a fresh scope.
  */
-function teardownTweakHost() {
-    for (const [id, t] of loaded) {
-        try {
-            t.stop?.();
-        }
-        catch (e) {
-            console.warn("[tweaker] tweak stop failed:", id, e);
-        }
-        finally {
-            void electron_1.ipcRenderer.invoke("tweaker:codex-view-dispose-tweak", id).catch(() => { });
-            void electron_1.ipcRenderer.invoke("tweaker:native-dispose-tweak", id).catch(() => { });
-        }
-    }
-    loaded.clear();
+async function stopRendererTweak(id) {
+    const tweak = loaded.get(id);
+    if (!tweak)
+        return;
+    tweak.resources.cancel();
+    tweak.stopPending ??= Promise.resolve().then(() => tweak.stop?.());
+    const result = await (0, tweak_lifecycle_1.runWithStartupTimeout)(() => Promise.all([tweak.stopPending, tweak.startPending?.catch(() => { })]), tweak_lifecycle_1.DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+    const cleanup = await (0, tweak_lifecycle_1.runWithStartupTimeout)(() => tweak.resources.close(), tweak_lifecycle_1.DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+    await Promise.all([
+        electron_1.ipcRenderer.invoke("tweaker:codex-view-dispose-tweak", id),
+        electron_1.ipcRenderer.invoke("tweaker:native-dispose-tweak", id),
+    ]);
+    if (result.status === "timed_out" || cleanup.status === "timed_out")
+        throw new Error(`Tweak ${id} shutdown is still pending; reload held`);
+    if (loaded.get(id) === tweak)
+        loaded.delete(id);
+}
+async function teardownTweakHost() {
+    hostGeneration++;
+    await Promise.all([...loaded.keys()].map(stopRendererTweak));
     (0, settings_injector_1.clearSections)();
 }
-async function loadTweak(t, paths) {
+async function loadTweak(t, paths, generation) {
+    const resources = new tweak_resources_1.TweakResources();
+    const instance = { resources };
+    loaded.set(t.manifest.id, instance);
     const source = (await electron_1.ipcRenderer.invoke("tweaker:read-tweak-source", t.entry));
+    if (generation !== hostGeneration || resources.signal.aborted)
+        return;
     // Evaluate as CJS-shaped: provide module/exports/api. Tweak code may use
     // `module.exports = { start, stop }` or `exports.start = ...` or pure ESM
     // default export shape (we accept both).
@@ -144,11 +191,12 @@ async function loadTweak(t, paths) {
     if (typeof tweak?.start !== "function") {
         throw new Error(`tweak ${t.manifest.id} has no start()`);
     }
-    const api = makeRendererApi(t.manifest, paths);
-    await tweak.start(api);
-    loaded.set(t.manifest.id, { stop: tweak.stop?.bind(tweak) });
+    instance.stop = tweak.stop?.bind(tweak);
+    const api = (0, tweak_resources_1.guardTweakApi)(makeRendererApi(t.manifest, paths, resources), resources);
+    instance.startPending = Promise.resolve().then(() => tweak.start(api));
+    await instance.startPending;
 }
-function makeRendererApi(manifest, paths) {
+function makeRendererApi(manifest, paths, resources) {
     const id = manifest.id;
     const assertIpcPermission = () => {
         if (!manifest.permissions?.includes("ipc")) {
@@ -185,17 +233,27 @@ function makeRendererApi(manifest, paths) {
     return {
         manifest,
         process: "renderer",
-        accountsNative: accounts_native_1.accountsNativeApi,
+        accountsNative: { ...accounts_native_1.accountsNativeApi, register: adapter => resources.add(accounts_native_1.accountsNativeApi.register(adapter)) },
         log: {
             debug: (...a) => log("debug", ...a),
             info: (...a) => log("info", ...a),
             warn: (...a) => log("warn", ...a),
             error: (...a) => log("error", ...a),
         },
+        nativeCapture: native_capture_1.nativeCaptureBridge.api,
+        lifecycle: { signal: resources.signal, add: resources.add.bind(resources) },
         storage: (0, exports.rendererStorage)(id),
         settings: {
-            register: (s) => (0, settings_injector_1.registerSection)({ ...s, id: `${id}:${s.id}` }),
-            registerPage: (p) => (0, settings_injector_1.registerPage)(id, manifest, { ...p, id: `${id}:${p.id}` }),
+            register: (s) => {
+                const handle = (0, settings_injector_1.registerSection)({ ...s, id: `${id}:${s.id}` });
+                resources.add(() => handle.unregister());
+                return handle;
+            },
+            registerPage: (p) => {
+                const handle = (0, settings_injector_1.registerPage)(id, manifest, { ...p, id: `${id}:${p.id}` });
+                resources.add(() => handle.unregister());
+                return handle;
+            },
             openPage: (pageId) => (0, settings_injector_1.openRegisteredPage)(id, `${id}:${pageId}`),
         },
         react: {
@@ -214,28 +272,37 @@ function makeRendererApi(manifest, paths) {
                 const existing = document.querySelector(sel);
                 if (existing)
                     return resolve(existing);
-                const deadline = Date.now() + timeoutMs;
+                let settled = false;
+                const onAbort = () => finish(null);
+                const finish = (element) => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    obs.disconnect();
+                    clearTimeout(timer);
+                    resources.signal.removeEventListener("abort", onAbort);
+                    if (element)
+                        resolve(element);
+                    else
+                        reject(new Error(`timeout waiting for ${sel}`));
+                };
                 const obs = new MutationObserver(() => {
                     const el = document.querySelector(sel);
-                    if (el) {
-                        obs.disconnect();
-                        resolve(el);
-                    }
-                    else if (Date.now() > deadline) {
-                        obs.disconnect();
-                        reject(new Error(`timeout waiting for ${sel}`));
-                    }
+                    if (el)
+                        finish(el);
                 });
                 obs.observe(document.documentElement, { childList: true, subtree: true });
+                const timer = setTimeout(() => finish(null), Math.max(0, timeoutMs));
+                resources.signal.addEventListener("abort", onAbort, { once: true });
             }),
-            host: host_surfaces_1.hostUiApi,
+            host: { ...host_surfaces_1.hostUiApi, observe: (kinds, listener) => resources.add(host_surfaces_1.hostUiApi.observe(kinds, listener)) },
         },
         ipc: {
             on: (c, h) => {
                 assertIpcPermission();
                 const wrapped = (_e, ...args) => h(...args);
                 electron_1.ipcRenderer.on(`tweaker:${id}:${c}`, wrapped);
-                return () => electron_1.ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped);
+                return resources.add(() => { electron_1.ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped); });
             },
             send: (c, ...args) => {
                 assertIpcPermission();
@@ -253,10 +320,10 @@ function makeRendererApi(manifest, paths) {
             },
         },
         fs: rendererFs(id, paths),
-        codex: rendererCodexApi(id),
+        codex: rendererCodexApi(id, resources),
     };
 }
-function rendererCodexApi(tweakId) {
+function rendererCodexApi(tweakId, resources) {
     return {
         runtime: {
             getInfo: async () => {
@@ -310,7 +377,7 @@ function rendererCodexApi(tweakId) {
             onStatusChanged: (listener) => {
                 const handler = () => { void electron_1.ipcRenderer.invoke("tweaker:get-refresh-status").then(listener); };
                 electron_1.ipcRenderer.on("tweaker:refresh-status-changed", handler);
-                return () => electron_1.ipcRenderer.removeListener("tweaker:refresh-status-changed", handler);
+                return resources.add(() => { electron_1.ipcRenderer.removeListener("tweaker:refresh-status-changed", handler); });
             },
         },
         capture: {

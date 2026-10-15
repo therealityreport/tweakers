@@ -9,10 +9,18 @@ This file governs repository-wide work. For implementation details inside
 - Before builds, refreshes, promotions, or artifact cleanup, read and follow
   [Build artifact retention and post-change updates](rules/build-artifact-retention.md).
   The user gives standing authorization to rebuild and open the newest verified
-  Tweakers version when a change requires it, then archive older historical
-  versions to SHOWS DB and move unneeded artifacts to Trash under that rule.
+  Tweakers version when a change requires it, then move older versions and
+  unneeded artifacts to Trash under that rule. Archive to SHOWS DB only items
+  intended for reuse, such as memories and outputs.
   Keep active dependencies and one verified rollback locally. Do not ask for
   duplicate confirmation.
+
+## Enforced local resource limits
+- Keep at most two local Tweakers application copies: installed plus rollback OR installed plus candidate. Partial candidates, failed builds, previews, and separately launchable duplicates count; no temporary third copy or additional failed-candidate allowance.
+- Reserve capacity before staging. Keep one generated development output set and never recursively package previous runtimes. SHOWS DB is archival storage only; no app, helper, launch configuration, or active dependency may run from it.
+- One lead owns expensive builds and verification across tasks, agents, and checkouts. Batch corrections, reuse checks with unchanged inputs, and run final required verification against stable generated files. Helpers must not independently launch builds or broad suites.
+- Only one Tweakers desktop may run across all paths and profiles, including execution probes. Native Codex/ChatGPT is independent and must not be interrupted.
+- Completion requires artifact reconciliation and process-lifecycle verification. Report capacity or recovery blockers rather than making retention exceptions.
 
 ## Shared user-level workflow
 
@@ -78,14 +86,16 @@ permissions, settings ownership, or maintenance, ask one structured question.
   cleanup, permissions, and tests; apply a semantic-version bump; run
   `npm run sync:tweaks`; run focused tests, catalog check, and build. Broaden to
   the full suite for shared runtime/lifecycle changes, cross-tweak effects, or
-  evidence of wider risk; then run one safe `tweaker dev-sync` snapshot and verify
-  the live app. Documentation-only changes require instruction/reference review,
-  not version bumps, regeneration, or live sync.
+  evidence of wider risk; then publish once and verify the live app. For the
+  installed independent Tweakers app, quit it and run `tweaker dev-sync --commit`
+  (a committed generation); its loader refuses any hot snapshot written into
+  `variants/tweakers/tweaks`. Plain `tweaker dev-sync` snapshots are only for
+  overlay installs. Documentation-only changes require instruction/reference
+  review, not version bumps, regeneration, or live sync.
 - **Runtime/installer:** run focused tests, typecheck/build, and full suite.
   When needed to apply the completed change, use the guarded refresh flow to
   rebuild and open the newest verified Tweakers version under the standing
-  authorization, then perform live verification and the required SHOWS DB
-  archival and eligible Trash cleanup.
+  authorization, then perform live verification and eligible Trash cleanup.
 - **Release:** update versions and changelog, run synchronization in check mode,
   history checks, build, and tests. A semver tag push can trigger publication;
   the existence of a tag is not evidence of user approval.
@@ -103,8 +113,11 @@ permissions, settings ownership, or maintenance, ask one structured question.
 - Full refresh uses the registered development checkout when it has unapplied
   changes; otherwise it uses the latest stable GitHub release. It must never
   fetch, merge, reset, or switch branches in the development checkout.
-- The refresh flow validates a disposable candidate before quitting ChatGPT,
-  promotes or rolls back atomically, and reopens the app after either outcome.
+- Source-verify the candidate before final cutover. Never interrupt native
+  Codex/ChatGPT. When broker activity cannot be proven safe, require Tweakers
+  and its broker to close naturally; hold their existing admission locks during
+  promotion. Failed acceptance must preserve potentially active processes and
+  recovery material rather than force a quit or claim a successful rollback.
 
 ## Chrome plugin profile
 
@@ -122,9 +135,9 @@ permissions, settings ownership, or maintenance, ask one structured question.
 - State the practical result, relevant verification, and anything unfinished. Scale detail to the task.
 - For feature work, include the selected owner/route. Include generated-state, live-sync, promotion, or restart status only when the task touches those surfaces. Explain skipped required checks.
 - For documentation-only work, report the instruction/reference checks; omit unrelated build, release, and live-app checklists.
-<!-- project-manager:graphify:start -->
+<!-- project-manager:project-knowledge:start -->
 ## Project knowledge
 
-- Follow [Memory and project knowledge](/Users/thomashulihan/.codex/instructions/RULES/memory-and-project-knowledge.md). It owns Engram repository history and checkout-scoped, on-demand Graphify retrieval.
-- Keep only repository-specific code-corpus exclusions in `.graphifyignore`; Project Manager treats nested Git repositories as independent source roots.
-<!-- project-manager:graphify:end -->
+- Follow [Memory and project knowledge](/Users/thomashulihan/.codex/instructions/RULES/memory-and-project-knowledge.md) for current project-memory opt-in, native-memory boundaries, and historical retrieval.
+- Use current source and existing project records for code structure and continuity. Do not enroll this repository automatically.
+<!-- project-manager:project-knowledge:end -->

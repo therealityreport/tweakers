@@ -54,6 +54,7 @@ test("copy-assets publishes the signed launcher and standalone manager bundle as
     mkdirSync(assetRoot, { recursive: true });
     writeFileSync(join(assetRoot, "stale-file"), "must be replaced\n");
 
+    for (const name of ["installer", "runtime"]) writeFileSync(join(root, "packages", name, "package.json"), JSON.stringify({name: `fixture-${name}`, dependencies: {}}));
     const result = copyInstallerAssets(root);
 
     assert.equal(result.runtimeCopied, true);

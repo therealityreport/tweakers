@@ -5,7 +5,9 @@ import { AccountRouterMux, RouterPreDispatchError, type RouterChild, type Router
 import { routerConfigFingerprint } from "../../src/account-router/config";
 import type { AccountQuotaObservation } from "../../src/account-router/quota";
 import { createInitialRouterState } from "../../src/account-router/state-store";
-import { ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, type JsonRpcMessage, type OpaqueAccountId, type RouterConfig, type RouterConfigV2, type RouterConfigV3, type RouterState } from "../../src/account-router/types";
+import { ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, type JsonRpcId, type JsonRpcMessage, type OpaqueAccountId, type RouterConfig, type RouterConfigV2, type RouterConfigV3, type RouterState } from "../../src/account-router/types";
+
+type ObservedMessage = JsonRpcMessage & { id?: JsonRpcId | null; method?: string };
 
 const accountA = `ar_${"A".repeat(43)}` as const;
 const accountB = `ar_${"B".repeat(43)}` as const;
@@ -117,7 +119,7 @@ class FakeTimers {
 }
 
 class FakeChild implements RouterChild {
-  readonly sent: JsonRpcMessage[] = [];
+  readonly sent: ObservedMessage[] = [];
   readonly signals: NodeJS.Signals[] = [];
   failNextPreDispatch = false;
   failNextAmbiguous = false;
@@ -208,7 +210,7 @@ test("feature enablement broadcasts to every account and returns the configured 
   mux.receiveDesktop({ jsonrpc: "2.0", id: "init", method: "initialize", params: {} });
   for (const child of factory.children.values()) child.emit(responseFor(child.sent[0], initializeResult(child)));
   desktop.length = 0;
-  mux.receiveDesktop({ jsonrpc: "2.0", id: "feature", method: "experimentalFeature/enablement/set", params: { feature: "fixture", enabled: true } });
+  mux.receiveDesktop({ jsonrpc: "2.0", id: "feature", method: "experimentalFeature/enablement/set", params: { enablement: { fixture: true } } });
   const primary = factory.children.get(accountA)!;
   const secondary = factory.children.get(accountB)!;
   const primaryRequest = primary.sent.at(-1)!;
@@ -269,6 +271,7 @@ function completeQuotaRefresh(factory: FakeFactory, remaining: Record<OpaqueAcco
     const accountRead = child.sent.findLast((message) => "method" in message && message.method === "account/read");
     const rateRead = child.sent.findLast((message) => "method" in message && message.method === "account/rateLimits/read");
     if (!accountRead || !rateRead) throw new Error(`missing official reads for ${account}`);
+    assert.equal("params" in rateRead ? rateRead.params : undefined, null, "the retained backend rate-limit read accepts null params");
     child.emit(responseFor(accountRead, { account: { authenticated: true, planType: "Pro" } }));
     child.emit(responseFor(rateRead, { rateLimits: { weekly: { remainingPercent: remaining[account], resetAt }, fiveHour: { remainingPercent: 50, resetAt } } }));
   }
@@ -389,7 +392,7 @@ test("v2 preserves bounded Codex quota metadata and clears it after a failed rat
   const refreshedAccount = first.sent.findLast((message) => "method" in message && message.method === "account/read")!;
   const refreshedRates = first.sent.findLast((message) => "method" in message && message.method === "account/rateLimits/read")!;
   first.emit(responseFor(refreshedAccount, { account: { authenticated: true, planType: "Pro" } }));
-  if (!("id" in refreshedRates)) throw new Error("expected rate-limit request");
+  if (refreshedRates.id === undefined) throw new Error("expected rate-limit request");
   first.emit({ jsonrpc: "2.0", id: refreshedRates.id, error: { code: -32000, message: "private provider failure" } });
   assert.deepEqual(observations.get(accountA), {
     health: "authenticated",

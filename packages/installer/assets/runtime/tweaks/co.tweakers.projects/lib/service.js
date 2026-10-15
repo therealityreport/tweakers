@@ -17,6 +17,7 @@ const {
   mergeLegacyProjectColors,
   readLegacyProjectColorPreferences,
   readNativeLocalProjects,
+  reconcileNativeProjectDiscovery,
   seedProjectsFromNativeRegistry,
 } = require("./state");
 const {
@@ -114,13 +115,17 @@ function createProjectService(api, dependencies = {}) {
       try {
         switch (message?.action) {
           case "get": {
+            const nativeProjects = readNative();
+            // Discovery is an in-memory projection. Only the existing explicit
+            // save path writes additions and their selected appearance.
+            replaceObject(state, reconcileNativeProjectDiscovery(state, nativeProjects));
             const publicState = require("./state").normalizeState(state);
             return {
               ok: true,
               state: clone(publicState),
               revision: revisionForState(publicState),
               storageStatus,
-              nativeProjects: readNative(),
+              nativeProjects,
               connections: await getConnections(message?.refreshConnections === true),
             };
           }

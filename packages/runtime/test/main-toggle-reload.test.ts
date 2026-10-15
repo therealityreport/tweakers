@@ -73,19 +73,34 @@ test("bundled lifecycle helper normalizes enabled value before persisting", () =
   assert.match(body, /enabled=\$\{normalizedEnabled\}/);
 });
 
-test("source lifecycle helper returns only after reloading", () => {
-  const body = extractFunctionBody(lifecycleSource, "setTweakEnabledAndReload");
-
-  assertCallOrder(body, ["reloadTweaks", "return true"]);
-  assert.match(body, /await reloadTweaks/);
-});
-
-test("bundled lifecycle helper returns only after reloading", () => {
-  const body = extractFunctionBody(bundledRuntime, "setTweakEnabledAndReload");
-
-  assertCallOrder(body, ["reloadTweaks", "return true"]);
-  assert.match(body, /await reloadTweaks/);
-});
+for (const [label, source] of [["source", lifecycleSource], ["bundled", bundledRuntime]]) {
+  test(`${label} lifecycle helper settles only after renderer reload acknowledgement`, async () => {
+    const body = extractFunctionBody(source!, "setTweakEnabledAndReload");
+    const compiled = ts.transpileModule(`globalThis.toggle = async (id, enabled, deps) => {${body}};`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+    }).outputText;
+    const calls: string[] = [];
+    let release!: () => void, broadcastReached!: () => void;
+    const acknowledgement = new Promise<void>(resolve => { release = resolve; });
+    const reached = new Promise<void>(resolve => { broadcastReached = resolve; });
+    const sandbox: Record<string, unknown> = { enqueueTweakLifecycle: (run: () => Promise<unknown>) => Promise.resolve().then(run) };
+    runInNewContext(compiled, sandbox);
+    const deps = {
+      setTweakEnabled(id: string, enabled: boolean) { assert.equal(id, "co.test.tweak"); assert.equal(enabled, false); calls.push("persist"); },
+      logInfo() {},
+      stopAllMainTweaks() { calls.push("stop"); }, clearTweakModuleCache() { calls.push("clear"); },
+      loadAllMainTweaks() { calls.push("load"); },
+      broadcastReload() { calls.push("broadcast"); broadcastReached(); return acknowledgement; },
+    };
+    let settled = false;
+    const pending = (sandbox.toggle as Function)("co.test.tweak", false, deps).then((value: unknown) => { settled = true; return value; });
+    await reached;
+    assert.equal(settled, false);
+    assert.deepEqual(calls, ["persist", "stop", "clear", "load", "broadcast"]);
+    release();
+    assert.equal(await pending, true);
+  });
+}
 
 test("source manual force reload delegates to lifecycle helper", () => {
   const body = extractHandlerBody(runtimeSource, "tweaker:reload-tweaks");

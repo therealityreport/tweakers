@@ -1,3 +1,4 @@
+import { boundedOpenFileCensus } from "./open-file-census.js";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -1700,12 +1701,12 @@ export function privateHistoryNormalizationSqliteAdapter(): PrivateHistoryNormal
 function defaultCensus(input: { appPath: string; protectedPaths: readonly string[] }): HistoryAdoptionCensus {
   const observedAt = new Date().toISOString();
   try {
-    const ps = spawnSync("/bin/ps", ["-axo", "pid=,command="], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const ps = spawnSync("/bin/ps", ["-axo", "pid=,command="], { timeout: 5000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     if (ps.error || ps.status !== 0 || typeof ps.stdout !== "string") return unknownCensus(observedAt);
     const processCensus = privateHistoryProcessCensus(ps.stdout, input.appPath);
     let openFileCount = 0;
     for (const path of input.protectedPaths) {
-      const lsof = spawnSync("/usr/sbin/lsof", ["-nP", "+D", path], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      const lsof = boundedOpenFileCensus(path);
       if (lsof.error || (lsof.status !== 0 && lsof.status !== 1)) return unknownCensus(observedAt);
       if (typeof lsof.stdout === "string") openFileCount += lsof.stdout.split("\n").filter((line) => line.trim()).length;
     }

@@ -28,6 +28,16 @@ export interface DoctorFindingV1 {
     evidence: string[];
 }
 export interface DoctorReportV1 {
+    upstreamCurrency?: {
+        version: 1;
+        jobId: string;
+        checkedAt: string;
+        state: "current" | "update-available" | "unavailable";
+        installedVersion: string | null;
+        installedBuild: string | null;
+        latestVersion: string | null;
+        latestBuild: string | null;
+    };
     schemaVersion: 1;
     workflowVersion?: 2;
     kind: "tweakers-independent-doctor";

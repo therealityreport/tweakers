@@ -19,8 +19,9 @@ The behavior now belongs to
 
 ## Reproduction and regression commands
 
-The original red reproduction remains archived outside this repo at
-`diagnostics/codex-chat-ui/streaming-observer-repro.cjs`. It demonstrates why a
+The original red reproduction requires the archived `revi` workspace; its
+`diagnostics/codex-chat-ui/streaming-observer-repro.cjs` fixture is absent from
+this checkout. It demonstrates why a
 text-node-only streaming completion was invisible to the old observer.
 
 Run the current green ownership/streaming contract:

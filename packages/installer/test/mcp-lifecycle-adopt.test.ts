@@ -24,6 +24,7 @@ import {
   mcpLifecycle,
   reconcileAdoptedMcpLifecycle,
   repairMcpLifecycle,
+  type McpLifecycleRepairDependencies,
 } from "../src/commands/mcp-lifecycle";
 import type { McpLifecycleHealthReport } from "../src/mcp-lifecycle-health";
 import {
@@ -36,6 +37,7 @@ import {
 } from "../src/mcp-lifecycle-install";
 import { lifecycleLockFile } from "../src/lifecycle-lock";
 import { acquireProcessLock } from "../src/process-lock";
+import { KNOWN_SCHEMA2_PREDECESSOR } from "../src/mcp-lifecycle-predecessor";
 
 // T5 intentionally validates canonical source before T8 regenerates the
 // installer asset copy. Keeping this explicit makes the upgrade proof immune
@@ -83,6 +85,35 @@ const VERSION_041_DIGESTS = {
   "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
   "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
 };
+
+test("schema2 predecessor adoption refuses unrecorded installed bytes before any mutation", () => {
+  withFixture((fixture) => {
+    const states = fixture.labelStates();
+    fixture.writeReceipt({ ...KNOWN_SCHEMA2_PREDECESSOR, labelTransitions: states.map((before) => ({
+      label: before.label, before, intended: before, observed: before,
+      operationsAttempted: [before.disabled ? "preserve-disabled-unloaded" : "bootout-bootstrap-verify"],
+    })) });
+    const before = fixture.snapshot();
+    assert.throws(() => adoptMcpLifecycle(fixture.input(), fixture.dependencies()), /predecessor installed identity mismatch/i);
+    assert.deepEqual(fixture.snapshot(), before);
+    assert.equal(fixture.reloads(), 0);
+  });
+});
+
+test("schema2 predecessor adoption refuses a changed recorded digest", () => {
+  withFixture((fixture) => {
+    const states = fixture.labelStates();
+    fixture.writeReceipt({ ...KNOWN_SCHEMA2_PREDECESSOR,
+      assetDigests: { ...KNOWN_SCHEMA2_PREDECESSOR.assetDigests, guard: "0".repeat(64) },
+      labelTransitions: states.map((before) => ({ label: before.label, before, intended: before, observed: before,
+        operationsAttempted: [before.disabled ? "preserve-disabled-unloaded" : "bootout-bootstrap-verify"] })),
+    });
+    const before = fixture.snapshot();
+    assert.throws(() => adoptMcpLifecycle(fixture.input(), fixture.dependencies()), /not an adoptable|recognized predecessor/i);
+    assert.deepEqual(fixture.snapshot(), before);
+    assert.equal(fixture.reloads(), 0);
+  });
+});
 
 test("explicit adopt upgrades exactly the recognized v2 managed receipt", () => {
   withFixture((fixture) => {
@@ -519,7 +550,7 @@ interface Fixture {
   root: string;
   receiptPath: string;
   input(): { targetHome: string; userRoot: string; sourceRoot: string; report: McpLifecycleHealthReport };
-  dependencies(overrides?: Record<string, unknown>): Parameters<typeof adoptMcpLifecycle>[1];
+  dependencies(overrides?: McpLifecycleRepairDependencies): McpLifecycleRepairDependencies;
   eligibleReport(proof?: "ok" | "error"): McpLifecycleHealthReport;
   labelStates(): readonly McpLifecycleLabelState[];
   receipt(): Record<string, unknown>;
@@ -641,7 +672,7 @@ function withFixture(run: (fixture: Fixture) => void): void {
         inspect: () => eligibleReport("ok"),
         now: () => new Date("2026-07-24T00:00:00.000Z"),
         ...overrides,
-      }) as Parameters<typeof adoptMcpLifecycle>[1],
+      }),
       eligibleReport,
       labelStates,
       receipt: () => JSON.parse(readFileSync(receiptPath, "utf8")) as Record<string, unknown>,
@@ -704,6 +735,7 @@ async function withFixtureAsync(run: (fixture: Fixture) => Promise<void>): Promi
         preview: { sourceRoot, targetHome: home, changedAssets: [], labels: MCP_LIFECYCLE_LABELS, labelStates: null, labelTransitions: [], preservedRuntimeFiles: [], reloadEligible: true, reloadDeferredReason: null, reloadPlan: [], rollbackPlan: [] },
       } }),
       dependencies: () => ({}),
+      labelStates: () => [],
       eligibleReport: () => fixture.input().report,
       receipt: () => JSON.parse(readFileSync(receiptPath, "utf8")) as Record<string, unknown>,
       writeReceipt: () => {},
@@ -724,7 +756,7 @@ function writeStatus(home: string): void {
   const directory = join(home, ".codex", "tmp");
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, "codex-mcp-lifecycle-status.json"), JSON.stringify({
-    schema_version: 2,
+    schema_version: manifest.lifecycle_schema_version,
     generated_at: generatedAt,
     matcher_registry_version: manifest.matcher_registry_version,
     job: { ok: true, mode: "automatic", error: null },
@@ -746,7 +778,7 @@ function writeStatus(home: string): void {
     explanations: ["Guard observes process health and may notify; it does not control processes or access task data."],
     sample_count: 1,
     reset_reason: "initial_sample",
-    schema_versions: { guard: 3, lifecycle: 2 },
+    schema_versions: { guard: 3, lifecycle: manifest.lifecycle_schema_version },
     matcher: {
       expected: manifest.matcher_registry_version,
       observed: manifest.matcher_registry_version,
@@ -766,3 +798,16 @@ function writeStatus(home: string): void {
     job: { ok: true, mode: "observation", error: null },
   }));
 }
+
+ test("explicit first adoption requires exact reviewed assets and emits current proof", () => {
+  withFixture((f) => {
+    unlinkSync(f.receiptPath);
+    const input = f.input();
+    const verification = verifyMcpLifecyclePackage({ sourceRoot: input.sourceRoot!, targetHome: input.targetHome });
+    const expectedInstalledDigests = Object.fromEntries(verification.assets.map((entry) => [entry.asset.id, createHash("sha256").update(readFileSync(entry.destinationPath)).digest("hex")]));
+    assert.throws(() => repairMcpLifecycle({ ...input, firstAdoption: { expectedInstalledDigests: {}, authorization: "explicit user adoption" } }, f.dependencies()), /every installed asset/);
+    const result = repairMcpLifecycle({ ...input, firstAdoption: { expectedInstalledDigests, authorization: "explicit user adoption" } }, f.dependencies());
+    assert.equal(result.status, "installed");
+    assert.equal(f.receipt().schemaVersion, 2);
+  });
+});

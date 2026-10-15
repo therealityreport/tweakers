@@ -11,7 +11,7 @@ import {
 
 function item(
   name: string,
-  overrides: Partial<TweaksPageItem> & { manifest?: Partial<TweakManifest> } = {},
+  overrides: Omit<Partial<TweaksPageItem>, "manifest"> & { manifest?: Partial<TweakManifest> } = {},
 ): TweaksPageItem {
   return {
     installed: true,

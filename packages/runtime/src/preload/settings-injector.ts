@@ -514,6 +514,7 @@ const state: InjectorState = {
 };
 
 let pendingRegisteredPageOpen: PendingRegisteredPageOpen | null = null;
+let diagnosticsFrame: number | null = null;
 
 let activeBuiltinPageCleanup: (() => void) | null = null;
 const originalHistoryMethods: Partial<Record<"pushState" | "replaceState", History["pushState"]>> = {};
@@ -536,7 +537,13 @@ function safeStringify(v: unknown): string {
 function publishRuntimeReadySettingsMount(): void {
   if (state.runtimeReadyMountPublished) return;
   state.runtimeReadyMountPublished = true;
-  ipcRenderer.send("tweaker:settings-mounted", { version: 1 });
+  void ipcRenderer.invoke("tweaker:settings-mount-context").then(context => {
+    if (!context || typeof context.operationId !== "string" || typeof context.promotionId !== "string" || typeof context.epoch !== "number") {
+      state.runtimeReadyMountPublished = false;
+      return;
+    }
+    ipcRenderer.send("tweaker:settings-mounted", { version: 2, operationId: context.operationId, promotionId: context.promotionId, epoch: context.epoch });
+  }).catch(() => { state.runtimeReadyMountPublished = false; });
 }
 
 // ───────────────────────────────────────────────────────────── public API ──
@@ -617,6 +624,8 @@ export function stopSettingsInjector(): void {
   state.observerTarget = null;
   state.replacementObserver?.disconnect();
   state.replacementObserver = null;
+  if (diagnosticsFrame !== null) cancelAnimationFrame(diagnosticsFrame);
+  diagnosticsFrame = null;
   if (state.settingsSurfaceHideTimer) {
     clearTimeout(state.settingsSurfaceHideTimer);
     state.settingsSurfaceHideTimer = null;
@@ -682,7 +691,10 @@ function scopeSettingsObserver(outcome: SettingsProbeOutcome): void {
       return;
     }
     state.probeScheduler?.recordFilteredMutation(records.length);
-    publishSettingsInjectorDiagnostics();
+    if (diagnosticsFrame === null) diagnosticsFrame = requestAnimationFrame(() => {
+      diagnosticsFrame = null;
+      publishSettingsInjectorDiagnostics();
+    });
   });
   state.observer.observe(target, { childList: true, subtree: true });
   state.observerTarget = target;
@@ -6172,12 +6184,29 @@ function resetTweakerInjectedSettingsGroupState(group: HTMLElement): void {
 function findContentArea(): HTMLElement | null {
   const sidebar = findSidebarItemsGroup();
   if (!sidebar) return null;
+  const findVisibleBox = (child: HTMLElement): HTMLElement | null => {
+    const style = getComputedStyle(child);
+    if (child.hidden || child.getAttribute("aria-hidden") === "true" ||
+        style.display === "none" || style.visibility === "hidden" ||
+        style.visibility === "collapse") return null;
+    // The native main surface is wrapped in display:contents, whose own
+    // rectangle is empty. Descend through that wrapper, not arbitrary panels.
+    if (style.display === "contents") {
+      for (const nested of Array.from(child.children) as HTMLElement[]) {
+        const box = findVisibleBox(nested);
+        if (box) return box;
+      }
+      return null;
+    }
+    const rect = child.getBoundingClientRect();
+    return rect.width > 300 && rect.height > 200 ? child : null;
+  };
   let parent = sidebar.parentElement;
   while (parent) {
     for (const child of Array.from(parent.children) as HTMLElement[]) {
       if (child === sidebar || child.contains(sidebar)) continue;
-      const r = child.getBoundingClientRect();
-      if (r.width > 300 && r.height > 200) return child;
+      const box = findVisibleBox(child);
+      if (box) return box;
     }
     parent = parent.parentElement;
   }

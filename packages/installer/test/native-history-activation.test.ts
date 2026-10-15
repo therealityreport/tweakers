@@ -560,6 +560,7 @@ test("an injected commit that started but never committed rolls back after regis
     },
     cancel: async () => { f.events.push("injected.cancel"); },
     rollback: async () => { f.events.push("injected.rollback"); },
+    restoreBeforeRegistration: async () => { f.events.push("injected.restore-before-registration"); },
   });
   await assert.rejects(runNativeHistoryActivation(f.context, f.dependencies), /did not prove a committed.*native-history-writer; PIDs 123/);
   assert.equal(f.events.includes("injected.rollback"), true);

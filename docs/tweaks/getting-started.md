@@ -9,9 +9,12 @@ open Codex-native windows.
 
 | Platform | Directory |
 |---|---|
-| macOS | `~/Library/Application Support/tweaker/tweaks/` |
-| Linux | `~/.local/share/tweaker/tweaks/` |
-| Windows | `%APPDATA%/tweaker/tweaks/` |
+| macOS | `~/Library/Application Support/Tweakers/tweaks/` |
+| Linux | `~/.local/share/Tweakers/tweaks/` (or `$XDG_DATA_HOME/Tweakers/tweaks/` when configured) |
+| Windows | `%APPDATA%/Tweakers/tweaks/` |
+
+Existing legacy installations and explicit Tweakers root overrides may use a
+different data root; inspect `tweaker status` before moving files.
 
 Tweaker watches this directory and hot-reloads when files change. You can also
 reload from Settings -> Tweaks or restart Codex.

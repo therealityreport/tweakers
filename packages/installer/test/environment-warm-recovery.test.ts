@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
 import {
   lstatSync,
@@ -51,7 +52,7 @@ interface Fixture {
 }
 
 async function withFixture(run: (fixture: Fixture) => Promise<void>): Promise<void> {
-  const root = mkdtempSync(join(realpathSync(process.cwd()), ".tweaker-warm-recovery-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweaker-warm-recovery-")));
   try {
     await run(makeFixture(root));
   } finally {

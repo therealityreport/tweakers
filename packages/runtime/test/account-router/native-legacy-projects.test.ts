@@ -88,7 +88,7 @@ test("desktop projection creates current rows from native records even when lega
   assert.deepEqual(projection.projectIdMap, { "legacy-a": "project-a", "legacy-b": "project-b" });
   assert.deepEqual(projection.values["local-projects"], {
     "legacy-a": { id: "legacy-a", name: "Source", rootPaths: [], createdAt: 0, updatedAt: 0 },
-    "legacy-b": { id: "legacy-b", name: "Second", rootPaths: ["/workspace/second"], createdAt: 0, updatedAt: 0 },
+    "legacy-b": { id: "legacy-b", name: "Second", rootPaths: ["/workspace/second"], createdAt: 0, updatedAt: 0, metadata: {} },
   });
   assert.deepEqual(projection.values["project-order"], ["legacy-a", "legacy-b"]);
 });
@@ -101,7 +101,7 @@ test("desktop projection accepts an absent legacy state file and partial native 
   assert.deepEqual(projection.values["project-appearances"], { "native-only": { color: "green" } });
 });
 
-test("desktop projection reconciles renamed IDs and filters deleted project state without hiding new projects", () => {
+test("desktop projection reconciles renamed IDs and preserves assignments without resurrecting deleted projects", () => {
   const f = fixture();
   f.data["local-projects"] = {
     "legacy-a": { id: "legacy-a", name: "SKILLS MANAGER", rootPaths: ["/workspace/manager"], createdAt: 10, updatedAt: 20 },
@@ -116,21 +116,59 @@ test("desktop projection reconciles renamed IDs and filters deleted project stat
   f.data["electron-workspace-root-labels"] = { "/workspace/manager": "Manager", "/workspace/deleted": "Deleted" };
   f.data["project-appearances"] = { "legacy-a": { color: "old", marker: "old" }, "legacy-b": { color: "deleted" } };
   f.write();
-  const projection = f.helper.desktopProjection([
+  const before = readFileSync(f.path);
+  const current = [
     { id: "new-a", name: "PROJECT MANAGER", roots: [{ path: "/workspace/manager" }], metadata: { "appearance.color": "blue", "appearance.marker": JSON.stringify({ symbol: "star" }) } },
     { id: "project-new", name: "New Project", roots: [{ path: "/workspace/new" }], metadata: {} },
-  ]);
+  ];
+  const projection = f.helper.desktopProjection(current);
   assert.ok(projection);
   assert.deepEqual(projection.projectIdMap, { "legacy-a": "new-a", "project-new": "project-new" });
   assert.deepEqual(projection.values["project-order"], ["legacy-a", "project-new"]);
   assert.deepEqual(projection.values["pinned-project-ids"], ["legacy-a"]);
   assert.deepEqual(Object.keys(projection.values["local-projects"]), ["legacy-a", "project-new"]);
-  assert.deepEqual(projection.values["local-projects"]["legacy-a"], { id: "legacy-a", name: "PROJECT MANAGER", rootPaths: ["/workspace/manager"], createdAt: 10, updatedAt: 20 });
-  assert.equal(projection.values["thread-project-assignments"]["thread-c"], undefined);
+  assert.deepEqual(projection.values["local-projects"]["legacy-a"], { id: "legacy-a", name: "PROJECT MANAGER", rootPaths: ["/workspace/manager"], createdAt: 10, updatedAt: 20, metadata: { "appearance.color": "blue", "appearance.marker": JSON.stringify({ symbol: "star" }) } });
+  assert.deepEqual(projection.values["thread-project-assignments"]["thread-c"], f.data["thread-project-assignments"]["thread-c"]);
   assert.deepEqual(projection.values["electron-workspace-root-labels"], { "/workspace/manager": "Manager" });
   assert.deepEqual(projection.values["project-appearances"]["legacy-a"], { color: "blue", marker: { symbol: "star" } });
   assert.equal(projection.values["project-appearances"]["legacy-b"], undefined);
   assert.equal(f.helper.unresolvedMembershipCount(), 1);
+  assert.equal(f.helper.legacyPublicProjectIdForThread("thread-c"), null);
+  assert.deepEqual(f.helper.legacyNativeThreadIdsForProject("deleted-b"), []);
+  const saved = f.helper.desktopProjection(current, { access: "read_only", source: "saved_local", authorityGeneration: 1 });
+  assert.ok(saved); assert.deepEqual(saved.values, projection.values);
+  assert.deepEqual(readFileSync(f.path), before, "projection preserves the saved source file");
+  assert.deepEqual(readdirSync(f.broker), [], "unresolved assignments create no ownership records");
+});
+
+test("unmapped orphan assignment records survive both modes while tombstones and native membership remain authoritative", () => {
+  const f = fixture();
+  const orphan = { projectKind: "local", projectId: "local-9fe62511fbd8f51a61e0293056f0b52b", savedDetail: { position: 3 } };
+  f.data["thread-project-assignments"]["orphan-thread"] = orphan;
+  f.data["thread-project-assignments"]["removed-orphan"] = { ...orphan };
+  f.write();
+  assert.equal(f.helper.removeThreadFromProject(orphan.projectId, "removed-orphan"), true);
+  const before = readFileSync(f.path);
+  const removalPath = join(f.broker, "native-legacy-project-removals.v1.json");
+  const removalsBefore = readFileSync(removalPath);
+  const current = [{ id: "project-a", name: "A", roots: [] }, { id: "project-b", name: "B", roots: [] }];
+  for (const authority of [
+    { access: "read_only", source: "saved_local", authorityGeneration: 1 },
+    { access: "read_write", source: "app_server", authorityGeneration: 2 },
+  ] as const) {
+    const projection = f.helper.desktopProjection(current, authority);
+    assert.ok(projection);
+    assert.deepEqual(projection.values["thread-project-assignments"]["orphan-thread"], orphan);
+    assert.equal(projection.values["thread-project-assignments"]["removed-orphan"], undefined);
+    assert.equal(projection.values["local-projects"][orphan.projectId], undefined);
+    assert.equal(projection.projectIdMap[orphan.projectId], undefined);
+    assert.equal(f.helper.unresolvedMembershipCount(), 1);
+    assert.equal(f.helper.legacyPublicProjectIdForThread("orphan-thread"), null);
+    assert.deepEqual(f.helper.legacyNativeThreadIdsForProject(orphan.projectId), []);
+    assert.deepEqual(f.helper.legacyNativeThreadIdsForProject("project-a"), ["thread-b", "thread-a"]);
+  }
+  assert.deepEqual(readFileSync(f.path), before);
+  assert.deepEqual(readFileSync(removalPath), removalsBefore);
 });
 
 test("desktop projection rejects malformed or ambiguous current native records", () => {
@@ -142,4 +180,35 @@ test("desktop projection rejects malformed or ambiguous current native records",
     const f = fixture();
     assert.equal(f.helper.desktopProjection(projects), null);
   }
+});
+
+test("saved projection preserves native timestamps/metadata, legacy pins/order and access authority", () => {
+  const f = fixture();
+  f.data["project-order"] = ["legacy-b", "legacy-a"]; f.data["pinned-project-ids"] = ["legacy-a"]; f.write();
+  const projection = f.helper.desktopProjection([
+    { id: "project-a", name: "A", roots: [], createdAt: 123, updatedAt: 456, metadata: { "appearance.color": "green", custom: "kept" } },
+    { id: "project-b", name: "B", roots: [] },
+  ], { access: "read_only", source: "saved_local", authorityGeneration: 9 });
+  assert.ok(projection); assert.equal(projection.access, "read_only"); assert.equal(projection.source, "saved_local"); assert.equal(projection.authorityGeneration, 9);
+  assert.deepEqual(projection.values["project-order"], ["legacy-b", "legacy-a"]);
+  assert.deepEqual(projection.values["pinned-project-ids"], ["legacy-a"]);
+  assert.deepEqual(projection.values["local-projects"]["legacy-a"], { id: "legacy-a", name: "A", rootPaths: [], createdAt: 123, updatedAt: 456, metadata: { "appearance.color": "green", custom: "kept" } });
+  assert.deepEqual(readdirSync(f.broker), [], "read-only projections persist no ownership or overrides");
+});
+
+test("saved milliseconds and app-server seconds project to identical legacy timestamps", () => {
+  const f = fixture();
+  const provider = { id: "project-a", name: "A", roots: [{ path: "/Users/thomashulihan/Projects/tweakers" }],
+    metadata: { "appearance.color": "blue", custom: "kept" }, createdAt: 1_700_000_000, updatedAt: 1_700_000_456 };
+  const saved = { ...provider, createdAt: provider.createdAt * 1000, updatedAt: provider.updatedAt * 1000 };
+  const offline = f.helper.desktopProjection([saved], { access: "read_only", source: "saved_local", authorityGeneration: 1 });
+  const online = f.helper.desktopProjection([provider], { access: "read_write", source: "app_server", authorityGeneration: 2 });
+  assert.ok(offline); assert.ok(online);
+  assert.deepEqual(online.values, offline.values);
+  assert.equal(online.values["local-projects"]["legacy-a"]!.createdAt, 1_700_000_000_000);
+  assert.equal(online.values["local-projects"]["legacy-a"]!.updatedAt, 1_700_000_456_000);
+  assert.equal(f.helper.desktopProjection([{ ...provider, createdAt: Number.MAX_SAFE_INTEGER }],
+    { access: "read_write", source: "app_server", authorityGeneration: 3 }), null, "seconds conversion must remain a safe integer");
+  assert.ok(f.helper.desktopProjection([{ ...saved, createdAt: Number.MAX_SAFE_INTEGER }],
+    { access: "read_only", source: "saved_local", authorityGeneration: 4 }), "valid saved milliseconds are not scaled again");
 });

@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.mountManager = mountManager;
+const tweak_topic_migration_1 = require("../tweak-topic-migration");
 /**
  * Built-in "Tweak Manager" — auto-injected by the runtime, not a user tweak.
  * Lists discovered tweaks with enable toggles, opens the tweaks dir, links
@@ -12,7 +13,9 @@ exports.mountManager = mountManager;
 const electron_1 = require("electron");
 const settings_injector_1 = require("./settings-injector");
 async function mountManager() {
-    const tweaks = (await electron_1.ipcRenderer.invoke("tweaker:list-tweaks"));
+    const listed = (await electron_1.ipcRenderer.invoke("tweaker:list-tweaks"));
+    const suppressed = (0, tweak_topic_migration_1.consolidateTweakTopics)(listed, localStorage);
+    const tweaks = listed.filter(tweak => !suppressed.has(tweak.manifest.id));
     const paths = (await electron_1.ipcRenderer.invoke("tweaker:user-paths"));
     (0, settings_injector_1.registerSection)({
         id: "tweaker:manager",
