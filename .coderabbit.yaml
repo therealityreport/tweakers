@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit is not used for this repository. If the app stays installed on the
+# account, keep it silent here: no automatic reviews, no review-status comments,
+# no commit status or check runs on pull requests, and no chat auto-replies.
+reviews:
+  auto_review:
+    enabled: false
+  review_status: false
+  commit_status: false
+  review_progress: false
+chat:
+  auto_reply: false
